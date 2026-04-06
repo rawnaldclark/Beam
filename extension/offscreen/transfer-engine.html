@@ -13,6 +13,9 @@
         - WebRTC peer connections and data channels
         - File chunking, encryption, and reassembly
     -->
+    <!-- Load libsodium as classic scripts (sets self.sodium_native + self.sodium) -->
+    <script src="../lib/libsodium-sumo.js"></script>
+    <script src="../lib/libsodium-wrappers-sumo.js"></script>
     <script type="module" src="transfer-engine.js"></script>
   </body>
 </html>

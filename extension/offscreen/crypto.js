@@ -16,9 +16,9 @@
  * @module offscreen/crypto
  */
 
-import sodium from 'libsodium-wrappers-sumo';
-
-/** @type {import('libsodium-wrappers-sumo') | null} Cached sodium instance. */
+// libsodium loaded via <script> tags in transfer-engine.html (sets self.sodium).
+// For Node.js tests, the npm module is loaded dynamically.
+let _sodiumModule = null;
 let _sodium = null;
 
 // ── internal helpers ────────────────────────────────────────────────────────
@@ -95,8 +95,18 @@ function hkdfExpand32(prk, info) {
  * @returns {Promise<void>}
  */
 export async function init() {
-  await sodium.ready;
-  _sodium = sodium;
+  if (_sodium) return; // already initialized
+  // In browser (offscreen document): loaded via <script> tags, available as self.sodium
+  if (typeof self !== 'undefined' && self.sodium && self.sodium.ready) {
+    await self.sodium.ready;
+    _sodium = self.sodium;
+  } else {
+    // In Node.js (tests): dynamic import from npm
+    const mod = await import('libsodium-wrappers-sumo');
+    _sodiumModule = mod.default;
+    await _sodiumModule.ready;
+    _sodium = _sodiumModule;
+  }
 }
 
 /**
