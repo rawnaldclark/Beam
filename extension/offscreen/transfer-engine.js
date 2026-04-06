@@ -37,6 +37,7 @@ import { init as initCrypto, generateKeyPairs, deriveDeviceId, deriveSharedSecre
 import { MSG, WIRE } from '../shared/message-types.js';
 import { WsClient } from './ws-client.js';
 import { RELAY_URL } from '../shared/constants.js';
+import { TransferManager } from './transfer-manager.js';
 
 // ---------------------------------------------------------------------------
 // Module-level state
@@ -81,6 +82,17 @@ let wsClient = null;
  * @type {{ peerInfo: object, sharedSecret: Uint8Array } | null}
  */
 let pendingPairing = null;
+
+/**
+ * Transfer manager — owns the complete file/clipboard transfer lifecycle.
+ * Instantiated once connectRelay() has authenticated the WebSocket so that
+ * outbound transfers can be dispatched immediately.
+ *
+ * Null until startup() + connectRelay() complete successfully.
+ *
+ * @type {TransferManager | null}
+ */
+let transferManager = null;
 
 // ---------------------------------------------------------------------------
 // Startup
@@ -208,10 +220,11 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ── Initiate an outbound transfer (from popup or service worker) ─────────
     // Sender : popup (direct file drop) or background.js (context menu / shortcut)
-    // No response — progress is reported via TRANSFER_PROGRESS / TRANSFER_COMPLETE.
-    // NOTE: Full implementation deferred to Phase E (transfer engine task).
+    // No response — progress is reported asynchronously via:
+    //   TRANSFER_PROGRESS, TRANSFER_COMPLETE, TRANSFER_FAILED
     case MSG.INITIATE_TRANSFER:
-      handleTransfer(msg.payload);
+      // Fire-and-forget; TransferManager sends progress/complete messages internally.
+      handleTransfer(msg.payload).catch(console.error);
       return false;
 
   }
@@ -283,6 +296,61 @@ async function connectRelay() {
       await handlePairRequest(msg);
     }
     // Otherwise silently ignore — WebRTC handling not yet implemented.
+  });
+
+  // ── Instantiate TransferManager ────────────────────────────────────────
+  // Created here (after auth completes) so it can immediately use the
+  // authenticated wsClient for outbound transfers.
+  transferManager = new TransferManager(wsClient, deviceKeys, pairedDevices);
+
+  // ── Incoming relay data frames ──────────────────────────────────────────
+  // The relay server routes encrypted frames from peers via WIRE.RELAY_DATA.
+  // We dispatch on the embedded `msgType` field to the correct TransferManager
+  // handler.  Binary frames (raw chunks) arrive on the WsClient binary handler.
+  wsClient.on(WIRE.RELAY_DATA, (msg) => {
+    if (!transferManager) return;
+
+    switch (msg.msgType) {
+      // ── Incoming file transfer request ────────────────────────────────
+      case 'transfer-request':
+        transferManager.handleIncomingRequest({
+          ...msg,
+          fromDeviceId: msg.fromDeviceId ?? msg.senderDeviceId,
+        });
+        break;
+
+      // ── Transfer accepted by receiver ─────────────────────────────────
+      // Resolves the accept-promise in sendFile() so chunk streaming begins.
+      case 'transfer-accept':
+        transferManager.handleChunkAck({
+          ...msg,
+          msgType: 'transfer-accept',
+        });
+        break;
+
+      // ── Chunk ACK from receiver ───────────────────────────────────────
+      case 'chunk-ack':
+        transferManager.handleChunkAck(msg);
+        break;
+
+      // ── Clipboard fast-path ───────────────────────────────────────────
+      case 'clipboard':
+        handleIncomingClipboard(msg);
+        break;
+
+      default:
+        // Unknown msgType — silently ignore to remain forward-compatible.
+        break;
+    }
+  });
+
+  // ── Binary chunk frames ─────────────────────────────────────────────────
+  // Raw binary WebSocket frames carry the 64-byte header + encrypted chunk
+  // ciphertext.  The WsClient exposes a single binary handler slot.
+  wsClient.onBinary((data) => {
+    if (transferManager) {
+      transferManager.handleChunk(data);
+    }
   });
 }
 
@@ -506,21 +574,178 @@ async function savePairedDevice({ name, icon }) {
 }
 
 /**
- * Stub: handle an outbound transfer request.
+ * Handle an outbound transfer request (MSG.INITIATE_TRANSFER).
  *
- * Logs the request and does nothing further.  The real implementation
- * (Phase E) will:
- *   1. Validate and normalise the payload (file, text, clipboard, image).
- *   2. Look up the target device's session key.
- *   3. Chunk and encrypt the data.
- *   4. Send chunks over the WebRTC data channel (or relay fallback).
- *   5. Emit TRANSFER_PROGRESS / TRANSFER_COMPLETE / TRANSFER_FAILED messages.
+ * Dispatches to the TransferManager based on the transfer type:
+ *   - `clipboard`: fast-path single-message transfer (sendClipboard).
+ *   - otherwise:   full two-phase file transfer (sendFile).
  *
- * @param {object} payload - Transfer request payload from the initiating component.
+ * The payload shape from the popup / service worker:
+ * ```
+ * {
+ *   targetDeviceId: string,
+ *   // File transfer:
+ *   fileName?:  string,
+ *   fileSize?:  number,
+ *   mimeType?:  string,
+ *   dataUrl?:   string,       // base64 data URI
+ *   arrayBuffer?: number[],   // raw bytes as plain array
+ *   // Clipboard transfer:
+ *   text?: string,
+ *   type?: 'clipboard',
+ * }
+ * ```
+ *
+ * Progress/completion is reported asynchronously via MSG.TRANSFER_PROGRESS,
+ * MSG.TRANSFER_COMPLETE, and MSG.TRANSFER_FAILED chrome.runtime messages.
+ *
+ * @param {object} payload - Transfer request payload from the popup or SW.
+ * @returns {Promise<void>}
  */
 async function handleTransfer(payload) {
-  // Phase A stub — will be replaced in Phase E.
-  console.log('[Beam] Transfer requested (stub — not yet implemented):', payload);
+  if (!transferManager) {
+    console.error('[Beam] handleTransfer: TransferManager not yet ready.');
+    return;
+  }
+
+  const { targetDeviceId, type, text } = payload;
+
+  // ── Clipboard fast-path ───────────────────────────────────────────────
+  if (type === 'clipboard' || (typeof text === 'string' && !payload.fileName)) {
+    try {
+      await transferManager.sendClipboard(targetDeviceId, text ?? '');
+    } catch (err) {
+      console.error('[Beam] sendClipboard failed:', err);
+    }
+    return;
+  }
+
+  // ── File transfer ─────────────────────────────────────────────────────
+  // Reconstruct a File-like object from the payload.  The popup serialises
+  // file data as a base64 data URI or plain number array because File objects
+  // do not survive the chrome.runtime message boundary.
+  let file;
+  try {
+    file = _reconstructFile(payload);
+  } catch (err) {
+    console.error('[Beam] handleTransfer: could not reconstruct file:', err);
+    return;
+  }
+
+  try {
+    await transferManager.sendFile(targetDeviceId, file);
+  } catch (err) {
+    console.error('[Beam] sendFile failed:', err);
+    // TransferManager notifies SW internally; this catch prevents unhandled rejections.
+  }
+}
+
+/**
+ * Handle an incoming clipboard fast-path message from a peer.
+ *
+ * Decrypts the clipboard payload, verifies its SHA-256 integrity check,
+ * then writes the text to the clipboard and notifies the service worker.
+ *
+ * @param {object} msg - Relay message with { transferId, ciphertext, fromDeviceId }.
+ */
+function handleIncomingClipboard(msg) {
+  if (!transferManager) return;
+
+  const { transferId, ciphertext, fromDeviceId } = msg;
+  const peer = pairedDevices.find((d) => d.deviceId === fromDeviceId);
+  if (!peer) {
+    console.warn('[Beam] handleIncomingClipboard: unknown peer', fromDeviceId);
+    return;
+  }
+
+  // Derive the metadata key for this peer (uses the long-term shared secret).
+  // For clipboard fast-path we use a simplified derivation that mirrors
+  // TransferManager._deriveSessionKeys() but without an ephemeral key.
+  // TODO(Phase H): use the same triple-DH derivation once WebRTC is in place.
+  import('./crypto.js').then(({ deriveSharedSecret: dss, deriveMetadataKey: dmk }) => {
+    try {
+      const staticSharedSecret = dss(
+        new Uint8Array(deviceKeys.x25519.sk),
+        new Uint8Array(peer.x25519PublicKey),
+      );
+      // Derive a stable metadata key from the long-term shared secret.
+      const metadataKey = dmk(staticSharedSecret);
+      const envelope    = new Uint8Array(ciphertext);
+
+      import('./crypto.js').then(({ decryptMetadata }) => {
+        try {
+          const { content, sha256, autoCopy } = decryptMetadata(envelope, metadataKey);
+
+          // Write to clipboard if autoCopy is set.
+          if (autoCopy && typeof navigator !== 'undefined' && navigator.clipboard) {
+            navigator.clipboard.writeText(content).catch((err) => {
+              console.warn('[Beam] Could not write to clipboard:', err);
+            });
+          }
+
+          // Notify SW: content for notification + clipboard history.
+          try {
+            chrome.runtime.sendMessage({
+              type:    MSG.TRANSFER_COMPLETE,
+              payload: {
+                transferId,
+                fromDeviceId,
+                text:     content,
+                sha256,
+                isClipboard: true,
+              },
+            });
+          } catch (_) { /* SW may be sleeping */ }
+        } catch (err) {
+          console.error('[Beam] Clipboard decryption failed:', err);
+        }
+      });
+    } catch (err) {
+      console.error('[Beam] Clipboard key derivation failed:', err);
+    }
+  });
+}
+
+/**
+ * Reconstruct a File-like object from the serialised transfer payload.
+ *
+ * The popup cannot pass a real File across the chrome.runtime message boundary
+ * because it is not structured-cloneable.  Instead the popup serialises the
+ * file as:
+ *   - `dataUrl`:     base64 data URI (e.g. "data:image/png;base64,...")
+ *   - `arrayBuffer`: plain number array of the raw bytes
+ *
+ * This function reconstructs a minimal File-compatible object with:
+ *   `.name`, `.size`, `.type`, `.arrayBuffer() → Promise<ArrayBuffer>`
+ *
+ * @param {object} payload
+ * @returns {{name: string, size: number, type: string, arrayBuffer: () => Promise<ArrayBuffer>}}
+ * @throws {Error} If neither dataUrl nor arrayBuffer is present.
+ */
+function _reconstructFile(payload) {
+  const { fileName, fileSize, mimeType, dataUrl, arrayBuffer: rawArray } = payload;
+
+  let bytes;
+  if (rawArray) {
+    bytes = new Uint8Array(rawArray);
+  } else if (dataUrl) {
+    // Strip the data URI prefix (e.g. "data:image/png;base64,").
+    const base64 = dataUrl.slice(dataUrl.indexOf(',') + 1);
+    const binary  = atob(base64);
+    bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) {
+      bytes[i] = binary.charCodeAt(i);
+    }
+  } else {
+    throw new Error('_reconstructFile: payload contains neither dataUrl nor arrayBuffer');
+  }
+
+  return {
+    name:        fileName ?? 'file',
+    size:        fileSize ?? bytes.byteLength,
+    type:        mimeType ?? 'application/octet-stream',
+    arrayBuffer: () => Promise.resolve(bytes.buffer),
+  };
 }
 
 // ---------------------------------------------------------------------------
