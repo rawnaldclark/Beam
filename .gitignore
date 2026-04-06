@@ -1,1 +1,4 @@
-node_modules/\n.superpowers/\n*.log
+node_modules/
+.superpowers/
+*.log
+.env
