@@ -124,9 +124,25 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .catch(err  => sendResponse({ type: MSG.IMAGE_FETCHED, payload: { error: err.message } }));
       return true; // async sendResponse
 
+    // ── All other messages — forward to offscreen document ─────────────────
+    default: {
+      // Messages like START_PAIRING, GET_DEVICE_LIST, PAIRING_CONFIRM_SAS, etc.
+      // are handled by the offscreen document. The popup can't talk to it directly
+      // so we forward: ensure offscreen exists, re-send with a _forwarded flag
+      // so our own listener ignores the echo, and pipe the response back.
+      if (msg._forwarded) return false; // ignore our own re-broadcast
+      ensureOffscreen().then(async () => {
+        try {
+          const response = await chrome.runtime.sendMessage({ ...msg, _forwarded: true });
+          sendResponse(response);
+        } catch {
+          sendResponse(null);
+        }
+      });
+      return true; // async sendResponse
+    }
+
   }
-  // Synchronous path — no async sendResponse needed.
-  return false;
 });
 
 // ---------------------------------------------------------------------------
