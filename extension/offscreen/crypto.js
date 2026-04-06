@@ -140,8 +140,22 @@ export function deriveDeviceId(ed25519Pk) {
   const s = S();
   const hash = s.crypto_hash_sha256(ed25519Pk);
   const idBytes = hash.slice(0, 16);
-  // Buffer.from works in Node; in a browser context use a manual b64url encoder.
-  return Buffer.from(idBytes).toString('base64url');
+  return toBase64url(idBytes);
+}
+
+/**
+ * Encode bytes as base64url (no padding) — works in both Node.js and browsers.
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function toBase64url(bytes) {
+  if (typeof Buffer !== 'undefined') {
+    // Node.js
+    return Buffer.from(bytes).toString('base64url');
+  }
+  // Browser: btoa produces standard base64, then swap +/→-/_ and strip =
+  const b64 = btoa(String.fromCharCode(...bytes));
+  return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
 /**

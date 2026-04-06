@@ -132,7 +132,11 @@ async function startup() {
   // Step 2: load or generate device keys
   const stored = await chrome.storage.local.get(['deviceKeys', 'deviceId', 'pairedDevices']);
 
-  if (stored.deviceKeys && stored.deviceId) {
+  // Validate stored deviceId — must be 22 chars (base64url of 16 bytes).
+  // A bad value (e.g., from a prior Buffer bug) forces regeneration.
+  const storedIdValid = stored.deviceId && stored.deviceId.length >= 16;
+
+  if (stored.deviceKeys && storedIdValid) {
     // Restore persisted keys — storage holds plain Arrays, convert back to Uint8Array.
     deviceKeys = {
       x25519: {
@@ -145,6 +149,21 @@ async function startup() {
       },
     };
     deviceId = stored.deviceId;
+  } else if (stored.deviceKeys) {
+    // Keys exist but deviceId was bad — re-derive from existing keys
+    deviceKeys = {
+      x25519: {
+        pk: new Uint8Array(stored.deviceKeys.x25519.pk),
+        sk: new Uint8Array(stored.deviceKeys.x25519.sk),
+      },
+      ed25519: {
+        pk: new Uint8Array(stored.deviceKeys.ed25519.pk),
+        sk: new Uint8Array(stored.deviceKeys.ed25519.sk),
+      },
+    };
+    deviceId = deriveDeviceId(deviceKeys.ed25519.pk);
+    await chrome.storage.local.set({ deviceId });
+    console.log('[Beam] Re-derived deviceId from existing keys:', deviceId);
   } else {
     // First run — generate fresh key pairs and persist them.
     deviceKeys = generateKeyPairs();
