@@ -1,0 +1,18 @@
+{
+  "manifest_version": 3,
+  "name": "Beam",
+  "version": "0.1.0",
+  "description": "Instant, encrypted file transfer between your devices.",
+  "permissions": ["offscreen", "storage", "notifications", "contextMenus", "commands", "alarms", "activeTab"],
+  "host_permissions": ["<all_urls>"],
+  "background": { "service_worker": "background.js", "type": "module" },
+  "action": {
+    "default_popup": "popup/popup.html",
+    "default_icon": { "16": "icons/icon-16.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" }
+  },
+  "commands": {
+    "send-clipboard": { "suggested_key": { "default": "Ctrl+Shift+Z", "mac": "Command+Shift+Z" }, "description": "Send clipboard to last device" },
+    "open-device-picker": { "suggested_key": { "default": "Ctrl+Shift+X", "mac": "Command+Shift+X" }, "description": "Open device picker" }
+  },
+  "icons": { "16": "icons/icon-16.png", "48": "icons/icon-48.png", "128": "icons/icon-128.png" }
+}

@@ -1,0 +1,11 @@
+{
+  "name": "beam-extension",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "libsodium-wrappers-sumo": "^0.8.2"
+  }
+}
