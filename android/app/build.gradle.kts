@@ -176,6 +176,9 @@ dependencies {
     // ─── Coroutines ───────────────────────────────────────────────────────────
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.0")
 
+    // ─── DocumentFile (SAF custom save location in TransferCompleteViewModel) ──
+    implementation("androidx.documentfile:documentfile:1.0.1")
+
     // ─── Core KTX ─────────────────────────────────────────────────────────────
     implementation("androidx.core:core-ktx:1.12.0")
 

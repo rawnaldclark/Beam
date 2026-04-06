@@ -7,6 +7,10 @@ import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
+import com.zaptransfer.android.ui.clipboard.ClipboardHistoryScreen
+import com.zaptransfer.android.ui.settings.SettingsScreen
+import com.zaptransfer.android.ui.transfer.TransferCompleteSheet
+import com.zaptransfer.android.ui.transfer.TransferProgressScreen
 
 // ─── Route constants ──────────────────────────────────────────────────────────
 // Centralised string tokens prevent typos across call sites.
@@ -173,11 +177,20 @@ fun BeamNavGraph(
             ),
         ) { backStackEntry ->
             val transferId = backStackEntry.arguments?.getString(ARG_TRANSFER_ID) ?: return@composable
-            // Phase H (Task 26): replace with TransferProgressScreen(transferId)
-            ScreenPlaceholder(
-                title = "Transfer: $transferId",
+            TransferProgressScreen(
+                transferId = transferId,
                 onBack = { navController.popBackStack() },
-                onNext = { navController.navigate("transfer/complete/$transferId") },
+                onCancel = { id ->
+                    // Navigate back to hub after cancel
+                    navController.navigate(ROUTE_DEVICE_HUB) {
+                        popUpTo(ROUTE_DEVICE_HUB) { inclusive = false }
+                    }
+                },
+                onComplete = { id ->
+                    navController.navigate("transfer/complete/$id") {
+                        popUpTo(ROUTE_TRANSFER_PROGRESS.substringBefore("{")) { inclusive = true }
+                    }
+                },
             )
         }
 
@@ -189,35 +202,27 @@ fun BeamNavGraph(
             ),
         ) { backStackEntry ->
             val transferId = backStackEntry.arguments?.getString(ARG_TRANSFER_ID) ?: return@composable
-            // Phase H (Task 27): replace with TransferCompleteSheet(transferId)
-            ScreenPlaceholder(
-                title = "Complete: $transferId",
-                onBack = {
+            TransferCompleteSheet(
+                transferId = transferId,
+                onDismiss = {
                     navController.navigate(ROUTE_DEVICE_HUB) {
                         popUpTo(ROUTE_DEVICE_HUB) { inclusive = false }
                     }
                 },
-                onNext = {},
             )
         }
 
         // ── Settings ─────────────────────────────────────────────────────────
         composable(ROUTE_SETTINGS) {
-            // Phase H (Task 28): replace with SettingsScreen
-            ScreenPlaceholder(
-                title = "Settings",
+            SettingsScreen(
                 onBack = { navController.popBackStack() },
-                onNext = {},
             )
         }
 
         // ── Clipboard History ────────────────────────────────────────────────
         composable(ROUTE_CLIPBOARD) {
-            // Phase H (Task 29): replace with ClipboardHistoryScreen
-            ScreenPlaceholder(
-                title = "Clipboard History",
+            ClipboardHistoryScreen(
                 onBack = { navController.popBackStack() },
-                onNext = {},
             )
         }
     }

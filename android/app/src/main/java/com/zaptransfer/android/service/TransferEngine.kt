@@ -7,7 +7,9 @@ import android.util.Log
 import com.zaptransfer.android.crypto.HashAccumulator
 import com.zaptransfer.android.crypto.KeyManager
 import com.zaptransfer.android.crypto.SessionCipher
+import com.zaptransfer.android.data.db.dao.ChunkProgressDao
 import com.zaptransfer.android.data.db.dao.TransferHistoryDao
+import com.zaptransfer.android.data.db.entity.ChunkProgressEntity
 import com.zaptransfer.android.data.db.entity.TransferHistoryEntity
 import com.zaptransfer.android.data.repository.DeviceRepository
 import com.zaptransfer.android.webrtc.RelayMessage
@@ -19,6 +21,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -55,6 +58,18 @@ private const val MSG_CHUNK_ACK = "chunk_ack"
 
 /** Subdirectory inside the app's cache directory used for in-progress receive buffers. */
 private const val TEMP_DIR = "transfer_tmp"
+
+/**
+ * How many chunks must be ACK'd between mandatory checkpoint writes.
+ * Lower values increase durability at the cost of more Room writes.
+ */
+private const val CHECKPOINT_CHUNK_INTERVAL = 64
+
+/**
+ * Maximum time in milliseconds between checkpoint writes, regardless of chunk count.
+ * Ensures progress is saved even for very large chunk sizes.
+ */
+private const val CHECKPOINT_TIME_INTERVAL_MS = 10_000L
 
 /**
  * Progress snapshot for a single transfer, published to the UI via [StateFlow].
@@ -104,6 +119,9 @@ private data class TransferSession(
     var sendJob: Job? = null,            // coroutine driving the chunk send loop
     var nextChunkIndex: Long = 0L,
     var chunkSentAt: MutableMap<Long, Long> = ConcurrentHashMap(), // index → nanoTime
+    // Chunk progress persistence tracking
+    var chunksAckedSinceCheckpoint: Int = 0,
+    var lastCheckpointTime: Long = System.currentTimeMillis(),
 )
 
 /**
@@ -153,6 +171,7 @@ class TransferEngine @Inject constructor(
     private val sessionCipher: SessionCipher,
     private val deviceRepo: DeviceRepository,
     private val transferHistoryDao: TransferHistoryDao,
+    private val chunkProgressDao: ChunkProgressDao,
     private val signalingClient: SignalingClient,
 ) {
 
@@ -545,6 +564,23 @@ class TransferEngine @Inject constructor(
                 }
                 signalingClient.send(ackMsg)
 
+                // ── Checkpoint persistence ─────────────────────────────────────
+                // Write a resume checkpoint every CHECKPOINT_CHUNK_INTERVAL chunks
+                // or every CHECKPOINT_TIME_INTERVAL_MS, whichever comes first.
+                // totalChunks is approximated from totalBytes / current chunk size.
+                session.chunksAckedSinceCheckpoint++
+                val now = System.currentTimeMillis()
+                val timeSinceLastCheckpoint = now - session.lastCheckpointTime
+                if (session.chunksAckedSinceCheckpoint >= CHECKPOINT_CHUNK_INTERVAL ||
+                    timeSinceLastCheckpoint >= CHECKPOINT_TIME_INTERVAL_MS
+                ) {
+                    val approxTotalChunks = if (session.chunkSizer.currentChunkSize > 0) {
+                        ((session.totalBytes + session.chunkSizer.currentChunkSize - 1) /
+                            session.chunkSizer.currentChunkSize).toInt()
+                    } else 1
+                    saveChunkProgress(session, chunkIndex, approxTotalChunks)
+                }
+
                 // Check if transfer is complete
                 if (session.transferredBytes >= session.totalBytes) {
                     finalizeReceive(session)
@@ -723,6 +759,7 @@ class TransferEngine @Inject constructor(
             )
 
             Log.i(TAG, "Receive complete and verified: ${session.transferId} → ${destFile.path}")
+            clearCheckpoint(session.transferId)
             cleanupSession(session)
 
         } catch (e: Exception) {
@@ -828,7 +865,7 @@ class TransferEngine @Inject constructor(
      */
     private fun cleanupSession(session: TransferSession) {
         scope.launch {
-            kotlinx.coroutines.delay(2_000)
+            delay(2_000)
             activeSessions.remove(session.transferId)
             _progress.update { it - session.transferId }
         }
@@ -1000,6 +1037,106 @@ class TransferEngine @Inject constructor(
         ciphertext.copyInto(frame, destinationOffset = offset)
 
         return frame
+    }
+
+    // ── Public API: cancel + checkpoint ───────────────────────────────────────
+
+    /**
+     * Cancels an in-progress transfer by its transfer ID.
+     *
+     * Cancels the send coroutine (if any), transitions the state machine to FAILED,
+     * updates the history record to CANCELLED, cleans up the temp file, and removes
+     * the chunk-progress checkpoint from Room.
+     *
+     * Safe to call from any thread — all mutations are dispatched onto [scope].
+     *
+     * @param transferId UUID of the transfer to cancel.
+     */
+    fun cancelTransfer(transferId: String) {
+        scope.launch {
+            val session = activeSessions[transferId] ?: run {
+                Log.w(TAG, "cancelTransfer: no session found for $transferId")
+                return@launch
+            }
+            Log.i(TAG, "Cancelling transfer $transferId")
+            session.sendJob?.cancel()
+            session.tempOutputStream?.runCatching { close() }
+            session.tempFile?.delete()
+
+            try {
+                session.stateMachine.transition(TransferState.FAILED)
+            } catch (e: IllegalStateException) {
+                session.stateMachine.forceReset()
+            }
+            publishProgress(session)
+
+            transferHistoryDao.updateCompletion(
+                transferId = transferId,
+                status = "CANCELLED",
+                sha256Hash = null,
+                localUri = null,
+                completedAt = System.currentTimeMillis(),
+            )
+
+            // Remove the resume checkpoint from Room
+            chunkProgressDao.delete(transferId)
+            cleanupSession(session)
+        }
+    }
+
+    /**
+     * Persists a chunk-progress checkpoint to Room for the given receive session.
+     *
+     * Called every [CHECKPOINT_CHUNK_INTERVAL] chunks OR every [CHECKPOINT_TIME_INTERVAL_MS],
+     * whichever threshold is reached first. The caller (handleChunk) is responsible for
+     * checking the thresholds — this function always writes unconditionally.
+     *
+     * @param session       The active receive session to checkpoint.
+     * @param chunkIndex    The index of the most recently ACK'd chunk.
+     * @param totalChunks   Total expected chunk count declared by the sender in metadata.
+     */
+    private suspend fun saveChunkProgress(
+        session: TransferSession,
+        chunkIndex: Long,
+        totalChunks: Int,
+    ) {
+        val entity = ChunkProgressEntity(
+            transferId = session.transferId,
+            totalChunks = totalChunks,
+            lastAckedChunk = chunkIndex.toInt(),
+            tempFilePath = session.tempFile?.absolutePath ?: "",
+            sha256State = null,  // incremental state serialisation not yet supported
+            updatedAt = System.currentTimeMillis(),
+        )
+        // Use insert with REPLACE conflict strategy for the first checkpoint;
+        // subsequent writes use updateProgress for lower overhead.
+        val existing = chunkProgressDao.getByTransferId(session.transferId)
+        if (existing == null) {
+            chunkProgressDao.insert(entity)
+        } else {
+            chunkProgressDao.updateProgress(
+                transferId = session.transferId,
+                lastAckedChunk = chunkIndex.toInt(),
+                sha256State = null,
+                updatedAt = entity.updatedAt,
+            )
+        }
+        session.chunksAckedSinceCheckpoint = 0
+        session.lastCheckpointTime = entity.updatedAt
+        Log.v(TAG, "Checkpoint saved: transferId=${session.transferId} lastAckedChunk=$chunkIndex")
+    }
+
+    /**
+     * Deletes the chunk-progress checkpoint for [transferId] from Room.
+     *
+     * Must be called when a transfer reaches a terminal state (COMPLETE, FAILED, CANCELLED)
+     * so that the startup recovery scan does not attempt to resume it.
+     *
+     * @param transferId UUID of the completed or failed transfer.
+     */
+    suspend fun clearCheckpoint(transferId: String) {
+        chunkProgressDao.delete(transferId)
+        Log.d(TAG, "Checkpoint cleared: transferId=$transferId")
     }
 
     /**
