@@ -6,6 +6,7 @@
     "test": "node --test test/*.test.js"
   },
   "dependencies": {
-    "libsodium-wrappers-sumo": "^0.8.2"
+    "libsodium-wrappers-sumo": "^0.8.2",
+    "qrcode-generator": "^2.0.4"
   }
 }

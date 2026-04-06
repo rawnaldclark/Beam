@@ -202,6 +202,7 @@ fun PinEntryScreen(
                         value = digits[index].value,
                         focusRequester = focusRequesters[index],
                         isError = errorMessage != null,
+                        isLast = index == PIN_LENGTH - 1,
                         onValueChange = { onDigitChanged(index, it) },
                         onBackspace = { onBackspace(index) },
                     )
@@ -255,6 +256,7 @@ private fun DigitBox(
     value: String,
     focusRequester: FocusRequester,
     isError: Boolean,
+    isLast: Boolean = false,
     onValueChange: (String) -> Unit,
     onBackspace: () -> Unit,
 ) {
@@ -262,9 +264,7 @@ private fun DigitBox(
         value = value,
         onValueChange = { newVal ->
             when {
-                // Deletion: the system sends "" when the user backspaces the only character
                 newVal.isEmpty() -> onBackspace()
-                // Accept only digits; take only the most recently typed character
                 else -> {
                     val filtered = newVal.filter { it.isDigit() }
                     if (filtered.isNotEmpty()) {
@@ -274,15 +274,15 @@ private fun DigitBox(
             }
         },
         modifier = Modifier
-            .size(width = 40.dp, height = 56.dp)
+            .size(width = 44.dp, height = 58.dp)
             .focusRequester(focusRequester),
         textStyle = TextStyle(
-            fontSize = 20.sp,
+            fontSize = 22.sp,
             textAlign = TextAlign.Center,
         ),
         keyboardOptions = KeyboardOptions(
             keyboardType = KeyboardType.NumberPassword,
-            imeAction = ImeAction.Next,
+            imeAction = if (isLast) ImeAction.Done else ImeAction.Next,
         ),
         singleLine = true,
         isError = isError,
