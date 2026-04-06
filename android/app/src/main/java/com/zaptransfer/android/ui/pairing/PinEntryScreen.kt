@@ -12,7 +12,6 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
@@ -143,62 +142,37 @@ fun PinEntryScreen(
                 singleLine = true,
             )
 
-            // Visual digit boxes — read-only display of pinText characters
+            // Visual digit boxes — two rows of 4 for guaranteed fit on any screen
+            // Row 1: digits 1-4
             Row(
-                horizontalArrangement = Arrangement.Center,
-                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
                 modifier = Modifier.fillMaxWidth(),
             ) {
-                repeat(PIN_LENGTH) { index ->
-                    if (index == 4) {
-                        // Separator between groups of 4
-                        Spacer(modifier = Modifier.width(12.dp))
-                        Text(
-                            text = "—",
-                            style = MaterialTheme.typography.headlineMedium,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                        )
-                        Spacer(modifier = Modifier.width(12.dp))
-                    }
+                repeat(4) { index ->
+                    DigitBox(
+                        digit = pinText.getOrNull(index)?.toString() ?: "",
+                        isFocused = index == pinText.length,
+                        hasError = errorMessage != null,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
 
-                    val digit = pinText.getOrNull(index)?.toString() ?: ""
-                    val isFocused = index == pinText.length // next digit to enter
-                    val hasError = errorMessage != null
+            Spacer(modifier = Modifier.height(12.dp))
 
-                    Box(
-                        contentAlignment = Alignment.Center,
-                        modifier = Modifier
-                            .size(width = 48.dp, height = 60.dp)
-                            .border(
-                                width = if (isFocused) 2.dp else 1.dp,
-                                color = when {
-                                    hasError -> MaterialTheme.colorScheme.error
-                                    isFocused -> MaterialTheme.colorScheme.primary
-                                    digit.isNotEmpty() -> MaterialTheme.colorScheme.outline
-                                    else -> MaterialTheme.colorScheme.outlineVariant
-                                },
-                                shape = RoundedCornerShape(12.dp),
-                            )
-                            .background(
-                                color = if (digit.isNotEmpty())
-                                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                                else Color.Transparent,
-                                shape = RoundedCornerShape(12.dp),
-                            ),
-                    ) {
-                        Text(
-                            text = digit,
-                            style = TextStyle(
-                                fontSize = 28.sp,
-                                textAlign = TextAlign.Center,
-                                color = MaterialTheme.colorScheme.onSurface,
-                            ),
-                        )
-                    }
-
-                    if (index < PIN_LENGTH - 1 && index != 3) {
-                        Spacer(modifier = Modifier.width(6.dp))
-                    }
+            // Row 2: digits 5-8
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                repeat(4) { index ->
+                    val actualIndex = index + 4
+                    DigitBox(
+                        digit = pinText.getOrNull(actualIndex)?.toString() ?: "",
+                        isFocused = actualIndex == pinText.length,
+                        hasError = errorMessage != null,
+                        modifier = Modifier.weight(1f),
+                    )
                 }
             }
 
@@ -221,5 +195,44 @@ fun PinEntryScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
         }
+    }
+}
+
+@Composable
+private fun DigitBox(
+    digit: String,
+    isFocused: Boolean,
+    hasError: Boolean,
+    modifier: Modifier = Modifier,
+) {
+    Box(
+        contentAlignment = Alignment.Center,
+        modifier = modifier
+            .height(64.dp)
+            .border(
+                width = if (isFocused) 2.dp else 1.dp,
+                color = when {
+                    hasError -> MaterialTheme.colorScheme.error
+                    isFocused -> MaterialTheme.colorScheme.primary
+                    digit.isNotEmpty() -> MaterialTheme.colorScheme.outline
+                    else -> MaterialTheme.colorScheme.outlineVariant
+                },
+                shape = RoundedCornerShape(12.dp),
+            )
+            .background(
+                color = if (digit.isNotEmpty())
+                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
+                else Color.Transparent,
+                shape = RoundedCornerShape(12.dp),
+            ),
+    ) {
+        Text(
+            text = digit,
+            style = TextStyle(
+                fontSize = 28.sp,
+                textAlign = TextAlign.Center,
+                color = MaterialTheme.colorScheme.onSurface,
+            ),
+        )
     }
 }

@@ -389,7 +389,8 @@ class PairingViewModel @Inject constructor(
         require(version == 1) { "Unsupported QR payload version: $version" }
 
         val deviceId = json.getString("did")
-        require(deviceId.length == 22) { "Invalid device ID length: ${deviceId.length}" }
+        Log.d("PairingViewModel", "QR payload: did=$deviceId (len=${deviceId.length}), raw=$rawJson")
+        require(deviceId.length >= 16) { "Invalid device ID length: ${deviceId.length} (expected 22, got '$deviceId')" }
 
         val epkBase64 = json.getString("epk")
         val xpkBase64 = json.getString("xpk")
