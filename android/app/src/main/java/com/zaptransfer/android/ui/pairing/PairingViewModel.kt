@@ -446,10 +446,13 @@ class PairingViewModel @Inject constructor(
         // Use the Chrome device's deviceId as the rendezvous point for pairing
         // (both sides register it so the relay can route between them).
         try {
+            Log.d(TAG, "Connecting to relay at ${payload.relayUrl}...")
             ensureRelayConnected(payload.relayUrl)
+            Log.d(TAG, "Relay connected. State: ${signalingClient.connectionState.value}")
 
             // Register the Chrome deviceId as rendezvous so we share a room
             signalingClient.registerRendezvous(listOf(payload.deviceId))
+            Log.d(TAG, "Registered rendezvous: ${payload.deviceId}")
 
             // Send PAIRING_REQUEST carrying our public keys to the Chrome peer
             val pairingRequest = JSONObject().apply {
@@ -460,12 +463,10 @@ class PairingViewModel @Inject constructor(
                 put("ed25519Pk", Base64.encodeToString(ourKeys.ed25519Pk, Base64.NO_WRAP))
                 put("x25519Pk", Base64.encodeToString(ourKeys.x25519Pk, Base64.NO_WRAP))
             }
-            signalingClient.send(pairingRequest)
-            Log.d(TAG, "PAIRING_REQUEST sent to ${payload.deviceId}")
+            val sent = signalingClient.send(pairingRequest)
+            Log.d(TAG, "PAIRING_REQUEST send result=$sent to ${payload.deviceId}")
         } catch (e: Exception) {
-            Log.w(TAG, "Failed to send PAIRING_REQUEST (non-fatal): ${e.message}", e)
-            // Non-fatal: SAS verification can still proceed; the Chrome side
-            // may receive the request on a retry or the user can re-scan.
+            Log.e(TAG, "Failed to send PAIRING_REQUEST: ${e.message}", e)
         }
 
         _uiState.value = PairingUiState.Verifying(
