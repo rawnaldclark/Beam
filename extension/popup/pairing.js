@@ -40,62 +40,56 @@ import { MSG } from '../shared/message-types.js';
  *   respond (e.g. it was not yet initialised).
  */
 export async function startPairing() {
-  // Read device keys directly from storage — no message passing needed.
-  // This avoids the complex SW→offscreen→SW→popup forwarding chain.
+  // Read keys from storage, or generate them right here in the popup.
+  // libsodium is loaded via <script> tags in popup.html.
   const stored = await chrome.storage.local.get(['deviceId', 'deviceKeys']);
 
   let deviceId = stored.deviceId;
   let ed25519Pk = stored.deviceKeys?.ed25519?.pk;
   let x25519Pk = stored.deviceKeys?.x25519?.pk;
 
-  // If deviceId is missing or invalid, derive it from stored keys
-  if ((!deviceId || deviceId.length < 16) && ed25519Pk) {
-    // Derive deviceId: SHA-256(ed25519Pk)[0:16] → base64url
-    const pkBytes = new Uint8Array(ed25519Pk);
-    const hashBuffer = await crypto.subtle.digest('SHA-256', pkBytes);
-    const idBytes = new Uint8Array(hashBuffer).slice(0, 16);
-    deviceId = btoa(String.fromCharCode(...idBytes))
-      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-    // Persist the fixed deviceId
-    await chrome.storage.local.set({ deviceId });
-    console.log('[Beam] Derived deviceId in popup:', deviceId);
+  // If keys exist and deviceId is valid, use them
+  if (deviceId && deviceId.length >= 16 && ed25519Pk && x25519Pk) {
+    console.log('[Beam] Using stored keys. deviceId:', deviceId);
+    return { deviceId, ed25519Pk, x25519Pk, relayUrl: 'wss://zaptransfer-relay.fly.dev' };
   }
 
-  if (!deviceId || !ed25519Pk || !x25519Pk) {
-    console.warn('[Beam] No keys in storage yet. Generating fresh keys in popup...');
-    // The offscreen document hasn't booted yet or failed. Generate keys here.
-    // Wait for libsodium to load (loaded as script in popup.html? No — only in offscreen)
-    // Use Web Crypto as fallback for key generation
-    // Actually, just trigger the offscreen to boot and wait for it
-    try {
-      await chrome.runtime.sendMessage({ type: MSG.KEEPALIVE_PING });
-      // Give offscreen 2 seconds to boot
-      await new Promise(r => setTimeout(r, 2000));
-      // Re-read storage
-      const retry = await chrome.storage.local.get(['deviceId', 'deviceKeys']);
-      deviceId = retry.deviceId;
-      ed25519Pk = retry.deviceKeys?.ed25519?.pk;
-      x25519Pk = retry.deviceKeys?.x25519?.pk;
-      if (deviceId && ed25519Pk && x25519Pk) {
-        console.log('[Beam] Keys available after boot wait. deviceId:', deviceId);
-      } else {
-        console.error('[Beam] Still no keys after boot wait.');
-        return null;
-      }
-    } catch (e) {
-      console.error('[Beam] Failed to trigger offscreen boot:', e);
-      return null;
-    }
+  // Keys missing or deviceId bad — generate fresh keys using libsodium
+  console.log('[Beam] Generating fresh keys in popup...');
+
+  if (typeof self.sodium === 'undefined' || !self.sodium.ready) {
+    console.error('[Beam] libsodium not loaded in popup');
+    return null;
   }
 
-  console.log('[Beam] startPairing from storage. deviceId:', deviceId, 'length:', deviceId.length);
+  await self.sodium.ready;
+  const s = self.sodium;
 
-  return {
+  // Generate key pairs
+  const x25519Kp = s.crypto_box_keypair();
+  const ed25519Kp = s.crypto_sign_keypair();
+
+  // Derive deviceId: base64url(SHA-256(ed25519Pk)[0:16])
+  const hash = s.crypto_hash_sha256(ed25519Kp.publicKey);
+  const idBytes = hash.slice(0, 16);
+  deviceId = btoa(String.fromCharCode(...idBytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+  // Persist to storage (so offscreen document can use them too)
+  ed25519Pk = Array.from(ed25519Kp.publicKey);
+  x25519Pk = Array.from(x25519Kp.publicKey);
+
+  await chrome.storage.local.set({
     deviceId,
-    ed25519Pk,
-    x25519Pk,
-    relayUrl: 'wss://zaptransfer-relay.fly.dev',
-  };
+    deviceKeys: {
+      x25519:  { pk: Array.from(x25519Kp.publicKey),  sk: Array.from(x25519Kp.privateKey) },
+      ed25519: { pk: Array.from(ed25519Kp.publicKey), sk: Array.from(ed25519Kp.privateKey) },
+    },
+  });
+
+  console.log('[Beam] Generated and stored keys. deviceId:', deviceId, 'length:', deviceId.length);
+
+  return { deviceId, ed25519Pk, x25519Pk, relayUrl: 'wss://zaptransfer-relay.fly.dev' };
 }
 
 // ---------------------------------------------------------------------------

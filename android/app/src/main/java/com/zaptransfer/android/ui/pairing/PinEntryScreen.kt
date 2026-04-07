@@ -2,6 +2,8 @@ package com.zaptransfer.android.ui.pairing
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -33,6 +35,7 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.graphics.Color
@@ -121,20 +124,19 @@ fun PinEntryScreen(
 
             Spacer(modifier = Modifier.height(40.dp))
 
-            // Single hidden BasicTextField that captures all keyboard input.
-            // The visual boxes below are decorative — they read from pinText state.
+            // Hidden BasicTextField that captures all keyboard input.
+            // Rendered with 0 alpha but full width so it's focusable.
             BasicTextField(
                 value = pinText,
                 onValueChange = { newVal ->
-                    // Filter to digits only, cap at PIN_LENGTH
                     val filtered = newVal.filter { it.isDigit() }.take(PIN_LENGTH)
                     pinText = filtered
                 },
                 modifier = Modifier
                     .focusRequester(focusRequester)
-                    // Make the field "invisible" but still focusable
-                    .size(1.dp)
-                    ,
+                    .fillMaxWidth()
+                    .height(1.dp)
+                    .alpha(0f),
                 keyboardOptions = KeyboardOptions(
                     keyboardType = KeyboardType.NumberPassword,
                     imeAction = ImeAction.Done,
@@ -142,11 +144,19 @@ fun PinEntryScreen(
                 singleLine = true,
             )
 
-            // Visual digit boxes — two rows of 4 for guaranteed fit on any screen
+            // Visual digit boxes — tapping anywhere re-focuses the hidden input
             // Row 1: digits 1-4
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() }
+                    ) {
+                        focusRequester.requestFocus()
+                        keyboardController?.show()
+                    },
             ) {
                 repeat(4) { index ->
                     DigitBox(
@@ -163,7 +173,15 @@ fun PinEntryScreen(
             // Row 2: digits 5-8
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(
+                        indication = null,
+                        interactionSource = remember { MutableInteractionSource() }
+                    ) {
+                        focusRequester.requestFocus()
+                        keyboardController?.show()
+                    },
             ) {
                 repeat(4) { index ->
                     val actualIndex = index + 4
