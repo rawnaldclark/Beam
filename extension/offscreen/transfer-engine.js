@@ -297,6 +297,13 @@ async function connectRelay() {
     .map((d) => d.rendezvousId)
     .filter(Boolean);
 
+  // Include our own deviceId as a rendezvous ID so Android devices that
+  // scanned our QR code can route PAIRING_REQUEST messages to us before
+  // a shared rendezvous has been computed.
+  if (!rendezvousIds.includes(deviceId)) {
+    rendezvousIds.push(deviceId);
+  }
+
   try {
     await wsClient.connect(deviceId, deviceKeys, rendezvousIds);
     console.log('[Beam] Relay connected. Presence tracking active.');
@@ -347,6 +354,19 @@ async function connectRelay() {
       await handlePairRequest(msg);
     }
     // Unknown SDP_OFFER shape — silently ignore to remain forward-compatible.
+  });
+
+  // ── Incoming PAIRING_REQUEST from Android peer ──────────────────────────
+  // Dedicated wire type introduced in Phase D+ to replace the overloaded
+  // SDP_OFFER-with-keys approach.  When this handler fires, the Android
+  // device has already scanned our QR code, performed ECDH, and derived
+  // SAS on its side.  We now do the same and push SAS to the popup.
+  wsClient.on(WIRE.PAIRING_REQUEST, async (msg) => {
+    await handlePairRequest({
+      deviceId:  msg.deviceId ?? msg.fromDeviceId,
+      ed25519Pk: _base64ToArray(msg.ed25519Pk),
+      x25519Pk:  _base64ToArray(msg.x25519Pk),
+    });
   });
 
   // ── Incoming WebRTC SDP answer ──────────────────────────────────────────
@@ -946,6 +966,22 @@ function _reconstructFile(payload) {
     type:        mimeType ?? 'application/octet-stream',
     arrayBuffer: () => Promise.resolve(bytes.buffer),
   };
+}
+
+// ---------------------------------------------------------------------------
+// Private helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Decode a standard base64 string into a plain Array of numbers.
+ *
+ * @param {string} b64 - Standard base64-encoded string.
+ * @returns {number[]} Decoded bytes as a plain number array.
+ */
+function _base64ToArray(b64) {
+  return Array.from(new Uint8Array(
+    [...atob(b64)].map(c => c.charCodeAt(0)),
+  ));
 }
 
 // ---------------------------------------------------------------------------

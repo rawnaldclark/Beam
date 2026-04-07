@@ -583,17 +583,20 @@ function handleMessage(msg) {
       }
       break;
 
-    case MSG.PAIRING_SAS:
+    case MSG.PAIRING_SAS: {
       // SAS emojis arrived — switch to SAS verification view.
       showView('sas');
-      if (msg.payload?.sas) {
-        // payload.sas may be a pre-joined string ("🦋 🌊 🐉 🎸") or an array.
-        const emojis = Array.isArray(msg.payload.sas)
-          ? msg.payload.sas
-          : msg.payload.sas.split(/\s+/);
+      // The offscreen sends { emojis, peerId } while the legacy path
+      // may use { sas }.  Handle both shapes.
+      const rawEmojis = msg.payload?.emojis ?? msg.payload?.sas;
+      if (rawEmojis) {
+        const emojis = Array.isArray(rawEmojis)
+          ? rawEmojis
+          : rawEmojis.split(/\s+/);
         displaySAS(el('sas-emojis'), emojis);
       }
       break;
+    }
 
     case MSG.PAIRING_COMPLETE: {
       // Pairing done — clear PIN timer, show naming form.
