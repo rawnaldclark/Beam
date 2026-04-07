@@ -19,7 +19,6 @@
  */
 
 import { MSG } from '../shared/message-types.js';
-import { PairingRelayClient } from './relay-client.js';
 
 // ---------------------------------------------------------------------------
 // QR initiation
@@ -353,28 +352,23 @@ const SAS_EMOJI_TABLE = Object.freeze([
 ]);
 
 // ---------------------------------------------------------------------------
-// Relay connection for pairing ceremony
+// Relay connection for pairing ceremony (delegated to service worker)
 // ---------------------------------------------------------------------------
 
-/** @type {PairingRelayClient|null} */
-let _relayClient = null;
-
-/** @type {CryptoKeyPair|null} In-memory Ed25519 key pair (never exported raw). */
-let _ed25519KeyPair = null;
-
-/** @type {CryptoKeyPair|null} In-memory X25519 key pair for ECDH. */
-let _x25519KeyPair = null;
-
 /**
- * Connect to the relay after QR is displayed, then wait for the Android
- * device's PAIRING_REQUEST message.
+ * Tell the service worker to connect to the relay and listen for a pairing
+ * request from the Android device.
  *
- * Steps:
- *  1. Re-import Ed25519 and X25519 key pairs from chrome.storage.local (PKCS8).
- *  2. Connect to relay, authenticate with Ed25519.
- *  3. Register our deviceId as rendezvous so the relay routes Android's message.
- *  4. Wait for 'pairing-request' from Android (up to 60 s).
- *  5. Perform X25519 ECDH, derive SAS via HKDF, map to 4 emoji.
+ * The WebSocket connection lives in the service worker so it survives the
+ * popup closing when the user switches to their phone to scan the QR code.
+ *
+ * When the pairing request arrives:
+ *   - If the popup is open: SW sends PAIRING_REQUEST_RECEIVED directly.
+ *   - If the popup is closed: SW stores data in chrome.storage.session.
+ *     When the popup reopens, it polls storage and picks it up.
+ *
+ * Once the raw pairing-request message is received (by either path), ECDH
+ * and SAS derivation happen here in the popup using Web Crypto.
  *
  * @param {string} deviceId - Our device ID (displayed in QR, used as rendezvous).
  * @returns {Promise<{emojis: string[], peerId: string, peerKeys: {ed25519Pk: number[], x25519Pk: number[]}, sharedSecret: number[]}>}
@@ -387,132 +381,157 @@ export async function waitForPairingRequest(deviceId) {
     throw new Error('Device keys not found in storage. Call startPairing() first.');
   }
 
-  // Import Ed25519 key pair for relay authentication
-  const ed25519PrivateKey = await crypto.subtle.importKey(
-    'pkcs8',
-    new Uint8Array(stored.deviceKeys.ed25519.sk).buffer,
-    'Ed25519',
-    false,
-    ['sign'],
-  );
-  const ed25519PublicKey = await crypto.subtle.importKey(
-    'raw',
-    new Uint8Array(stored.deviceKeys.ed25519.pk).buffer,
-    'Ed25519',
-    true,
-    ['verify'],
-  );
-  _ed25519KeyPair = { privateKey: ed25519PrivateKey, publicKey: ed25519PublicKey };
+  // Tell the service worker to open the relay WebSocket and authenticate.
+  const result = await chrome.runtime.sendMessage({
+    type: 'START_PAIRING_LISTENER',
+    payload: {
+      deviceId,
+      ed25519Sk: stored.deviceKeys.ed25519.sk,
+      ed25519Pk: stored.deviceKeys.ed25519.pk,
+    },
+  });
 
-  // Import X25519 key pair for ECDH key exchange
+  if (!result?.ok) {
+    throw new Error('SW relay failed: ' + (result?.error || 'no response'));
+  }
+  console.log('[Beam] SW relay listening for pairing');
+
+  // Wait for the pairing request — two delivery paths:
+  //   1. Direct message from SW (popup is open when request arrives).
+  //   2. Poll chrome.storage.session (popup was closed and reopened).
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      chrome.runtime.onMessage.removeListener(listener);
+      clearInterval(pollTimer);
+      chrome.runtime.sendMessage({ type: 'STOP_PAIRING_LISTENER' });
+      reject(new Error('Pairing request timeout (60s)'));
+    }, 60_000);
+
+    /**
+     * Process the raw pairing-request message: ECDH + HKDF -> SAS emoji.
+     * @param {object} msg - The pairing-request relay message.
+     */
+    const handlePairingRequest = async (msg) => {
+      clearTimeout(timeout);
+      try {
+        const derivedResult = await deriveSasFromRequest(msg, stored.deviceKeys);
+        resolve(derivedResult);
+      } catch (err) {
+        reject(err);
+      }
+    };
+
+    // Path 1: Direct message from SW while popup is open.
+    const listener = (msg) => {
+      if (msg.type === 'PAIRING_REQUEST_RECEIVED') {
+        chrome.runtime.onMessage.removeListener(listener);
+        clearInterval(pollTimer);
+        handlePairingRequest(msg.payload);
+      }
+    };
+    chrome.runtime.onMessage.addListener(listener);
+
+    // Path 2: Poll session storage (popup may have been closed and reopened).
+    const pollTimer = setInterval(async () => {
+      const s = await chrome.storage.session.get('pendingPairingRequest');
+      if (s.pendingPairingRequest) {
+        clearInterval(pollTimer);
+        chrome.runtime.onMessage.removeListener(listener);
+        // Clear to prevent double-processing.
+        await chrome.storage.session.remove('pendingPairingRequest');
+        handlePairingRequest(s.pendingPairingRequest);
+      }
+    }, 500);
+  });
+}
+
+/**
+ * Perform X25519 ECDH key exchange and derive the SAS emoji from a raw
+ * pairing-request message.
+ *
+ * @param {object}  msg        - The relay pairing-request message (contains ed25519Pk, x25519Pk).
+ * @param {object}  deviceKeys - Our device keys from chrome.storage.local.
+ * @returns {Promise<{emojis: string[], peerId: string, peerKeys: {ed25519Pk: number[], x25519Pk: number[]}, sharedSecret: number[]}>}
+ */
+async function deriveSasFromRequest(msg, deviceKeys) {
+  const peerId = msg.fromDeviceId || msg.deviceId;
+  console.log('[Beam] Deriving SAS for PAIRING_REQUEST from', peerId);
+
+  const peerX25519PkRaw = base64ToBytes(msg.x25519Pk);
+  const peerEd25519PkRaw = base64ToBytes(msg.ed25519Pk);
+
+  // X25519 ECDH: derive 256-bit shared secret
   const x25519PrivateKey = await crypto.subtle.importKey(
     'pkcs8',
-    new Uint8Array(stored.deviceKeys.x25519.sk).buffer,
+    new Uint8Array(deviceKeys.x25519.sk).buffer,
     'X25519',
     false,
     ['deriveBits'],
   );
-  const x25519PublicKey = await crypto.subtle.importKey(
+  const peerX25519Pk = await crypto.subtle.importKey(
     'raw',
-    new Uint8Array(stored.deviceKeys.x25519.pk).buffer,
+    peerX25519PkRaw.buffer,
     'X25519',
-    true,
+    false,
     [],
   );
-  _x25519KeyPair = { privateKey: x25519PrivateKey, publicKey: x25519PublicKey };
+  const sharedBits = await crypto.subtle.deriveBits(
+    { name: 'X25519', public: peerX25519Pk },
+    x25519PrivateKey,
+    256,
+  );
+  const sharedSecret = new Uint8Array(sharedBits);
 
-  // Connect to relay and authenticate
-  _relayClient = new PairingRelayClient();
-  await _relayClient.connect(deviceId, _ed25519KeyPair);
-  console.log('[Beam] Connected to relay for pairing');
+  // SAS derivation (spec section 4.4.2):
+  //   salt = chrome_ed25519_pk (32B) || android_ed25519_pk (32B)
+  // Android does: salt = payload.ed25519Pk + ourKeys.ed25519Pk
+  //   where payload.ed25519Pk = chrome's pk (from QR), ourKeys = android's pk.
+  // Chrome must use the same order: our_pk || peer_pk.
+  const ourEd25519Pk = new Uint8Array(deviceKeys.ed25519.pk);
+  const salt = new Uint8Array(ourEd25519Pk.length + peerEd25519PkRaw.length);
+  salt.set(ourEd25519Pk);
+  salt.set(peerEd25519PkRaw, ourEd25519Pk.length);
 
-  // Register our deviceId as rendezvous (Android uses this to route to us)
-  _relayClient.registerRendezvous([deviceId]);
+  // HKDF-SHA256(ikm=sharedSecret, salt=salt, info="zaptransfer-sas-v1", len=8)
+  const hkdfKey = await crypto.subtle.importKey(
+    'raw',
+    sharedSecret,
+    'HKDF',
+    false,
+    ['deriveBits'],
+  );
+  const sasBits = await crypto.subtle.deriveBits(
+    {
+      name: 'HKDF',
+      hash: 'SHA-256',
+      salt: salt,
+      info: new TextEncoder().encode('zaptransfer-sas-v1'),
+    },
+    hkdfKey,
+    64, // 8 bytes = 64 bits
+  );
+  const sasBytes = new Uint8Array(sasBits);
 
-  // Wait for PAIRING_REQUEST from Android
-  return new Promise((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      _relayClient?.disconnect();
-      reject(new Error('Pairing request timeout (60s)'));
-    }, 60000);
+  // Map 8 SAS bytes to 4 emoji (2 bytes per emoji, big-endian uint16 mod 256)
+  const emojis = sasToEmoji(sasBytes);
 
-    _relayClient.on('pairing-request', async (msg) => {
-      clearTimeout(timeout);
-
-      const peerId = msg.fromDeviceId || msg.deviceId;
-      console.log('[Beam] Received PAIRING_REQUEST from', peerId);
-
-      try {
-        const peerX25519PkRaw = base64ToBytes(msg.x25519Pk);
-        const peerEd25519PkRaw = base64ToBytes(msg.ed25519Pk);
-
-        // X25519 ECDH: derive 256-bit shared secret
-        const peerX25519Pk = await crypto.subtle.importKey(
-          'raw',
-          peerX25519PkRaw.buffer,
-          'X25519',
-          false,
-          [],
-        );
-        const sharedBits = await crypto.subtle.deriveBits(
-          { name: 'X25519', public: peerX25519Pk },
-          _x25519KeyPair.privateKey,
-          256,
-        );
-        const sharedSecret = new Uint8Array(sharedBits);
-
-        // SAS derivation (spec section 4.4.2):
-        //   salt = chrome_ed25519_pk (32B) || android_ed25519_pk (32B)
-        // Android does: salt = payload.ed25519Pk + ourKeys.ed25519Pk
-        //   where payload.ed25519Pk = chrome's pk (from QR), ourKeys = android's pk.
-        // Chrome must use the same order: our_pk || peer_pk.
-        const ourEd25519Pk = new Uint8Array(stored.deviceKeys.ed25519.pk);
-        const salt = new Uint8Array(ourEd25519Pk.length + peerEd25519PkRaw.length);
-        salt.set(ourEd25519Pk);
-        salt.set(peerEd25519PkRaw, ourEd25519Pk.length);
-
-        // HKDF-SHA256(ikm=sharedSecret, salt=salt, info="zaptransfer-sas-v1", len=8)
-        const hkdfKey = await crypto.subtle.importKey(
-          'raw',
-          sharedSecret,
-          'HKDF',
-          false,
-          ['deriveBits'],
-        );
-        const sasBits = await crypto.subtle.deriveBits(
-          {
-            name: 'HKDF',
-            hash: 'SHA-256',
-            salt: salt,
-            info: new TextEncoder().encode('zaptransfer-sas-v1'),
-          },
-          hkdfKey,
-          64, // 8 bytes = 64 bits
-        );
-        const sasBytes = new Uint8Array(sasBits);
-
-        // Map 8 SAS bytes to 4 emoji (2 bytes per emoji, big-endian uint16 mod 256)
-        const emojis = sasToEmoji(sasBytes);
-
-        resolve({
-          emojis,
-          peerId,
-          peerKeys: {
-            ed25519Pk: Array.from(peerEd25519PkRaw),
-            x25519Pk: Array.from(peerX25519PkRaw),
-          },
-          sharedSecret: Array.from(sharedSecret),
-        });
-      } catch (err) {
-        reject(err);
-      }
-    });
-  });
+  return {
+    emojis,
+    peerId,
+    peerKeys: {
+      ed25519Pk: Array.from(peerEd25519PkRaw),
+      x25519Pk: Array.from(peerX25519PkRaw),
+    },
+    sharedSecret: Array.from(sharedSecret),
+  };
 }
 
 /**
  * Send PAIRING_ACK back to Android after the user confirms the SAS emoji match,
  * then save the paired device to chrome.storage.local.
+ *
+ * The ACK is sent through the service worker's relay WebSocket connection
+ * (which may still be open from the startPairingListener call).
  *
  * @param {string} peerId - The Android device's ID.
  * @param {{ed25519Pk: number[], x25519Pk: number[]}} peerKeys - Android's public keys.
@@ -520,22 +539,23 @@ export async function waitForPairingRequest(deviceId) {
  * @returns {Promise<void>}
  */
 export async function confirmPairing(peerId, peerKeys, deviceId) {
-  // Send acknowledgement to Android via relay
-  if (_relayClient?.isConnected) {
-    const stored = await chrome.storage.local.get(['deviceKeys']);
-    _relayClient.send({
+  // Send acknowledgement to Android via the SW's relay WebSocket.
+  const stored = await chrome.storage.local.get(['deviceKeys']);
+  await chrome.runtime.sendMessage({
+    type: 'SEND_PAIRING_MESSAGE',
+    payload: {
       type:           'pairing-ack',
       targetDeviceId: peerId,
       rendezvousId:   deviceId,
       deviceId:       deviceId,
       ed25519Pk:      bytesToBase64(new Uint8Array(stored.deviceKeys.ed25519.pk)),
       x25519Pk:       bytesToBase64(new Uint8Array(stored.deviceKeys.x25519.pk)),
-    });
-  }
+    },
+  });
 
   // Save paired device to storage
-  const stored = await chrome.storage.local.get(['pairedDevices']);
-  const devices = stored.pairedDevices || [];
+  const existing = await chrome.storage.local.get(['pairedDevices']);
+  const devices = existing.pairedDevices || [];
   devices.push({
     deviceId:        peerId,
     name:            'Android Device', // User will rename in the naming step
@@ -546,22 +566,16 @@ export async function confirmPairing(peerId, peerKeys, deviceId) {
   });
   await chrome.storage.local.set({ pairedDevices: devices });
 
-  // Clean up relay connection
-  _relayClient?.disconnect();
-  _relayClient = null;
-  _ed25519KeyPair = null;
-  _x25519KeyPair = null;
+  // Tell SW to close the pairing relay connection.
+  chrome.runtime.sendMessage({ type: 'STOP_PAIRING_LISTENER' });
 }
 
 /**
- * Disconnect the pairing relay client without completing pairing.
- * Called when the user cancels pairing or navigates away.
+ * Cancel the pairing ceremony and tell the service worker to close
+ * its relay WebSocket. Called when the user cancels pairing or navigates away.
  */
 export function cancelPairingRelay() {
-  _relayClient?.disconnect();
-  _relayClient = null;
-  _ed25519KeyPair = null;
-  _x25519KeyPair = null;
+  chrome.runtime.sendMessage({ type: 'STOP_PAIRING_LISTENER' });
 }
 
 /**

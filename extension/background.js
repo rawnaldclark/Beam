@@ -30,6 +30,7 @@
 
 import { MSG }                  from './shared/message-types.js';
 import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
+import { startPairingListener, stopPairingListener, sendPairingMessage } from './background-relay.js';
 
 // ---------------------------------------------------------------------------
 // Badge state — tracks a pending "failure" clear so we can dismiss it on the
@@ -136,6 +137,23 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .then(data  => sendResponse({ type: MSG.IMAGE_FETCHED, payload: { data } }))
         .catch(err  => sendResponse({ type: MSG.IMAGE_FETCHED, payload: { error: err.message } }));
       return true; // async sendResponse
+
+    // ── Pairing relay (runs in SW so it survives popup close) ────────────────
+    case 'START_PAIRING_LISTENER': {
+      const { deviceId, ed25519Sk, ed25519Pk } = msg.payload;
+      startPairingListener(deviceId, ed25519Sk, ed25519Pk)
+        .then(() => sendResponse({ ok: true }))
+        .catch(err => sendResponse({ ok: false, error: err.message }));
+      return true; // async sendResponse
+    }
+
+    case 'STOP_PAIRING_LISTENER':
+      stopPairingListener();
+      break;
+
+    case 'SEND_PAIRING_MESSAGE':
+      sendPairingMessage(msg.payload);
+      break;
 
     // ── All other messages — forward to offscreen document ─────────────────
     default: {
