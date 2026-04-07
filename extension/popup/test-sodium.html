@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html>
+<head><title>Sodium Test</title></head>
+<body>
+<pre id="out">Loading...</pre>
+<script src="../lib/libsodium-sumo.js"></script>
+<script src="../lib/libsodium-wrappers-sumo.js"></script>
+<script>
+const out = document.getElementById('out');
+out.textContent = 'Scripts loaded.\n';
+out.textContent += 'window.libsodium: ' + (typeof window.libsodium) + '\n';
+out.textContent += 'window.sodium: ' + (typeof window.sodium) + '\n';
+out.textContent += 'self.sodium: ' + (typeof self.sodium) + '\n';
+
+if (window.sodium && window.sodium.ready) {
+  out.textContent += 'sodium.ready exists, awaiting...\n';
+  window.sodium.ready.then(function(s) {
+    out.textContent += 'sodium READY!\n';
+    var kp = s.crypto_sign_keypair();
+    out.textContent += 'ed25519 pk length: ' + kp.publicKey.length + '\n';
+    var hash = s.crypto_hash_sha256(kp.publicKey);
+    var idBytes = hash.slice(0, 16);
+    var b64 = btoa(String.fromCharCode.apply(null, idBytes));
+    var deviceId = b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    out.textContent += 'deviceId: ' + deviceId + ' (len=' + deviceId.length + ')\n';
+    out.textContent += '\nSUCCESS - sodium works in popup!\n';
+  }).catch(function(e) {
+    out.textContent += 'sodium.ready FAILED: ' + e.message + '\n';
+  });
+} else {
+  out.textContent += 'sodium NOT available!\n';
+  out.textContent += 'Check: self.libsodium=' + (typeof self.libsodium) + '\n';
+}
+</script>
+</body>
+</html>

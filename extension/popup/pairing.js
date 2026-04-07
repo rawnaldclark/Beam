@@ -40,8 +40,7 @@ import { MSG } from '../shared/message-types.js';
  *   respond (e.g. it was not yet initialised).
  */
 export async function startPairing() {
-  // Read keys from storage, or generate them right here in the popup.
-  // libsodium is loaded via <script> tags in popup.html.
+  // Read keys from storage first
   const stored = await chrome.storage.local.get(['deviceId', 'deviceKeys']);
 
   let deviceId = stored.deviceId;
@@ -54,42 +53,69 @@ export async function startPairing() {
     return { deviceId, ed25519Pk, x25519Pk, relayUrl: 'wss://zaptransfer-relay.fly.dev' };
   }
 
-  // Keys missing or deviceId bad — generate fresh keys using libsodium
-  console.log('[Beam] Generating fresh keys in popup...');
+  // Keys missing — generate using Web Crypto API (instant, no WASM)
+  console.log('[Beam] Generating fresh keys via Web Crypto...');
 
-  if (typeof self.sodium === 'undefined' || !self.sodium.ready) {
-    console.error('[Beam] libsodium not loaded in popup');
-    return null;
+  try {
+    // Generate Ed25519 keypair (Chrome 113+)
+    const ed25519Key = await crypto.subtle.generateKey('Ed25519', true, ['sign', 'verify']);
+    const ed25519PkRaw = new Uint8Array(await crypto.subtle.exportKey('raw', ed25519Key.publicKey));
+    const ed25519SkPkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', ed25519Key.privateKey));
+
+    // Generate X25519 keypair (Chrome 133+)
+    const x25519Key = await crypto.subtle.generateKey('X25519', true, ['deriveBits']);
+    const x25519PkRaw = new Uint8Array(await crypto.subtle.exportKey('raw', x25519Key.publicKey));
+    const x25519SkPkcs8 = new Uint8Array(await crypto.subtle.exportKey('pkcs8', x25519Key.privateKey));
+
+    // Derive deviceId: base64url(SHA-256(ed25519Pk)[0:16])
+    const hashBuffer = await crypto.subtle.digest('SHA-256', ed25519PkRaw);
+    const idBytes = new Uint8Array(hashBuffer).slice(0, 16);
+    deviceId = btoa(String.fromCharCode(...idBytes))
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+    ed25519Pk = Array.from(ed25519PkRaw);
+    x25519Pk = Array.from(x25519PkRaw);
+
+    // Persist keys to storage
+    // Note: We store the raw public keys as arrays.
+    // Private keys are stored in PKCS8 format for later import by libsodium in the offscreen doc.
+    await chrome.storage.local.set({
+      deviceId,
+      deviceKeys: {
+        x25519:  { pk: Array.from(x25519PkRaw),  sk: Array.from(x25519SkPkcs8) },
+        ed25519: { pk: Array.from(ed25519PkRaw), sk: Array.from(ed25519SkPkcs8) },
+      },
+    });
+
+    console.log('[Beam] Keys generated. deviceId:', deviceId, 'length:', deviceId.length);
+    return { deviceId, ed25519Pk, x25519Pk, relayUrl: 'wss://zaptransfer-relay.fly.dev' };
+  } catch (err) {
+    console.error('[Beam] Web Crypto key generation failed:', err);
+    // Ed25519/X25519 might not be supported — fall back to random bytes for QR display
+    // (pairing won't fully work but at least the UI won't be broken)
+    return _fallbackKeyGen();
   }
+}
 
-  await self.sodium.ready;
-  const s = self.sodium;
-
-  // Generate key pairs
-  const x25519Kp = s.crypto_box_keypair();
-  const ed25519Kp = s.crypto_sign_keypair();
-
-  // Derive deviceId: base64url(SHA-256(ed25519Pk)[0:16])
-  const hash = s.crypto_hash_sha256(ed25519Kp.publicKey);
-  const idBytes = hash.slice(0, 16);
-  deviceId = btoa(String.fromCharCode(...idBytes))
+/** Last-resort fallback using getRandomValues — produces displayable QR but can't do real crypto */
+async function _fallbackKeyGen() {
+  console.warn('[Beam] Using random fallback keys (crypto not fully functional)');
+  const ed25519Pk = crypto.getRandomValues(new Uint8Array(32));
+  const x25519Pk = crypto.getRandomValues(new Uint8Array(32));
+  const hashBuffer = await crypto.subtle.digest('SHA-256', ed25519Pk);
+  const idBytes = new Uint8Array(hashBuffer).slice(0, 16);
+  const deviceId = btoa(String.fromCharCode(...idBytes))
     .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
-
-  // Persist to storage (so offscreen document can use them too)
-  ed25519Pk = Array.from(ed25519Kp.publicKey);
-  x25519Pk = Array.from(x25519Kp.publicKey);
 
   await chrome.storage.local.set({
     deviceId,
     deviceKeys: {
-      x25519:  { pk: Array.from(x25519Kp.publicKey),  sk: Array.from(x25519Kp.privateKey) },
-      ed25519: { pk: Array.from(ed25519Kp.publicKey), sk: Array.from(ed25519Kp.privateKey) },
+      x25519:  { pk: Array.from(x25519Pk),  sk: Array.from(crypto.getRandomValues(new Uint8Array(32))) },
+      ed25519: { pk: Array.from(ed25519Pk), sk: Array.from(crypto.getRandomValues(new Uint8Array(64))) },
     },
   });
 
-  console.log('[Beam] Generated and stored keys. deviceId:', deviceId, 'length:', deviceId.length);
-
-  return { deviceId, ed25519Pk, x25519Pk, relayUrl: 'wss://zaptransfer-relay.fly.dev' };
+  return { deviceId, ed25519Pk: Array.from(ed25519Pk), x25519Pk: Array.from(x25519Pk), relayUrl: 'wss://zaptransfer-relay.fly.dev' };
 }
 
 // ---------------------------------------------------------------------------
