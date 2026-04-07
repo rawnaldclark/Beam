@@ -104,12 +104,15 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
         }
       }
       else if (msg.type === 'auth-ok') {
-        console.log('[Beam SW] Pairing relay authenticated');
+        console.log('[Beam SW] Pairing relay authenticated as', deviceId);
         // Register our deviceId as rendezvous so the relay routes Android's message.
         pairingWs.send(JSON.stringify({
           type: 'register-rendezvous',
           rendezvousIds: [deviceId],
         }));
+        console.log('[Beam SW] Registered rendezvous:', deviceId);
+        // Start heartbeat to keep connection alive while user switches to phone
+        _startHeartbeat();
         resolve();
       }
       else if (msg.type === 'auth-fail') {
@@ -140,14 +143,30 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
       }
     };
 
-    pairingWs.onerror = () => {
+    pairingWs.onerror = (e) => {
+      console.error('[Beam SW] Pairing relay WebSocket error');
       reject(new Error('WebSocket connection error'));
     };
 
-    pairingWs.onclose = () => {
+    pairingWs.onclose = (e) => {
+      console.warn('[Beam SW] Pairing relay WebSocket closed. Code:', e.code, 'Reason:', e.reason);
+      if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
       pairingWs = null;
     };
   });
+}
+
+/** @type {number|null} */
+let _heartbeatTimer = null;
+
+/** Start sending pings every 25 seconds to keep the connection alive. */
+function _startHeartbeat() {
+  if (_heartbeatTimer) clearInterval(_heartbeatTimer);
+  _heartbeatTimer = setInterval(() => {
+    if (pairingWs?.readyState === WebSocket.OPEN) {
+      pairingWs.send(JSON.stringify({ type: 'ping' }));
+    }
+  }, 25000);
 }
 
 /**
@@ -155,6 +174,7 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
  * Safe to call even if no connection is active.
  */
 export function stopPairingListener() {
+  if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
   if (pairingWs) {
     pairingWs.onmessage = null;
     pairingWs.onerror = null;
