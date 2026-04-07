@@ -140,10 +140,17 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ── Pairing relay (runs in SW so it survives popup close) ────────────────
     case 'START_PAIRING_LISTENER': {
+      console.log('[Beam SW] START_PAIRING_LISTENER received, deviceId:', msg.payload?.deviceId);
       const { deviceId, ed25519Sk, ed25519Pk } = msg.payload;
       startPairingListener(deviceId, ed25519Sk, ed25519Pk)
-        .then(() => sendResponse({ ok: true }))
-        .catch(err => sendResponse({ ok: false, error: err.message }));
+        .then(() => {
+          console.log('[Beam SW] Pairing listener started successfully');
+          sendResponse({ ok: true });
+        })
+        .catch(err => {
+          console.error('[Beam SW] Pairing listener failed:', err.message);
+          sendResponse({ ok: false, error: err.message });
+        });
       return true; // async sendResponse
     }
 
