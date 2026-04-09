@@ -499,6 +499,11 @@ async function showPairingView() {
   pendingPairing = null;
   pairingDeviceId = null;
 
+  // Clear stale pairing data from previous failed attempts.
+  await chrome.storage.session.remove('pendingPairingRequest').catch(() => {});
+  // Stop any existing SW relay listener from a previous attempt.
+  chrome.runtime.sendMessage({ type: 'STOP_PAIRING_LISTENER' }).catch(() => {});
+
   showView('pairing');
 
   // Reset QR container to placeholder state while waiting for data.
@@ -570,9 +575,12 @@ async function showPairingView() {
     showView('sas');
   } catch (err) {
     console.error('[Beam popup] waitForPairingRequest failed:', err);
+    // Clean up stale pairing state.
+    await chrome.storage.session.remove('pendingPairingRequest').catch(() => {});
+    chrome.runtime.sendMessage({ type: 'STOP_PAIRING_LISTENER' }).catch(() => {});
     // Only show error if we are still on the pairing view (user may have cancelled)
     if (!document.getElementById('view-pairing')?.classList.contains('hidden')) {
-      showToast('Pairing failed: ' + err.message, 'error');
+      showToast('Pairing timed out. Try again.', 'error');
       showView('main');
     }
   }
