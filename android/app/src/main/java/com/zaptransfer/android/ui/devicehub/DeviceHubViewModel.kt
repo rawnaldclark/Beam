@@ -6,7 +6,9 @@ import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.zaptransfer.android.data.db.dao.ClipboardDao
 import com.zaptransfer.android.data.db.dao.TransferHistoryDao
+import com.zaptransfer.android.data.db.entity.ClipboardEntryEntity
 import com.zaptransfer.android.data.db.entity.PairedDeviceEntity
 import com.zaptransfer.android.data.db.entity.TransferHistoryEntity
 import com.zaptransfer.android.data.repository.DeviceRepository
@@ -58,6 +60,7 @@ private const val TAG = "DeviceHubVM"
 class DeviceHubViewModel @Inject constructor(
     private val deviceRepo: DeviceRepository,
     private val transferHistoryDao: TransferHistoryDao,
+    private val clipboardDao: ClipboardDao,
     private val signalingClient: SignalingClient,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
@@ -83,6 +86,26 @@ class DeviceHubViewModel @Inject constructor(
             // Copy to Android system clipboard
             val clipboardManager = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
             clipboardManager.setPrimaryClip(ClipData.newPlainText("Beam Clipboard", content))
+
+            // Persist to Room for the "Received Clipboard" history section
+            viewModelScope.launch {
+                try {
+                    clipboardDao.insert(
+                        ClipboardEntryEntity(
+                            deviceId = from,
+                            content = content,
+                            isUrl = android.util.Patterns.WEB_URL.matcher(content).find(),
+                            receivedAt = System.currentTimeMillis(),
+                        )
+                    )
+                    // Trim to 20 entries max
+                    while (clipboardDao.getCount() > 20) {
+                        clipboardDao.deleteOldest()
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "Failed to persist clipboard entry: ${e.message}")
+                }
+            }
 
             // Notify the UI
             val preview = if (content.length > 60) content.take(57) + "..." else content
@@ -178,6 +201,30 @@ class DeviceHubViewModel @Inject constructor(
         } else {
             _toastEvents.tryEmit("Failed to send: relay not connected")
         }
+    }
+
+    /**
+     * The 10 most recent clipboard entries, ordered newest-first.
+     * Drives the "Received Clipboard" section on the Device Hub screen.
+     */
+    val recentClipboard: StateFlow<List<ClipboardEntryEntity>> =
+        clipboardDao.getRecent(10)
+            .stateIn(
+                scope = viewModelScope,
+                started = SharingStarted.WhileSubscribed(5_000),
+                initialValue = emptyList(),
+            )
+
+    /**
+     * Copies the given text to the Android system clipboard.
+     * Used by the "Copy" button on received clipboard items.
+     *
+     * @param text The text content to place on the clipboard.
+     */
+    fun copyToClipboard(text: String) {
+        val clipboardManager = appContext.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboardManager.setPrimaryClip(ClipData.newPlainText("Beam Clipboard", text))
+        _toastEvents.tryEmit("Copied to clipboard")
     }
 
     /**

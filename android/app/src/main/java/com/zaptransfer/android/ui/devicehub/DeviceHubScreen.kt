@@ -22,6 +22,7 @@ import androidx.compose.material.icons.filled.PhoneAndroid
 import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Tablet
 import androidx.compose.material.icons.filled.DesktopWindows
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Card
@@ -98,6 +99,7 @@ fun DeviceHubScreen(
 ) {
     val uiState by viewModel.uiState.collectAsState()
     val recentTransfers by viewModel.recentTransfers.collectAsState()
+    val clipboardItems by viewModel.recentClipboard.collectAsState()
 
     // Observe toast events from the ViewModel (clipboard send/receive feedback).
     val context = LocalContext.current
@@ -201,6 +203,30 @@ fun DeviceHubScreen(
                             onSendText = { onSendText(deviceUi.entity.deviceId) },
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                         )
+                    }
+
+                    // ── Section: Received Clipboard ────────────────────────────
+                    if (clipboardItems.isNotEmpty()) {
+                        item {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SectionHeader(title = "Received Clipboard")
+                            Divider(
+                                modifier = Modifier.padding(horizontal = 16.dp),
+                                color = MaterialTheme.colorScheme.outlineVariant,
+                            )
+                        }
+
+                        items(
+                            items = clipboardItems,
+                            key = { it.entryId },
+                        ) { entry ->
+                            ReceivedClipboardItem(
+                                content = entry.content,
+                                timestamp = entry.receivedAt,
+                                isUrl = entry.isUrl,
+                                onCopy = { viewModel.copyToClipboard(entry.content) },
+                            )
+                        }
                     }
 
                     // ── Section header: Recent Transfers ────────────────────────
@@ -421,5 +447,81 @@ private fun connectionTypeLabel(platform: String): String = when (platform) {
     "chrome_extension" -> "Browser Extension"
     "android" -> "Android"
     else -> platform.replaceFirstChar { it.uppercase() }
+}
+
+// ── Received Clipboard item ───────────────────────────────────────────────────
+
+/**
+ * A single received clipboard entry displayed in the "Received Clipboard" section.
+ *
+ * Shows a truncated preview of the content (max 80 chars), a relative timestamp,
+ * and a "Copy" button that re-copies the content to the system clipboard.
+ *
+ * @param content   The full clipboard text received from a paired device.
+ * @param timestamp Unix epoch millis when the item was received.
+ * @param isUrl     True if the content was classified as a URL by the sender.
+ * @param onCopy    Callback invoked when the user taps the "Copy" button.
+ */
+@Composable
+fun ReceivedClipboardItem(
+    content: String,
+    timestamp: Long,
+    isUrl: Boolean,
+    onCopy: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    Card(
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 4.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+        ),
+        shape = MaterialTheme.shapes.small,
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = content.take(80) + if (content.length > 80) "\u2026" else "",
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = formatRelativeTime(timestamp),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Spacer(modifier = Modifier.width(8.dp))
+            Button(
+                onClick = onCopy,
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+            ) {
+                Text("Copy", style = MaterialTheme.typography.labelSmall)
+            }
+        }
+    }
+}
+
+/**
+ * Formats a Unix-epoch timestamp as a human-readable relative time string.
+ *
+ * @param timestamp Unix epoch millis to format.
+ * @return A string like "just now", "3 min ago", "2h ago", or "5d ago".
+ */
+private fun formatRelativeTime(timestamp: Long): String {
+    val diff = System.currentTimeMillis() - timestamp
+    return when {
+        diff < 60_000L -> "just now"
+        diff < 3_600_000L -> "${diff / 60_000L} min ago"
+        diff < 86_400_000L -> "${diff / 3_600_000L}h ago"
+        else -> "${diff / 86_400_000L}d ago"
+    }
 }
 
