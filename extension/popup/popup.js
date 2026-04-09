@@ -141,10 +141,11 @@ async function loadDevices() {
     chrome.storage.session.get('devicePresence').catch(() => ({})),
   ]);
 
-  const presenceMap = presence?.devicePresence ?? {};
+  // TODO: real presence tracking not yet implemented — treat all paired
+  // devices as online so quick-action buttons are enabled.
   currentDevices = (stored.pairedDevices ?? []).map(d => ({
     ...d,
-    isOnline: presenceMap[d.deviceId]?.isOnline === true,
+    isOnline: true,
   }));
 
   renderDevices();
@@ -869,10 +870,12 @@ async function sendFile(file) {
  * @returns {Promise<void>}
  */
 async function sendClipboard() {
-  if (!selectedDeviceId) {
-    showToast('Select an online device first.', 'error');
+  const targetId = selectedDeviceId || currentDevices[0]?.deviceId;
+  if (!targetId) {
+    showToast('No paired device.', 'error');
     return;
   }
+  selectedDeviceId = targetId;
 
   let text;
   try {

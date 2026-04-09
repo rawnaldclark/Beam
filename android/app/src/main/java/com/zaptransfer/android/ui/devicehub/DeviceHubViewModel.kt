@@ -134,7 +134,8 @@ class DeviceHubViewModel @Inject constructor(
             devices = devices.map { entity ->
                 PairedDeviceUi(
                     entity = entity,
-                    isOnline = online.contains(entity.deviceId),
+                    // TODO: real presence not yet wired — treat all paired devices as online
+                    isOnline = true,
                 )
             },
             isLoading = false,
