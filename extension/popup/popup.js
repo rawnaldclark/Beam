@@ -160,16 +160,19 @@ async function consumeAutoCopyPending() {
  * @returns {Promise<void>}
  */
 async function loadDevices() {
-  const [stored, presence] = await Promise.all([
+  const [localData, sessionData] = await Promise.all([
     chrome.storage.local.get('pairedDevices'),
     chrome.storage.session.get('devicePresence').catch(() => ({})),
   ]);
 
-  // TODO: real presence tracking not yet implemented — treat all paired
-  // devices as online so quick-action buttons are enabled.
-  currentDevices = (stored.pairedDevices ?? []).map(d => ({
+  // Presence defaults to OFFLINE until the relay confirms a peer-online
+  // message for each device. The relay broadcasts peer-online for any
+  // already-registered peers when we join, so initial state populates
+  // quickly after the signalling client connects.
+  const presence = sessionData?.devicePresence || {};
+  currentDevices = (localData?.pairedDevices ?? []).map(d => ({
     ...d,
-    isOnline: true,
+    isOnline: presence[d.deviceId]?.isOnline === true,
   }));
 
   renderDevices();

@@ -176,6 +176,27 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
           // The popup will read from chrome.storage.session when it reopens.
         }
       }
+      else if (msg.type === 'peer-online' || msg.type === 'peer-offline') {
+        const peerId = msg.deviceId;
+        const isOnline = msg.type === 'peer-online';
+        console.log('[Beam SW] Presence update:', peerId, isOnline ? 'online' : 'offline');
+
+        // Update session storage so the popup can read it on open.
+        const stored = await chrome.storage.session.get('devicePresence');
+        const presence = stored.devicePresence || {};
+        presence[peerId] = { isOnline, timestamp: Date.now() };
+        await chrome.storage.session.set({ devicePresence: presence });
+
+        // Notify popup if open — it will merge the single update without a reload.
+        try {
+          await chrome.runtime.sendMessage({
+            type: 'device-presence-changed',
+            payload: { deviceId: peerId, online: isOnline },
+          });
+        } catch {
+          // Popup closed — it will read from storage when next opened.
+        }
+      }
       else if (msg.type === 'clipboard-transfer') {
         // Incoming clipboard content from a paired Android device.
         console.log('[Beam SW] Clipboard received from', msg.fromDeviceId || msg.deviceId);

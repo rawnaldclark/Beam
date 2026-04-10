@@ -124,6 +124,20 @@ class DeviceHubViewModel @Inject constructor(
                             Log.d(TAG, "File accepted by remote, transferId: ${json.optString("transferId")}")
                         }
                         "file-complete" -> handleFileComplete(json)
+                        "peer-online" -> {
+                            val peerId = json.optString("deviceId", "")
+                            if (peerId.isNotEmpty()) {
+                                Log.d(TAG, "Peer online: $peerId")
+                                deviceRepo.handlePresence(peerId, true)
+                            }
+                        }
+                        "peer-offline" -> {
+                            val peerId = json.optString("deviceId", "")
+                            if (peerId.isNotEmpty()) {
+                                Log.d(TAG, "Peer offline: $peerId")
+                                deviceRepo.handlePresence(peerId, false)
+                            }
+                        }
                     }
                 }
             }
@@ -281,8 +295,7 @@ class DeviceHubViewModel @Inject constructor(
             devices = devices.map { entity ->
                 PairedDeviceUi(
                     entity = entity,
-                    // TODO: real presence not yet wired — treat all paired devices as online
-                    isOnline = true,
+                    isOnline = online.contains(entity.deviceId),
                 )
             },
             isLoading = false,
