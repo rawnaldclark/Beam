@@ -57,6 +57,7 @@ chrome.runtime.onInstalled.addListener(() => {
   const periodInMinutes = Math.max(1, KEEPALIVE_INTERVAL_MS / 60_000);
   chrome.alarms.create('keepalive', { periodInMinutes });
   autoStartRelayIfPaired();
+  rebuildContextMenusFromStorage();
 });
 
 /**
@@ -66,10 +67,22 @@ chrome.runtime.onInstalled.addListener(() => {
 chrome.runtime.onStartup.addListener(() => {
   ensureOffscreen();
   autoStartRelayIfPaired();
+  rebuildContextMenusFromStorage();
 });
 
 // Auto-start on SW initialization (fires every time SW wakes up)
 autoStartRelayIfPaired();
+rebuildContextMenusFromStorage();
+
+// Rebuild context menus whenever paired devices change (after pairing, unpair, etc.)
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area === 'local' && changes.pairedDevices) {
+    rebuildContextMenusFromStorage();
+  }
+  if (area === 'session' && changes.devicePresence) {
+    rebuildContextMenusFromStorage();
+  }
+});
 
 /**
  * If the user has previously paired, automatically start the relay listener
@@ -141,7 +154,8 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ── Device presence — rebuild context menus ─────────────────────────────
     case MSG.DEVICE_PRESENCE_CHANGED:
-      rebuildContextMenus(msg.payload.devices ?? []);
+      // Ignore payload — reload from storage to get the full canonical list.
+      rebuildContextMenusFromStorage();
       break;
 
     // ── Storage relay for offscreen document (which can't access chrome.storage) ──
@@ -343,6 +357,55 @@ function notifySent(message) {
   });
 }
 
+/**
+ * Read the system clipboard. Tries multiple strategies since Chrome MV3 has
+ * no single reliable way to read clipboard from a service worker.
+ *
+ * Strategy 1: Inject into the active tab (fails on chrome:// URLs)
+ * Strategy 2: Show a notification asking the user to open the popup
+ *
+ * @returns {Promise<{text: string, error?: string}>}
+ */
+async function readClipboardFromActiveTab() {
+  try {
+    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+    if (!tab?.id) {
+      return { text: '', error: 'No active tab' };
+    }
+
+    // chrome:// URLs, chrome-extension:// URLs, and web store pages block injection
+    const url = tab.url || '';
+    if (url.startsWith('chrome://') || url.startsWith('chrome-extension://') ||
+        url.startsWith('edge://') || url.startsWith('about:') ||
+        url.includes('chromewebstore.google.com')) {
+      return { text: '', error: 'Cannot read clipboard on this page (chrome:// URL). Switch to a regular webpage.' };
+    }
+
+    const [result] = await chrome.scripting.executeScript({
+      target: { tabId: tab.id },
+      func: async () => {
+        try {
+          if (!document.hasFocus()) {
+            // Try to focus — sometimes the active tab doesn't have focus
+            window.focus();
+          }
+          const text = await navigator.clipboard.readText();
+          return { ok: true, text };
+        } catch (err) {
+          return { ok: false, error: err.message };
+        }
+      },
+    });
+
+    const res = result?.result;
+    if (!res) return { text: '', error: 'No result from script injection' };
+    if (!res.ok) return { text: '', error: res.error || 'Clipboard read failed' };
+    return { text: res.text || '' };
+  } catch (err) {
+    return { text: '', error: err.message };
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Keyboard shortcuts
 // ---------------------------------------------------------------------------
@@ -373,29 +436,14 @@ chrome.commands.onCommand.addListener(async (command) => {
     }
 
     try {
-      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-      if (!tab?.id) return;
+      const { text, error } = await readClipboardFromActiveTab();
 
-      // Inject a small snippet into the active tab to read the clipboard;
-      // the service worker has no DOM, so navigator.clipboard is unavailable here.
-      const [result] = await chrome.scripting.executeScript({
-        target: { tabId: tab.id },
-        func:   async () => {
-          try {
-            return await navigator.clipboard.readText();
-          } catch {
-            return null;
-          }
-        },
-      });
-
-      const text = result?.result;
       if (!text) {
         chrome.notifications.create('beam-err-' + Date.now(), {
           type:    'basic',
           iconUrl: 'icons/icon-128.png',
           title:   'Beam',
-          message: 'Clipboard is empty or permission denied',
+          message: error || 'Clipboard is empty',
         });
         return;
       }
@@ -508,41 +556,59 @@ async function ensureOffscreen() {
  */
 function rebuildContextMenus(devices) {
   chrome.contextMenus.removeAll(() => {
-    const onlineDevices = devices.filter(d => d.isOnline);
-
-    if (onlineDevices.length === 0) {
+    if (!devices || devices.length === 0) {
       chrome.contextMenus.create({
         id:       'beam-none',
-        title:    'No devices online',
+        title:    'Beam: no paired devices',
         enabled:  false,
         contexts: ['all'],
       });
       return;
     }
 
-    for (const device of onlineDevices) {
-      // Image context menu — shown on right-click of an image element.
+    // Show menu items for ALL paired devices (not just online).
+    // If offline, the send will fail gracefully, but the menu is always there.
+    for (const device of devices) {
+      const suffix = device.isOnline === false ? ' (offline)' : '';
       chrome.contextMenus.create({
         id:       `img_${device.deviceId}`,
-        title:    `Send image to ${device.name}`,
+        title:    `Beam: Send image to ${device.name}${suffix}`,
         contexts: ['image'],
       });
-
-      // Link context menu — shown on right-click of a hyperlink.
       chrome.contextMenus.create({
         id:       `link_${device.deviceId}`,
-        title:    `Send link to ${device.name}`,
+        title:    `Beam: Send link to ${device.name}${suffix}`,
         contexts: ['link'],
       });
-
-      // Selection context menu — shown when text is selected.
       chrome.contextMenus.create({
         id:       `text_${device.deviceId}`,
-        title:    `Send text to ${device.name}`,
+        title:    `Beam: Send text to ${device.name}${suffix}`,
         contexts: ['selection'],
       });
     }
   });
+}
+
+/**
+ * Load paired devices from storage and rebuild context menus.
+ * Called on extension install, startup, and SW wake.
+ */
+async function rebuildContextMenusFromStorage() {
+  try {
+    const [localData, sessionData] = await Promise.all([
+      chrome.storage.local.get('pairedDevices'),
+      chrome.storage.session.get('devicePresence'),
+    ]);
+    const devices = localData?.pairedDevices || [];
+    const presence = sessionData?.devicePresence || {};
+    const annotated = devices.map(d => ({
+      ...d,
+      isOnline: presence[d.deviceId]?.isOnline === true,
+    }));
+    rebuildContextMenus(annotated);
+  } catch (err) {
+    console.error('[Beam SW] Failed to rebuild context menus:', err);
+  }
 }
 
 // ---------------------------------------------------------------------------
