@@ -54,17 +54,43 @@ let badgeShowingFailure = false;
  * never left dormant for longer than one Chrome alarm period (~1 minute).
  */
 chrome.runtime.onInstalled.addListener(() => {
-  // Chrome requires a minimum alarm period of 1 minute for MV3 service workers.
-  // KEEPALIVE_INTERVAL_MS (25 s) is shorter than that, so we clamp to 1 minute.
   const periodInMinutes = Math.max(1, KEEPALIVE_INTERVAL_MS / 60_000);
   chrome.alarms.create('keepalive', { periodInMinutes });
+  autoStartRelayIfPaired();
 });
 
 /**
  * On browser startup: ensure the offscreen document is running so the
  * extension is ready before the user interacts with the popup.
  */
-chrome.runtime.onStartup.addListener(ensureOffscreen);
+chrome.runtime.onStartup.addListener(() => {
+  ensureOffscreen();
+  autoStartRelayIfPaired();
+});
+
+// Auto-start on SW initialization (fires every time SW wakes up)
+autoStartRelayIfPaired();
+
+/**
+ * If the user has previously paired, automatically start the relay listener
+ * so incoming messages (clipboard, files) work without the user opening the popup.
+ */
+async function autoStartRelayIfPaired() {
+  try {
+    const stored = await chrome.storage.local.get(['deviceId', 'deviceKeys', 'pairedDevices']);
+    if (!stored.deviceId || !stored.deviceKeys?.ed25519?.sk || !stored.pairedDevices?.length) {
+      return; // Not paired yet
+    }
+    console.log('[Beam SW] Auto-starting relay listener for paired session');
+    await startPairingListener(
+      stored.deviceId,
+      stored.deviceKeys.ed25519.sk,
+      stored.deviceKeys.ed25519.pk
+    );
+  } catch (err) {
+    console.error('[Beam SW] Auto-start relay failed:', err);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Alarm handler — keepalive ping

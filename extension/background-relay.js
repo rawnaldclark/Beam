@@ -64,6 +64,12 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
   // Close any existing connection before starting a new one.
   stopPairingListener();
 
+  // Store credentials for auto-reconnect on unexpected disconnect
+  _lastDeviceId = deviceId;
+  _lastEd25519Sk = ed25519Sk;
+  _lastEd25519Pk = ed25519Pk;
+  _explicitStop = false;
+
   pairingDeviceId = deviceId;
 
   // Import Ed25519 keys from raw/PKCS8 arrays via Web Crypto.
@@ -258,9 +264,27 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
       console.warn('[Beam SW] Pairing relay WebSocket closed. Code:', e.code, 'Reason:', e.reason);
       if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
       pairingWs = null;
+
+      // Auto-reconnect if we weren't explicitly stopped
+      if (!_explicitStop && _lastDeviceId && _lastEd25519Sk && _lastEd25519Pk) {
+        console.log('[Beam SW] Auto-reconnecting to relay in 2s...');
+        setTimeout(() => {
+          if (!pairingWs && !_explicitStop) {
+            startPairingListener(_lastDeviceId, _lastEd25519Sk, _lastEd25519Pk)
+              .then(() => console.log('[Beam SW] Reconnected successfully'))
+              .catch(err => console.error('[Beam SW] Reconnect failed:', err));
+          }
+        }, 2000);
+      }
     };
   });
 }
+
+// Reconnection state
+let _explicitStop = false;
+let _lastDeviceId = null;
+let _lastEd25519Sk = null;
+let _lastEd25519Pk = null;
 
 /** @type {number|null} */
 let _heartbeatTimer = null;
@@ -280,6 +304,7 @@ function _startHeartbeat() {
  * Safe to call even if no connection is active.
  */
 export function stopPairingListener() {
+  _explicitStop = true;
   if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
   if (pairingWs) {
     pairingWs.onmessage = null;
