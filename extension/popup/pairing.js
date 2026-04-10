@@ -382,7 +382,8 @@ export async function waitForPairingRequest(deviceId) {
   }
 
   // Tell the service worker to open the relay WebSocket and authenticate.
-  const result = await chrome.runtime.sendMessage({
+  // Wrap in a timeout since the SW may be idle and slow to respond.
+  const startListenerPromise = chrome.runtime.sendMessage({
     type: 'START_PAIRING_LISTENER',
     payload: {
       deviceId,
@@ -390,6 +391,30 @@ export async function waitForPairingRequest(deviceId) {
       ed25519Pk: stored.deviceKeys.ed25519.pk,
     },
   });
+
+  const timeoutPromise = new Promise((_, reject) =>
+    setTimeout(() => reject(new Error('SW did not respond within 10s')), 10_000)
+  );
+
+  let result;
+  try {
+    result = await Promise.race([startListenerPromise, timeoutPromise]);
+  } catch (err) {
+    // Retry once — the SW might have been waking up
+    console.warn('[Beam] First START_PAIRING_LISTENER attempt failed:', err.message, '— retrying');
+    try {
+      result = await chrome.runtime.sendMessage({
+        type: 'START_PAIRING_LISTENER',
+        payload: {
+          deviceId,
+          ed25519Sk: stored.deviceKeys.ed25519.sk,
+          ed25519Pk: stored.deviceKeys.ed25519.pk,
+        },
+      });
+    } catch (err2) {
+      throw new Error('SW relay unreachable. Try reloading the extension.');
+    }
+  }
 
   if (!result?.ok) {
     throw new Error('SW relay failed: ' + (result?.error || 'no response'));
