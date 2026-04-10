@@ -61,6 +61,13 @@ let pendingFileTransfer = null;
  * @throws {Error} On WebSocket error, auth failure, or crypto failure.
  */
 export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
+  // If we already have an OPEN connection for this device, don't reconnect.
+  // This prevents duplicate notifications from multiple concurrent WebSockets.
+  if (pairingWs?.readyState === WebSocket.OPEN && pairingDeviceId === deviceId) {
+    console.log('[Beam SW] Pairing listener already connected for', deviceId);
+    return;
+  }
+
   // Close any existing connection before starting a new one.
   stopPairingListener();
 
