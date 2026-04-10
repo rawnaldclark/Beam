@@ -290,10 +290,22 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
       reject(new Error('WebSocket connection error'));
     };
 
-    pairingWs.onclose = (e) => {
+    pairingWs.onclose = async (e) => {
       console.warn('[Beam SW] Pairing relay WebSocket closed. Code:', e.code, 'Reason:', e.reason);
       if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
       pairingWs = null;
+
+      // Clear cached presence — we don't know the current state after a reconnect.
+      // The relay will re-send peer-online events for any online peers when we
+      // re-register the rendezvous.
+      try {
+        await chrome.storage.session.set({ devicePresence: {} });
+        // Notify popup so UI updates immediately
+        chrome.runtime.sendMessage({
+          type: 'device-presence-changed',
+          payload: { reset: true },
+        }).catch(() => {});
+      } catch { /* ignore */ }
 
       // Auto-reconnect if we weren't explicitly stopped
       if (!_explicitStop && _lastDeviceId && _lastEd25519Sk && _lastEd25519Pk) {

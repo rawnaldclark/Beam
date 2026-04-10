@@ -384,13 +384,30 @@ async function readClipboardFromActiveTab() {
     const [result] = await chrome.scripting.executeScript({
       target: { tabId: tab.id },
       func: async () => {
+        // Try modern API first (requires document focus)
         try {
-          if (!document.hasFocus()) {
-            // Try to focus — sometimes the active tab doesn't have focus
-            window.focus();
+          if (document.hasFocus()) {
+            const text = await navigator.clipboard.readText();
+            return { ok: true, text, method: 'modern' };
           }
-          const text = await navigator.clipboard.readText();
-          return { ok: true, text };
+        } catch (_) { /* fall through to legacy */ }
+
+        // Legacy fallback: create a textarea, paste into it via execCommand
+        // This works even without document focus because we grab focus first
+        try {
+          const ta = document.createElement('textarea');
+          ta.style.position = 'fixed';
+          ta.style.opacity = '0';
+          ta.style.left = '-9999px';
+          ta.style.top = '0';
+          document.body.appendChild(ta);
+          ta.focus();
+          ta.select();
+          const ok = document.execCommand('paste');
+          const text = ta.value;
+          document.body.removeChild(ta);
+          if (ok && text) return { ok: true, text, method: 'legacy' };
+          return { ok: false, error: 'execCommand paste returned empty' };
         } catch (err) {
           return { ok: false, error: err.message };
         }
@@ -400,6 +417,7 @@ async function readClipboardFromActiveTab() {
     const res = result?.result;
     if (!res) return { text: '', error: 'No result from script injection' };
     if (!res.ok) return { text: '', error: res.error || 'Clipboard read failed' };
+    console.log('[Beam SW] Clipboard read via:', res.method);
     return { text: res.text || '' };
   } catch (err) {
     return { text: '', error: err.message };
