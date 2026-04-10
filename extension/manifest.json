@@ -3,7 +3,7 @@
   "name": "Beam",
   "version": "0.1.0",
   "description": "Instant, encrypted file transfer between your devices.",
-  "permissions": ["offscreen", "storage", "notifications", "contextMenus", "commands", "alarms", "activeTab", "clipboardRead"],
+  "permissions": ["offscreen", "storage", "notifications", "contextMenus", "commands", "alarms", "activeTab", "clipboardRead", "scripting"],
   "host_permissions": ["<all_urls>"],
   "content_security_policy": {
     "extension_pages": "script-src 'self' 'wasm-unsafe-eval'; object-src 'self'"

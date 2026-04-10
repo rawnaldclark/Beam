@@ -190,46 +190,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ── File transfer via relay binary channel ──────────────────────────────
     case 'SEND_FILE': {
-      const { fileName, fileSize, mimeType, data, targetDeviceId, rendezvousId } = msg.payload;
-      const transferId = 'tf-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-
-      // Send file-offer + relay-bind, then wait for file-accept before sending data.
-      sendPairingMessage({ type: 'file-offer', targetDeviceId, rendezvousId, fileName, fileSize, mimeType, transferId });
-      sendPairingMessage({ type: 'relay-bind', transferId, targetDeviceId, rendezvousId });
-
-      // Listen for file-accept, then send chunks
-      const _sendFileData = () => {
-        const binaryStr = atob(data);
-        const bytes = new Uint8Array(binaryStr.length);
-        for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
-
-        const CHUNK_SIZE = 200 * 1024;
-        let offset = 0;
-
-        // Send chunks with small delays to avoid overwhelming the relay
-        function sendNextChunk() {
-          if (offset >= bytes.length) {
-            // All chunks sent — send file-complete + release after a brief pause
-            setTimeout(() => {
-              sendPairingMessage({ type: 'file-complete', targetDeviceId, rendezvousId, transferId });
-              sendPairingMessage({ type: 'relay-release', transferId });
-              console.log('[Beam SW] File send complete:', fileName);
-            }, 200);
-            return;
-          }
-          const end = Math.min(offset + CHUNK_SIZE, bytes.length);
-          sendBinary(bytes.slice(offset, end).buffer);
-          offset = end;
-          // 50ms between chunks — gives relay time to forward
-          setTimeout(sendNextChunk, 50);
-        }
-        sendNextChunk();
-      };
-
-      // Wait 2 seconds for receiver to bind, then start sending.
-      // The receiver auto-assembles when bytesReceived >= fileSize.
-      setTimeout(_sendFileData, 2000);
-
+      const transferId = sendFileViaRelay(msg.payload);
       sendResponse({ ok: true, transferId });
       return true;
     }
@@ -273,42 +234,114 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 // ---------------------------------------------------------------------------
 
 /**
- * Dispatch a context menu click to the offscreen transfer engine.
+ * Handle a context menu click by sending the selected content to the target
+ * device via the working SEND_CLIPBOARD / SEND_FILE relay paths.
  *
  * Menu item IDs are formatted as "{prefix}_{deviceId}" where prefix is one of
  * "img", "link", or "text".  We parse the prefix to determine what content
- * type to send and build the payload from the ContextMenuInfo fields.
+ * type to send and dispatch directly through sendPairingMessage/sendFileViaRelay.
  *
  * @param {chrome.contextMenus.OnClickData} info - Click metadata.
  * @param {chrome.tabs.Tab}                 tab  - The tab in which the click occurred.
  */
 chrome.contextMenus.onClicked.addListener(async (info, tab) => {
-  await ensureOffscreen();
-
   // Clear any lingering failure badge when the user initiates a new transfer.
-  if (badgeShowingFailure) clearBadge();
+  badgeShowingFailure = false;
+  clearBadge();
 
-  // Parse prefix from menu item ID: "img_{deviceId}", "link_{deviceId}", "text_{deviceId}"
-  const separatorIdx  = info.menuItemId.indexOf('_');
-  const prefix        = info.menuItemId.slice(0, separatorIdx);
-  const targetDeviceId = info.menuItemId.slice(separatorIdx + 1);
+  // Parse menu item ID: "img_{deviceId}" / "link_{deviceId}" / "text_{deviceId}"
+  const menuId = String(info.menuItemId);
+  const match  = menuId.match(/^(img|link|text)_(.+)$/);
+  if (!match) return;
 
-  /** @type {object} */
-  const payload = { targetDeviceId };
+  const [, type, deviceId] = match;
 
-  if (prefix === 'img' && info.srcUrl) {
-    payload.type = 'image';
-    payload.url  = info.srcUrl;
-  } else if (prefix === 'link' && info.linkUrl) {
-    payload.type    = 'link';
-    payload.content = info.linkUrl;
-  } else if (prefix === 'text' && info.selectionText) {
-    payload.type    = 'text';
-    payload.content = info.selectionText;
+  // Look up our own deviceId — this is the rendezvousId both sides registered
+  // during pairing, and the SW uses it as the from-identity for outgoing msgs.
+  const { deviceId: ownDeviceId } = await chrome.storage.local.get('deviceId');
+  if (!ownDeviceId) {
+    console.error('[Beam SW] Cannot send: no deviceId stored');
+    return;
+  }
+  const rendezvousId = ownDeviceId;
+
+  if (type === 'link') {
+    sendPairingMessage({
+      type:           'clipboard-transfer',
+      targetDeviceId: deviceId,
+      rendezvousId,
+      content:        info.linkUrl,
+    });
+    notifySent('Link sent');
+    return;
   }
 
-  chrome.runtime.sendMessage({ type: MSG.INITIATE_TRANSFER, payload });
+  if (type === 'text') {
+    sendPairingMessage({
+      type:           'clipboard-transfer',
+      targetDeviceId: deviceId,
+      rendezvousId,
+      content:        info.selectionText,
+    });
+    notifySent('Text sent');
+    return;
+  }
+
+  if (type === 'img') {
+    try {
+      const imageData = await fetchImageForOffscreen(info.srcUrl);
+
+      // Convert the plain-array byte data to base64 (SEND_FILE expects base64).
+      const bytes = new Uint8Array(imageData.data);
+      let binStr  = '';
+      const SLICE = 32768;
+      for (let i = 0; i < bytes.length; i += SLICE) {
+        binStr += String.fromCharCode.apply(null, bytes.subarray(i, i + SLICE));
+      }
+      const base64 = btoa(binStr);
+
+      // Derive a filename from the image URL pathname.
+      let fileName = 'image.jpg';
+      try {
+        const urlPath = new URL(info.srcUrl).pathname;
+        const last    = urlPath.split('/').pop();
+        if (last) fileName = last;
+      } catch { /* fallback default */ }
+
+      sendFileViaRelay({
+        fileName,
+        fileSize:       imageData.size,
+        mimeType:       imageData.mimeType || 'image/jpeg',
+        data:           base64,
+        targetDeviceId: deviceId,
+        rendezvousId,
+      });
+      notifySent('Image sending…');
+    } catch (err) {
+      console.error('[Beam SW] Image fetch failed:', err);
+      chrome.notifications.create('beam-err-' + Date.now(), {
+        type:    'basic',
+        iconUrl: 'icons/icon-128.png',
+        title:   'Beam',
+        message: 'Failed to fetch image: ' + err.message,
+      });
+    }
+  }
 });
+
+/**
+ * Show a transient "sent" notification after a context-menu or shortcut action.
+ *
+ * @param {string} message - Short user-facing message for the notification body.
+ */
+function notifySent(message) {
+  chrome.notifications.create('beam-sent-' + Date.now(), {
+    type:    'basic',
+    iconUrl: 'icons/icon-128.png',
+    title:   'Beam',
+    message,
+  });
+}
 
 // ---------------------------------------------------------------------------
 // Keyboard shortcuts
@@ -317,22 +350,78 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 /**
  * Handle keyboard commands declared in manifest.json's `commands` section.
  *
- * "send-clipboard" — initiate a transfer of the current clipboard contents
- *                    to the last-used device.
+ * "send-clipboard"     — read the active tab's clipboard and send to the first
+ *                        online paired device via the working relay path.
+ * "open-device-picker" — open the extension popup for manual device selection.
  *
  * @param {string} command - Command name as declared in the manifest.
  */
 chrome.commands.onCommand.addListener(async (command) => {
-  await ensureOffscreen();
-
   if (command === 'send-clipboard') {
-    // Clear any lingering failure badge when the user initiates a new action.
-    if (badgeShowingFailure) clearBadge();
+    badgeShowingFailure = false;
+    clearBadge();
 
-    chrome.runtime.sendMessage({
-      type:    MSG.INITIATE_TRANSFER,
-      payload: { type: 'clipboard', targetDeviceId: 'last-used' },
-    });
+    const target = await findTargetDevice();
+    if (!target) {
+      chrome.notifications.create('beam-err-' + Date.now(), {
+        type:    'basic',
+        iconUrl: 'icons/icon-128.png',
+        title:   'Beam',
+        message: 'No paired device to send to',
+      });
+      return;
+    }
+
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+      if (!tab?.id) return;
+
+      // Inject a small snippet into the active tab to read the clipboard;
+      // the service worker has no DOM, so navigator.clipboard is unavailable here.
+      const [result] = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func:   async () => {
+          try {
+            return await navigator.clipboard.readText();
+          } catch {
+            return null;
+          }
+        },
+      });
+
+      const text = result?.result;
+      if (!text) {
+        chrome.notifications.create('beam-err-' + Date.now(), {
+          type:    'basic',
+          iconUrl: 'icons/icon-128.png',
+          title:   'Beam',
+          message: 'Clipboard is empty or permission denied',
+        });
+        return;
+      }
+
+      sendPairingMessage({
+        type:           'clipboard-transfer',
+        targetDeviceId: target.deviceId,
+        rendezvousId:   target.rendezvousId,
+        content:        text,
+      });
+
+      chrome.notifications.create('beam-sent-' + Date.now(), {
+        type:    'basic',
+        iconUrl: 'icons/icon-128.png',
+        title:   'Beam',
+        message: `Clipboard sent to ${target.name}`,
+      });
+    } catch (err) {
+      console.error('[Beam SW] Clipboard read failed:', err);
+      chrome.notifications.create('beam-err-' + Date.now(), {
+        type:    'basic',
+        iconUrl: 'icons/icon-128.png',
+        title:   'Beam',
+        message: 'Failed to read clipboard: ' + err.message,
+      });
+    }
     return;
   }
 
@@ -620,6 +709,105 @@ function showOpenPopupFallbackNotification() {
     title:   'Beam',
     message: 'Click the Beam icon in the toolbar to open the device picker.',
   });
+}
+
+// ---------------------------------------------------------------------------
+// Target device selection + file relay helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Find the first online paired device, or fall back to the first paired device
+ * if none are currently online.  Returns null when there are no paired devices.
+ *
+ * @returns {Promise<{deviceId: string, name: string, rendezvousId: string}|null>}
+ *   Selected target device with the rendezvousId (our own deviceId) both sides
+ *   registered during pairing, or null if no paired devices exist.
+ */
+async function findTargetDevice() {
+  const [localData, sessionData] = await Promise.all([
+    chrome.storage.local.get(['pairedDevices', 'deviceId']),
+    chrome.storage.session.get('devicePresence'),
+  ]);
+
+  const devices     = localData?.pairedDevices || [];
+  const presence    = sessionData?.devicePresence || {};
+  const ownDeviceId = localData?.deviceId;
+
+  const online   = devices.find(d => presence[d.deviceId]?.isOnline === true);
+  const fallback = devices[0];
+  const target   = online || fallback;
+
+  if (!target) return null;
+
+  return {
+    deviceId:     target.deviceId,
+    name:         target.name,
+    // rendezvousId is Chrome's own deviceId — both sides registered it during pairing.
+    rendezvousId: ownDeviceId,
+  };
+}
+
+/**
+ * Send a file via the pairing relay binary channel.
+ *
+ * Emits file-offer + relay-bind, waits briefly for the receiver to bind, then
+ * streams base64-decoded bytes as chunked binary frames, finishing with
+ * file-complete + relay-release.
+ *
+ * Shared between the SEND_FILE message handler (popup path) and the context
+ * menu image handler so both code paths go through identical logic.
+ *
+ * @param {{
+ *   fileName: string,
+ *   fileSize: number,
+ *   mimeType: string,
+ *   data: string,                // base64-encoded file bytes
+ *   targetDeviceId: string,
+ *   rendezvousId: string,
+ * }} payload
+ * @returns {string} The generated transferId for this transfer.
+ */
+function sendFileViaRelay(payload) {
+  const { fileName, fileSize, mimeType, data, targetDeviceId, rendezvousId } = payload;
+  const transferId = 'tf-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
+
+  // Send file-offer + relay-bind, then wait for file-accept before sending data.
+  sendPairingMessage({ type: 'file-offer', targetDeviceId, rendezvousId, fileName, fileSize, mimeType, transferId });
+  sendPairingMessage({ type: 'relay-bind', transferId, targetDeviceId, rendezvousId });
+
+  const _sendFileData = () => {
+    const binaryStr = atob(data);
+    const bytes = new Uint8Array(binaryStr.length);
+    for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+
+    const CHUNK_SIZE = 200 * 1024;
+    let offset = 0;
+
+    // Send chunks with small delays to avoid overwhelming the relay.
+    function sendNextChunk() {
+      if (offset >= bytes.length) {
+        // All chunks sent — send file-complete + release after a brief pause.
+        setTimeout(() => {
+          sendPairingMessage({ type: 'file-complete', targetDeviceId, rendezvousId, transferId });
+          sendPairingMessage({ type: 'relay-release', transferId });
+          console.log('[Beam SW] File send complete:', fileName);
+        }, 200);
+        return;
+      }
+      const end = Math.min(offset + CHUNK_SIZE, bytes.length);
+      sendBinary(bytes.slice(offset, end).buffer);
+      offset = end;
+      // 50ms between chunks — gives relay time to forward.
+      setTimeout(sendNextChunk, 50);
+    }
+    sendNextChunk();
+  };
+
+  // Wait 2 seconds for receiver to bind, then start sending.
+  // The receiver auto-assembles when bytesReceived >= fileSize.
+  setTimeout(_sendFileData, 2000);
+
+  return transferId;
 }
 
 // ---------------------------------------------------------------------------
