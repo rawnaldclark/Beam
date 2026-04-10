@@ -100,6 +100,7 @@ fun DeviceHubScreen(
     val uiState by viewModel.uiState.collectAsState()
     val recentTransfers by viewModel.recentTransfers.collectAsState()
     val clipboardItems by viewModel.recentClipboard.collectAsState()
+    val pendingFile by viewModel.pendingFileSave.collectAsState()
 
     // Observe toast events from the ViewModel (clipboard send/receive feedback).
     val context = LocalContext.current
@@ -203,6 +204,46 @@ fun DeviceHubScreen(
                             onSendText = { onSendText(deviceUi.entity.deviceId) },
                             modifier = Modifier.padding(horizontal = 16.dp, vertical = 6.dp),
                         )
+                    }
+
+                    // ── Pending File to Save ───────────────────────────────────
+                    pendingFile?.let { pf ->
+                        item {
+                            Spacer(modifier = Modifier.height(8.dp))
+                            SectionHeader(title = "File Received")
+                        }
+                        item {
+                            Card(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 16.dp, vertical = 4.dp),
+                                colors = CardDefaults.cardColors(
+                                    containerColor = MaterialTheme.colorScheme.primaryContainer,
+                                ),
+                            ) {
+                                Column(modifier = Modifier.padding(16.dp)) {
+                                    Text(
+                                        text = "📄 ${pf.fileName}",
+                                        style = MaterialTheme.typography.titleMedium,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer,
+                                    )
+                                    Text(
+                                        text = "${pf.data.size / 1024} KB",
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onPrimaryContainer.copy(alpha = 0.7f),
+                                    )
+                                    Spacer(Modifier.height(12.dp))
+                                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                        Button(onClick = { viewModel.savePendingFile() }) {
+                                            Text("Save to Downloads")
+                                        }
+                                        OutlinedButton(onClick = { viewModel.dismissPendingFile() }) {
+                                            Text("Dismiss")
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
 
                     // ── Section: Received Clipboard ────────────────────────────
