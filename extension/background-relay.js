@@ -22,6 +22,16 @@
  * @module background-relay
  */
 
+import {
+  sendClipboardEncrypted as _sendClipboardEncrypted,
+  sendFileEncrypted as _sendFileEncrypted,
+  handleTransferInit,
+  handleTransferAccept,
+  handleTransferReject,
+  handleIncomingBeamFrame,
+  isBeamFrame,
+} from './crypto/beam-relay-handlers.js';
+
 const RELAY_URL = 'wss://zaptransfer-relay.fly.dev';
 
 /** @type {WebSocket|null} Active pairing WebSocket connection. */
@@ -29,22 +39,6 @@ let pairingWs = null;
 
 /** @type {string|null} Device ID for the current pairing session. */
 let pairingDeviceId = null;
-
-/**
- * State for an in-progress incoming file transfer.
- * Populated when a file-offer is received; consumed when file-complete arrives.
- *
- * @type {{
- *   transferId: string,
- *   fileName: string,
- *   fileSize: number,
- *   mimeType: string,
- *   fromDeviceId: string,
- *   chunks: Uint8Array[],
- *   bytesReceived: number,
- * }|null}
- */
-let pendingFileTransfer = null;
 
 /**
  * Start listening for a pairing request from an Android device.
@@ -199,89 +193,20 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
           // Popup closed — it will read from storage when next opened.
         }
       }
-      else if (msg.type === 'clipboard-transfer') {
-        // Incoming clipboard content from a paired Android device.
-        console.log('[Beam SW] Clipboard received from', msg.fromDeviceId || msg.deviceId);
-
-        // Read the auto-copy setting (default: ON).
-        const settingsData = await chrome.storage.local.get('settings');
-        const autoCopy = settingsData?.settings?.autoCopy !== false;
-
-        // Append to session storage ring buffer (most recent first, max 20 entries).
-        const existing = (await chrome.storage.session.get('receivedClipboard'))?.receivedClipboard || [];
-        existing.unshift({
-          content: msg.content,
-          fromDeviceId: msg.fromDeviceId || msg.deviceId,
-          timestamp: Date.now(),
-        });
-        if (existing.length > 20) existing.length = 20;
-        await chrome.storage.session.set({ receivedClipboard: existing });
-
-        if (autoCopy) {
-          // Service workers cannot write to the clipboard directly.
-          // Set a flag in session storage so the popup can copy on next open,
-          // and notify the popup if it is currently open.
-          await chrome.storage.session.set({ autoCopyPending: msg.content });
-          try {
-            await chrome.runtime.sendMessage({
-              type: 'AUTO_COPY_CLIPBOARD',
-              payload: { content: msg.content },
-            });
-          } catch {
-            // Popup is closed — autoCopyPending will be consumed when it reopens.
-          }
-        }
-
-        // Show a desktop notification with a content preview.
-        const notifTitle = autoCopy ? 'Clipboard Copied' : 'Clipboard Received';
-        chrome.notifications.create('clipboard-' + Date.now(), {
-          type: 'basic',
-          iconUrl: 'icons/icon-128.png',
-          title: notifTitle,
-          message: msg.content.slice(0, 100) + (msg.content.length > 100 ? '...' : ''),
-        });
+      else if (msg.type === 'transfer-init') {
+        // Beam E2E handshake — peer wants to start an encrypted transfer.
+        await handleTransferInit({ msg, sendJson: sendPairingMessage });
       }
-      else if (msg.type === 'file-offer') {
-        // A remote device wants to send us a file.
-        const fromId = msg.fromDeviceId || msg.deviceId;
-        console.log('[Beam SW] File offer from', fromId, ':', msg.fileName, msg.fileSize, 'bytes');
-
-        // Auto-accept: set up state to receive binary chunks.
-        pendingFileTransfer = {
-          transferId:   msg.transferId,
-          fileName:     msg.fileName,
-          fileSize:     msg.fileSize,
-          mimeType:     msg.mimeType,
-          fromDeviceId: fromId,
-          chunks:       [],
-          bytesReceived: 0,
-        };
-
-        // Send file-accept back to sender.
-        sendPairingMessage({
-          type:           'file-accept',
-          targetDeviceId: fromId,
-          rendezvousId:   msg.rendezvousId || pairingDeviceId,
-          transferId:     msg.transferId,
-        });
-
-        // Bind the relay session so binary frames are routed to us.
-        sendPairingMessage({
-          type:           'relay-bind',
-          transferId:     msg.transferId,
-          targetDeviceId: fromId,
-          rendezvousId:   msg.rendezvousId || pairingDeviceId,
-        });
+      else if (msg.type === 'transfer-accept') {
+        await handleTransferAccept({ msg });
       }
-      else if (msg.type === 'file-accept') {
-        // The remote device accepted our file offer — binary send can proceed.
-        console.log('[Beam SW] File accepted by remote, transferId:', msg.transferId);
+      else if (msg.type === 'transfer-reject') {
+        await handleTransferReject({ msg });
       }
       else if (msg.type === 'file-complete') {
-        // All binary chunks have been sent by the remote device.
-        if (pendingFileTransfer && msg.transferId === pendingFileTransfer.transferId) {
-          await assembleAndSaveFile();
-        }
+        // Advisory signal that the sender has finished — the receiver
+        // already drives completion off chunksReceived === totalChunks
+        // inside handleIncomingBeamFrame, so this is currently a no-op.
       }
     };
 
@@ -384,110 +309,102 @@ export function sendPairingMessage(msg) {
  * @returns {Promise<void>}
  */
 async function handleIncomingBinaryFrame(data) {
-  if (!pendingFileTransfer) return;
-
   const bytes = data instanceof Blob
     ? new Uint8Array(await data.arrayBuffer())
     : new Uint8Array(data);
 
-  pendingFileTransfer.chunks.push(bytes);
-  pendingFileTransfer.bytesReceived += bytes.length;
-  console.log(
-    '[Beam SW] File chunk:',
-    bytes.length, 'B, total:',
-    pendingFileTransfer.bytesReceived, '/', pendingFileTransfer.fileSize,
-  );
-
-  // Auto-assemble when all bytes received — don't wait for file-complete message
-  if (pendingFileTransfer.bytesReceived >= pendingFileTransfer.fileSize) {
-    console.log('[Beam SW] All bytes received, assembling file');
-    await assembleAndSaveFile();
+  // Every binary frame MUST be a Beam E2E encrypted frame with the 'BEAM'
+  // magic prefix. The legacy plaintext file path has been removed.
+  if (isBeamFrame(bytes)) {
+    try {
+      await handleIncomingBeamFrame({
+        bytes,
+        onClipboardDecrypted: async (content, fromDeviceId) => {
+          await deliverIncomingClipboard(content, fromDeviceId);
+        },
+        onFileComplete: async ({ bytes: fileBytes, fileName, fileSize, mimeType, fromDeviceId }) => {
+          await deliverIncomingFile({
+            bytes: fileBytes,
+            fileName,
+            fileSize,
+            mimeType,
+            fromDeviceId,
+          });
+        },
+      });
+    } catch (err) {
+      console.error('[Beam SW] Beam frame handling failed:', err);
+      notifyReceiveFailure();
+    }
+    return;
   }
+  console.warn('[Beam SW] Unexpected non-Beam binary frame dropped (size:', bytes.length, 'bytes)');
+  notifyReceiveFailure();
 }
 
 /**
- * Assemble all received chunks into a single file and store it in session
- * storage for the popup to trigger a download.
- *
- * The file data is stored as a base64 string because chrome.storage cannot
- * hold ArrayBuffer values.
- *
- * @returns {Promise<void>}
+ * Deliver a fully-assembled, fully-decrypted incoming file to the user via
+ * the existing auto-save / manual-save UX. Called from the Beam frame
+ * handler once a file's metadata + all chunks have been decrypted and
+ * assembled.
  */
-async function assembleAndSaveFile() {
-  const ft = pendingFileTransfer;
-  if (!ft) return;
-
-  console.log('[Beam SW] Assembling file:', ft.fileName, ft.bytesReceived, 'bytes');
-
-  // Combine all chunks into one contiguous buffer.
-  const totalSize = ft.chunks.reduce((s, c) => s + c.length, 0);
-  const combined = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const chunk of ft.chunks) {
-    combined.set(chunk, offset);
-    offset += chunk.length;
-  }
-
-  // Convert to base64 for storage (chrome.storage can't hold ArrayBuffer).
-  // Process in 32KB slices to avoid call-stack overflow on large files.
+export async function deliverIncomingFile({
+  bytes,
+  fileName,
+  fileSize,
+  mimeType,
+  fromDeviceId,
+}) {
+  // Convert to base64 for storage. chrome.storage cannot hold ArrayBuffer
+  // and data: URLs for chrome.downloads also need a base64 body. Process
+  // in 32KB slices to avoid call-stack overflow on large files.
   let base64 = '';
   const SLICE = 32768;
-  for (let i = 0; i < combined.length; i += SLICE) {
-    base64 += String.fromCharCode.apply(null, combined.subarray(i, i + SLICE));
+  for (let i = 0; i < bytes.length; i += SLICE) {
+    base64 += String.fromCharCode.apply(null, bytes.subarray(i, i + SLICE));
   }
   base64 = btoa(base64);
 
-  // Read the auto-save setting (default: OFF).
   const settingsData = await chrome.storage.local.get('settings');
   const autoSave = !!settingsData?.settings?.autoSave;
+  const safeMime = mimeType || 'application/octet-stream';
 
   if (autoSave) {
-    // Auto-save: trigger a browser download directly from the service worker.
-    const dataUrl = `data:${ft.mimeType};base64,${base64}`;
+    const dataUrl = `data:${safeMime};base64,${base64}`;
     try {
       await chrome.downloads.download({
         url:      dataUrl,
-        filename: ft.fileName,
+        filename: fileName,
         saveAs:   false,
       });
-      console.log('[Beam SW] Auto-saved file:', ft.fileName);
+      console.log('[Beam SW] Auto-saved file:', fileName);
     } catch (err) {
       console.error('[Beam SW] Auto-save download failed:', err);
     }
-
-    // Desktop notification
     chrome.notifications.create('file-' + Date.now(), {
       type:    'basic',
       iconUrl: 'icons/icon-128.png',
       title:   'File Saved',
-      message: ft.fileName + ' (' + formatSize(ft.fileSize) + ') saved to Downloads',
+      message: fileName + ' (' + formatSize(fileSize) + ') saved to Downloads',
     });
   } else {
-    // Manual save: store in session storage for the popup to show a download banner.
     await chrome.storage.session.set({
       receivedFile: {
-        fileName:     ft.fileName,
-        fileSize:     ft.fileSize,
-        mimeType:     ft.mimeType,
-        fromDeviceId: ft.fromDeviceId,
-        data:         base64,
-        timestamp:    Date.now(),
+        fileName,
+        fileSize,
+        mimeType: safeMime,
+        fromDeviceId,
+        data:     base64,
+        timestamp: Date.now(),
       },
     });
-
-    // Desktop notification so the user knows a file arrived.
     chrome.notifications.create('file-' + Date.now(), {
       type:    'basic',
       iconUrl: 'icons/icon-128.png',
       title:   'File Received',
-      message: ft.fileName + ' (' + formatSize(ft.fileSize) + ') — open Beam to save',
+      message: fileName + ' (' + formatSize(fileSize) + ') — open Beam to save',
     });
   }
-
-  // Release the relay session and clear state.
-  sendPairingMessage({ type: 'relay-release', transferId: ft.transferId });
-  pendingFileTransfer = null;
 }
 
 /**
@@ -515,6 +432,128 @@ export function sendBinary(data) {
     return true;
   }
   return false;
+}
+
+/**
+ * Surface a desktop notification when an incoming Beam transfer cannot be
+ * decrypted (most often: tampered ciphertext, missing session, or peer
+ * keys out of sync). Receiver-side counterpart to the sender error UX.
+ */
+function notifyReceiveFailure() {
+  try {
+    chrome.notifications.create('beam-rxerr-' + Date.now(), {
+      type:    'basic',
+      iconUrl: 'icons/icon-128.png',
+      title:   'Beam',
+      message: 'Received transfer could not be decrypted.',
+    });
+  } catch (_) {
+    /* notifications API may be unavailable in some test contexts */
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Beam E2E encrypted clipboard
+// ---------------------------------------------------------------------------
+
+/**
+ * Deliver a Beam-decrypted clipboard payload to session storage, the popup,
+ * and a desktop notification. Single authoritative inbound clipboard UX.
+ */
+export async function deliverIncomingClipboard(content, fromDeviceId) {
+  const settingsData = await chrome.storage.local.get('settings');
+  const autoCopy = settingsData?.settings?.autoCopy !== false;
+
+  const existing = (await chrome.storage.session.get('receivedClipboard'))?.receivedClipboard || [];
+  existing.unshift({
+    content,
+    fromDeviceId,
+    timestamp: Date.now(),
+  });
+  if (existing.length > 20) existing.length = 20;
+  await chrome.storage.session.set({ receivedClipboard: existing });
+
+  if (autoCopy) {
+    await chrome.storage.session.set({ autoCopyPending: content });
+    try {
+      await chrome.runtime.sendMessage({
+        type: 'AUTO_COPY_CLIPBOARD',
+        payload: { content },
+      });
+    } catch {
+      /* popup closed — autoCopyPending will be consumed on next open */
+    }
+  }
+
+  const notifTitle = autoCopy ? 'Clipboard Copied' : 'Clipboard Received';
+  chrome.notifications.create('clipboard-' + Date.now(), {
+    type: 'basic',
+    iconUrl: 'icons/icon-128.png',
+    title: notifTitle,
+    message: content.slice(0, 100) + (content.length > 100 ? '...' : ''),
+  });
+}
+
+/**
+ * Public API: encrypt and send a clipboard payload to a paired device.
+ *
+ * Runs the Beam Triple-DH handshake on the pairing WebSocket, derives a
+ * per-transfer session key, and emits the ciphertext as a single Beam
+ * binary frame. Rejects with an Error (with a `code` field from
+ * ERROR_CODES) if the peer is unreachable, the handshake times out, or
+ * the handshake is actively rejected.
+ *
+ * @param {string} targetDeviceId
+ * @param {string} rendezvousId
+ * @param {string} content
+ * @returns {Promise<{transferIdHex: string}>}
+ */
+export async function sendClipboardEncrypted(targetDeviceId, rendezvousId, content) {
+  return _sendClipboardEncrypted({
+    targetDeviceId,
+    rendezvousId,
+    content,
+    sendJson: sendPairingMessage,
+    sendBinary,
+  });
+}
+
+/**
+ * Public API: encrypt and send a file to a paired device.
+ *
+ * Runs the Beam Triple-DH handshake, encrypts the metadata envelope
+ * (fileName/fileSize/mime/totalChunks) under metaKey, then encrypts each
+ * 200KB chunk under chunkKey. Frames are emitted on the pairing WebSocket
+ * with the 'BEAM' magic prefix so the receiver can demux them from the
+ * legacy plaintext file path.
+ *
+ * @param {{
+ *   targetDeviceId: string,
+ *   rendezvousId: string,
+ *   fileName: string,
+ *   fileSize: number,
+ *   mimeType: string,
+ *   data: string, // base64-encoded file bytes (same shape as legacy payload)
+ * }} payload
+ * @returns {Promise<{transferIdHex: string, totalChunks: number}>}
+ */
+export async function sendFileEncrypted(payload) {
+  const { fileName, fileSize, mimeType, data, targetDeviceId, rendezvousId } = payload;
+  // Decode the base64 payload once — senders up the stack already produce
+  // base64 (image fetches, popup file picker) so keeping the API stable.
+  const binStr = atob(data);
+  const rawBytes = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i += 1) rawBytes[i] = binStr.charCodeAt(i);
+  return _sendFileEncrypted({
+    targetDeviceId,
+    rendezvousId,
+    fileName,
+    fileSize,
+    mimeType,
+    rawBytes,
+    sendJson: sendPairingMessage,
+    sendBinary,
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -40,4 +40,43 @@ describe('validate()', () => {
   it('rejects reconnect missing required fields', () => { const r = validate({ type: 'reconnect' }); assert.equal(r.valid, false); });
   it('accepts valid reconnect', () => { const r = validate({ type: 'reconnect', deviceId: 'd1', publicKey: 'AAAA', signature: 'BBBB', timestamp: Date.now() }); assert.equal(r.valid, true); });
   it('rejects messages exceeding max text size (64KB)', () => { const r = validate({ type: 'sdp-offer', targetDeviceId: 'd1', rendezvousId: 'rv1', sdp: 'x'.repeat(65 * 1024) }); assert.equal(r.valid, false); assert.match(r.error, /too large/i); });
+
+  // Beam E2E handshake envelope validation
+  it('accepts valid transfer-init', () => {
+    const r = validate({ type: 'transfer-init', v: 1, rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't', kind: 'clipboard', ephPkA: 'pk', salt: 's' });
+    assert.equal(r.valid, true);
+  });
+  it('rejects transfer-init with invalid kind', () => {
+    const r = validate({ type: 'transfer-init', v: 1, rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't', kind: 'bogus', ephPkA: 'pk', salt: 's' });
+    assert.equal(r.valid, false);
+    assert.match(r.error, /kind/);
+  });
+  it('rejects transfer-init missing ephPkA', () => {
+    const r = validate({ type: 'transfer-init', v: 1, rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't', kind: 'file', salt: 's' });
+    assert.equal(r.valid, false);
+    assert.match(r.error, /ephPkA/);
+  });
+  it('rejects transfer-init with non-numeric version', () => {
+    const r = validate({ type: 'transfer-init', v: 'one', rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't', kind: 'clipboard', ephPkA: 'pk', salt: 's' });
+    assert.equal(r.valid, false);
+    assert.match(r.error, /\bv\b/);
+  });
+  it('accepts valid transfer-accept', () => {
+    const r = validate({ type: 'transfer-accept', v: 1, rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't', ephPkB: 'pk' });
+    assert.equal(r.valid, true);
+  });
+  it('rejects transfer-accept missing ephPkB', () => {
+    const r = validate({ type: 'transfer-accept', v: 1, rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't' });
+    assert.equal(r.valid, false);
+    assert.match(r.error, /ephPkB/);
+  });
+  it('accepts valid transfer-reject', () => {
+    const r = validate({ type: 'transfer-reject', rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't', errorCode: 'TIMEOUT' });
+    assert.equal(r.valid, true);
+  });
+  it('rejects transfer-reject missing errorCode', () => {
+    const r = validate({ type: 'transfer-reject', rendezvousId: 'rv1', targetDeviceId: 'd1', transferId: 't' });
+    assert.equal(r.valid, false);
+    assert.match(r.error, /errorCode/);
+  });
 });

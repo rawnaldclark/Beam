@@ -189,6 +189,13 @@ dependencies {
     testImplementation("io.mockk:mockk:1.13.9")
     testImplementation("androidx.test:core-ktx:1.5.0")
     testImplementation("androidx.room:room-testing:2.6.1")  // In-memory Room for unit tests
+    // Pure-JVM libsodium binding for unit tests — same wire format as
+    // lazysodium-android so BeamCipherTest can run without an emulator.
+    testImplementation("com.goterl:lazysodium-java:5.1.4")
+    testImplementation("net.java.dev.jna:jna:5.13.0")
+    // Real JSON parser for unit tests — Android's stub org.json returns 0 for
+    // every getInt when isReturnDefaultValues = true.
+    testImplementation("com.google.code.gson:gson:2.10.1")
 
     androidTestImplementation("androidx.test.ext:junit:1.1.5")
     androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")

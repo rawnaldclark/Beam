@@ -1021,6 +1021,13 @@ async function _setStorageViaSW(data) {
 // ---------------------------------------------------------------------------
 
 // Boot promise — message handlers await this before accessing deviceId/keys.
+//
+// connectRelay() is NOT called: the service worker (background-relay.js)
+// owns the only WebSocket to the relay as of Task 7. Opening a second
+// connection from the offscreen document under the same deviceId races
+// with the SW's connection and the gateway's zombie-eviction logic kicks
+// them out in a loop, causing severe presence flapping. The offscreen
+// document remains a stateless helper for GET_DEVICE_LIST, START_PAIRING
+// data, and KEEPALIVE_PING — none of which need their own relay socket.
 const _bootPromise = startup()
-  .then(() => connectRelay())
   .catch(err => console.error('[Beam] Boot failed:', err));

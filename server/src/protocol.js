@@ -13,8 +13,15 @@
 /** Maximum JSON-encoded size for text messages. Enforced in validate(). */
 export const MAX_TEXT_SIZE = 64 * 1024; // 64 KB
 
-/** Maximum size for binary relay frames. Enforced by the relay module. */
-export const MAX_BINARY_SIZE = 256 * 1024; // 256 KB
+/**
+ * Maximum size for binary relay frames. Sized to comfortably hold an
+ * encrypted Beam file chunk: a 200 KB plaintext padded to the next
+ * power-of-2 bucket (256 KB) plus the 16-byte Poly1305 tag and the
+ * 24-byte Beam binary header. Previously 256 KB, which was exactly
+ * 40 bytes short of the encrypted frame and caused the ws library to
+ * close connections with code 1009 ("Message too big").
+ */
+export const MAX_BINARY_SIZE = 512 * 1024; // 512 KB
 
 // ---------------------------------------------------------------------------
 // Message type constants
@@ -60,6 +67,12 @@ export const MSG = Object.freeze({
   FILE_OFFER:         'file-offer',
   FILE_ACCEPT:        'file-accept',
   FILE_COMPLETE:      'file-complete',
+
+  // Beam E2E encryption handshake (relay is a dumb passthrough — no
+  // server-side crypto; sender and receiver derive keys end-to-end).
+  TRANSFER_INIT:      'transfer-init',
+  TRANSFER_ACCEPT:    'transfer-accept',
+  TRANSFER_REJECT:    'transfer-reject',
 
   // Session management
   RECONNECT:          'reconnect',
@@ -209,6 +222,41 @@ const FIELD_RULES = new Map([
     if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId (must be a non-empty string)';
     if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId (must be a non-empty string)';
     if (!isNonEmptyString(msg.transferId))     return 'Missing or invalid field: transferId (must be a non-empty string)';
+    return null;
+  }],
+
+  // Beam E2E encryption handshake. The server never inspects the crypto
+  // fields themselves — it only enforces that the envelope is well-formed
+  // so we fail fast on garbage and keep the binary relay path pristine.
+  [MSG.TRANSFER_INIT, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.transferId))     return 'Missing or invalid field: transferId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.kind))           return 'Missing or invalid field: kind (must be a non-empty string)';
+    if (msg.kind !== 'clipboard' && msg.kind !== 'file')
+      return `Invalid field: kind must be "clipboard" or "file", got "${msg.kind}"`;
+    if (!isNonEmptyString(msg.ephPkA))         return 'Missing or invalid field: ephPkA (must be a non-empty string)';
+    if (!isNonEmptyString(msg.salt))           return 'Missing or invalid field: salt (must be a non-empty string)';
+    if (typeof msg.v !== 'number' || msg.v <= 0)
+      return 'Missing or invalid field: v (must be a positive number)';
+    return null;
+  }],
+
+  [MSG.TRANSFER_ACCEPT, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.transferId))     return 'Missing or invalid field: transferId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.ephPkB))         return 'Missing or invalid field: ephPkB (must be a non-empty string)';
+    if (typeof msg.v !== 'number' || msg.v <= 0)
+      return 'Missing or invalid field: v (must be a positive number)';
+    return null;
+  }],
+
+  [MSG.TRANSFER_REJECT, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.transferId))     return 'Missing or invalid field: transferId (must be a non-empty string)';
+    if (!isNonEmptyString(msg.errorCode))      return 'Missing or invalid field: errorCode (must be a non-empty string)';
     return null;
   }],
 

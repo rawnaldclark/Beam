@@ -297,4 +297,99 @@ describe('Signaling', () => {
     assert.equal(gateway.sent.length, 0, 'no messages should be sent for non-signaling types');
     assert.equal(gateway.sentTo.length, 0, 'no error messages should be sent for non-signaling types');
   });
+
+  // -------------------------------------------------------------------------
+  // Test 7 — Relays Beam transfer-init, transfer-accept, transfer-reject
+  // -------------------------------------------------------------------------
+  it('relays transfer-init (Beam E2E handshake) to the target', () => {
+    presence._setRendezvous('rv1', ['device-sender', 'device-target']);
+
+    const msg = {
+      type: 'transfer-init',
+      v: 1,
+      rendezvousId: 'rv1',
+      targetDeviceId: 'device-target',
+      transferId: 'abc123',
+      kind: 'clipboard',
+      ephPkA: 'pk-a-b64url',
+      salt: 'salt-b64url',
+    };
+
+    const handled = signaling.handleMessage('device-sender', msg, MOCK_WS);
+    assert.equal(handled, true);
+
+    const toTarget = gateway.sent.filter((e) => e.deviceId === 'device-target');
+    assert.equal(toTarget.length, 1);
+    const relayed = toTarget[0].msg;
+    assert.equal(relayed.type, 'transfer-init');
+    assert.equal(relayed.fromDeviceId, 'device-sender');
+    assert.equal(relayed.transferId, 'abc123');
+    assert.equal(relayed.kind, 'clipboard');
+    assert.equal(relayed.ephPkA, 'pk-a-b64url');
+    assert.equal(relayed.salt, 'salt-b64url');
+    assert.ok(!Object.prototype.hasOwnProperty.call(relayed, 'targetDeviceId'));
+  });
+
+  it('relays transfer-accept (Beam E2E handshake) to the target', () => {
+    presence._setRendezvous('rv1', ['device-sender', 'device-target']);
+
+    const msg = {
+      type: 'transfer-accept',
+      v: 1,
+      rendezvousId: 'rv1',
+      targetDeviceId: 'device-target',
+      transferId: 'abc123',
+      ephPkB: 'pk-b-b64url',
+    };
+
+    const handled = signaling.handleMessage('device-sender', msg, MOCK_WS);
+    assert.equal(handled, true);
+
+    const toTarget = gateway.sent.filter((e) => e.deviceId === 'device-target');
+    assert.equal(toTarget.length, 1);
+    const relayed = toTarget[0].msg;
+    assert.equal(relayed.type, 'transfer-accept');
+    assert.equal(relayed.fromDeviceId, 'device-sender');
+    assert.equal(relayed.ephPkB, 'pk-b-b64url');
+  });
+
+  it('relays transfer-reject with errorCode preserved', () => {
+    presence._setRendezvous('rv1', ['device-sender', 'device-target']);
+
+    const msg = {
+      type: 'transfer-reject',
+      rendezvousId: 'rv1',
+      targetDeviceId: 'device-target',
+      transferId: 'abc123',
+      errorCode: 'TIMEOUT',
+    };
+
+    const handled = signaling.handleMessage('device-sender', msg, MOCK_WS);
+    assert.equal(handled, true);
+
+    const toTarget = gateway.sent.filter((e) => e.deviceId === 'device-target');
+    assert.equal(toTarget.length, 1);
+    assert.equal(toTarget[0].msg.errorCode, 'TIMEOUT');
+  });
+
+  it('rejects transfer-init when sender is not in rendezvous', () => {
+    presence._setRendezvous('rv1', ['device-target']);
+
+    const msg = {
+      type: 'transfer-init',
+      v: 1,
+      rendezvousId: 'rv1',
+      targetDeviceId: 'device-target',
+      transferId: 'abc123',
+      kind: 'file',
+      ephPkA: 'pk-a',
+      salt: 'salt',
+    };
+
+    const handled = signaling.handleMessage('device-sender', msg, MOCK_WS);
+    assert.equal(handled, true);
+    assert.equal(gateway.sent.length, 0, 'no relay when sender not in rendezvous');
+    assert.equal(gateway.sentTo.length, 1, 'error sent back to sender');
+    assert.equal(gateway.sentTo[0].msg.type, 'error');
+  });
 });

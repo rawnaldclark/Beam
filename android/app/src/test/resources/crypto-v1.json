@@ -1,0 +1,88 @@
+{
+  "version": 1,
+  "spec": "docs/superpowers/specs/2026-04-10-e2e-encryption-design.md",
+  "generator": "server/scripts/gen-test-vectors.py",
+  "inputs": {
+    "staticSkA": "a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf",
+    "staticPkA": "605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23c",
+    "staticSkB": "c0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedf",
+    "staticPkB": "dc2cca31e8e43bbd91dff7e475cca3347eb478107d5bd765aba4ae4a30c35d44",
+    "ephSkA": "1011121314151617184192a3b4c5d6e70001020304050607f8e9dacbbcad9e8f",
+    "ephPkA": "a6c8685088ba74a470dcc753a81c7929805561bf238c5f9650c0da623fb22304",
+    "ephSkB": "2021222324252627281131425364758a9988776655443322112233445566778f",
+    "ephPkB": "a82e6d410614494b663fbd367b42b3617d2665df0510768801e54a67a95e7f3f",
+    "salt": "5a1750d1a2b3c4d5e6f708192a3b4c5d6e7f8091a2b3c4d5e6f708192a3b4c5d",
+    "transferId": "11223344556677889900aabbccddeeff"
+  },
+  "tripleDH": {
+    "dh1": "73c204dd0cea6ab1ab92816880f82d92b6d991392f827f8cc017c0fd8026ed45",
+    "dh2": "54a580cd4dcc131bad6399e0805a845b98e39836037b81e5e9ae05c7da9f8f5d",
+    "dh3": "50323a32cd5325c5c94e06c0a17dfa2b54dc5b9d126fd8b4965e986cf1af9b6f",
+    "ikm": "73c204dd0cea6ab1ab92816880f82d92b6d991392f827f8cc017c0fd8026ed4554a580cd4dcc131bad6399e0805a845b98e39836037b81e5e9ae05c7da9f8f5d50323a32cd5325c5c94e06c0a17dfa2b54dc5b9d126fd8b4965e986cf1af9b6f"
+  },
+  "transcript": "8f0eea5ffad6d8643441080adf56f8ca7d59b1a6de47442c7f342d1b2e92ad31",
+  "keys": {
+    "sessionKey": "a01b7fd86825dda1f0d0eaa3f410b00974cfee05c505597500ec0460acb40543",
+    "chunkKey": "d55a2edee712eff6b92237c2a60dd7ac295c84147f8d31b839061f569dc20e48",
+    "metaKey": "238e8a31c70ae302ab6e61bf6937ea0997e0b410f5238251de0bbc4817bbd4fe"
+  },
+  "clipboard": {
+    "plaintext": "48656c6c6f2066726f6d204265616d202d2074686520717569636b2062726f776e20666f78206a756d7073206f76657220746865206c617a7920646f672e",
+    "plaintextLen": 62,
+    "paddedLen": 128,
+    "kindByte": 1,
+    "index": 0,
+    "totalChunks": 1,
+    "nonce": "bbf90538510742d2cf88e8ab8035e1c775b08872d1bf8b14",
+    "aad": "6265616d2d616561642d76310100000000000000018f0eea5ffad6d8643441080adf56f8ca7d59b1a6de47442c7f342d1b2e92ad31",
+    "ciphertext": "58818f6526bc8426f72b65bb9fa71a3488982960d36b806a9689c9ea4ca2f3c33d555f478efd92e3dce24537de7120c1ead66232980acdd79318792b258e7c35aac53691f19e594f912e5dc9ad2e1d1610781d97f744443407eead81bd9009f7ccf0413b2ad3724ccdd249e01cac4b8629ed484e40678fad6609555a5c45f0d67f04a80f416f71e0195160179eff57c6"
+  },
+  "fileMetadata": {
+    "plaintext": "7b2266696c654e616d65223a227661636174696f6e2d70686f746f2e6a7067222c2266696c6553697a65223a3631343430302c226d696d65223a22696d6167652f6a706567222c22746f74616c4368756e6b73223a337d",
+    "plaintextLen": 87,
+    "paddedLen": 128,
+    "kindByte": 2,
+    "index": 0,
+    "totalChunks": 0,
+    "nonce": "690c6e11456c5ea71c7f071b9e9d5c1af73658761a97cf82",
+    "aad": "6265616d2d616561642d76310200000000000000008f0eea5ffad6d8643441080adf56f8ca7d59b1a6de47442c7f342d1b2e92ad31",
+    "ciphertext": "a82ffe481bbf0bd39ee96d7bebc10ff9fc3982221480d3f3c273b7a2e2c6ec4510ae22cd4710f82cd6fd561534b97687afaafa46389c8ce6ddde3a4f0f3e024e4b3cb605ad46e68430eb0b7c38ad3f6294e9a7931bff20b2a54a28568418d5a98b30a3592a0131dd13b7d675fb536e8226f4a435bf4cf79f99bd7c4151fb3b147f0c9cc8e3f404efd0175ddfc1009c83"
+  },
+  "fileChunks": {
+    "chunkSize": 204800,
+    "totalChunks": 3,
+    "kindByte": 3,
+    "chunks": [
+      {
+        "index": 1,
+        "plaintextSha256": "2f72c82cbdcc0dbab5ec857d919f52b03469dff0e560628bf327cdcc81a20d93",
+        "plaintextLen": 204800,
+        "paddedLen": 262144,
+        "nonce": "2cce6f00d6a22d50a42da47bddaac8215fb3be13e09fd5ab",
+        "aad": "6265616d2d616561642d76310300000001000000038f0eea5ffad6d8643441080adf56f8ca7d59b1a6de47442c7f342d1b2e92ad31",
+        "ciphertextSha256": "cd644e753323228320c2cb73e849f4ff0b883d1e1f62a4bc21c728e8c4a78832",
+        "ciphertextLen": 262160
+      },
+      {
+        "index": 2,
+        "plaintextSha256": "75849421d66dc0011d232a2595dda8d0472998c40caa339d2f59b2e10b97155c",
+        "plaintextLen": 204800,
+        "paddedLen": 262144,
+        "nonce": "48c0f44ecae9dd9e584d5c510f34d851e5f576505a25799e",
+        "aad": "6265616d2d616561642d76310300000002000000038f0eea5ffad6d8643441080adf56f8ca7d59b1a6de47442c7f342d1b2e92ad31",
+        "ciphertextSha256": "80252d14c3d34f237dc3a7c1806a669fc805a7717d91e20e7aaa66ed6c30c49e",
+        "ciphertextLen": 262160
+      },
+      {
+        "index": 3,
+        "plaintextSha256": "105238f71c492d09d5b663b76cea56a1f6cdec510650e8340a228e289183b464",
+        "plaintextLen": 12345,
+        "paddedLen": 16384,
+        "nonce": "f5f60ad5125e0bd7e59a5d3ea180bf7187a9033f721a9b0d",
+        "aad": "6265616d2d616561642d76310300000003000000038f0eea5ffad6d8643441080adf56f8ca7d59b1a6de47442c7f342d1b2e92ad31",
+        "ciphertextSha256": "c9bd7b8707084abefbde70decbfff03f51ac73c66da89ac63b72637fa879030f",
+        "ciphertextLen": 16400
+      }
+    ]
+  }
+}

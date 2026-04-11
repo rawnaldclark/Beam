@@ -30,7 +30,8 @@
 
 import { MSG }                  from './shared/message-types.js';
 import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
-import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary } from './background-relay.js';
+import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted } from './background-relay.js';
+import { beamErrorMessage } from './crypto/session-registry.js';
 
 // ---------------------------------------------------------------------------
 // Badge state — tracks a pending "failure" clear so we can dismiss it on the
@@ -202,24 +203,27 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       sendPairingMessage(msg.payload);
       break;
 
-    // ── File transfer via relay binary channel ──────────────────────────────
+    // ── File transfer via relay binary channel (Beam E2E encrypted) ────────
     case 'SEND_FILE': {
-      const transferId = sendFileViaRelay(msg.payload);
-      sendResponse({ ok: true, transferId });
-      return true;
+      sendFileEncrypted(msg.payload)
+        .then(({ transferIdHex }) => sendResponse({ ok: true, transferId: transferIdHex }))
+        .catch((err) => {
+          console.error('[Beam SW] SEND_FILE failed:', err);
+          sendResponse({ ok: false, error: beamErrorMessage(err.code) });
+        });
+      return true; // async sendResponse
     }
 
-    // ── Clipboard transfer via relay WebSocket ─────────────────────────────
+    // ── Clipboard transfer via relay WebSocket (Beam E2E encrypted) ────────
     case 'SEND_CLIPBOARD': {
       const { content, targetDeviceId, rendezvousId } = msg.payload;
-      sendPairingMessage({
-        type: 'clipboard-transfer',
-        targetDeviceId,
-        rendezvousId,
-        content,
-      });
-      sendResponse({ ok: true });
-      break;
+      sendClipboardEncrypted(targetDeviceId, rendezvousId, content)
+        .then(() => sendResponse({ ok: true }))
+        .catch((err) => {
+          console.error('[Beam SW] SEND_CLIPBOARD failed:', err);
+          sendResponse({ ok: false, error: beamErrorMessage(err.code) });
+        });
+      return true; // async sendResponse
     }
 
     // ── All other messages — forward to offscreen document ─────────────────
@@ -280,24 +284,24 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   const rendezvousId = ownDeviceId;
 
   if (type === 'link') {
-    sendPairingMessage({
-      type:           'clipboard-transfer',
-      targetDeviceId: deviceId,
-      rendezvousId,
-      content:        info.linkUrl,
-    });
-    notifySent('Link sent');
+    try {
+      await sendClipboardEncrypted(deviceId, rendezvousId, info.linkUrl);
+      notifySent('Link sent');
+    } catch (err) {
+      console.error('[Beam SW] Link send failed:', err);
+      notifyFail('Link send failed: ' + beamErrorMessage(err.code));
+    }
     return;
   }
 
   if (type === 'text') {
-    sendPairingMessage({
-      type:           'clipboard-transfer',
-      targetDeviceId: deviceId,
-      rendezvousId,
-      content:        info.selectionText,
-    });
-    notifySent('Text sent');
+    try {
+      await sendClipboardEncrypted(deviceId, rendezvousId, info.selectionText);
+      notifySent('Text sent');
+    } catch (err) {
+      console.error('[Beam SW] Text send failed:', err);
+      notifyFail('Text send failed: ' + beamErrorMessage(err.code));
+    }
     return;
   }
 
@@ -322,14 +326,19 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         if (last) fileName = last;
       } catch { /* fallback default */ }
 
-      sendFileViaRelay({
+      sendFileEncrypted({
         fileName,
         fileSize:       imageData.size,
         mimeType:       imageData.mimeType || 'image/jpeg',
         data:           base64,
         targetDeviceId: deviceId,
         rendezvousId,
-      });
+      })
+        .then(() => notifySent('Image sent'))
+        .catch((err) => {
+          console.error('[Beam SW] Image send failed:', err);
+          notifyFail('Image send failed: ' + beamErrorMessage(err.code));
+        });
       notifySent('Image sending…');
     } catch (err) {
       console.error('[Beam SW] Image fetch failed:', err);
@@ -350,6 +359,21 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
  */
 function notifySent(message) {
   chrome.notifications.create('beam-sent-' + Date.now(), {
+    type:    'basic',
+    iconUrl: 'icons/icon-128.png',
+    title:   'Beam',
+    message,
+  });
+}
+
+/**
+ * Show a failure notification for a Beam transfer. Used by the encrypted
+ * clipboard path to surface handshake / delivery errors to the user.
+ *
+ * @param {string} message - Short user-facing error description.
+ */
+function notifyFail(message) {
+  chrome.notifications.create('beam-err-' + Date.now(), {
     type:    'basic',
     iconUrl: 'icons/icon-128.png',
     title:   'Beam',
@@ -466,19 +490,23 @@ chrome.commands.onCommand.addListener(async (command) => {
         return;
       }
 
-      sendPairingMessage({
-        type:           'clipboard-transfer',
-        targetDeviceId: target.deviceId,
-        rendezvousId:   target.rendezvousId,
-        content:        text,
-      });
-
-      chrome.notifications.create('beam-sent-' + Date.now(), {
-        type:    'basic',
-        iconUrl: 'icons/icon-128.png',
-        title:   'Beam',
-        message: `Clipboard sent to ${target.name}`,
-      });
+      try {
+        await sendClipboardEncrypted(target.deviceId, target.rendezvousId, text);
+        chrome.notifications.create('beam-sent-' + Date.now(), {
+          type:    'basic',
+          iconUrl: 'icons/icon-128.png',
+          title:   'Beam',
+          message: `Clipboard sent to ${target.name}`,
+        });
+      } catch (err) {
+        console.error('[Beam SW] Clipboard send failed:', err);
+        chrome.notifications.create('beam-err-' + Date.now(), {
+          type:    'basic',
+          iconUrl: 'icons/icon-128.png',
+          title:   'Beam',
+          message: `Clipboard send failed: ${beamErrorMessage(err.code)}`,
+        });
+      }
     } catch (err) {
       console.error('[Beam SW] Clipboard read failed:', err);
       chrome.notifications.create('beam-err-' + Date.now(), {
@@ -831,68 +859,10 @@ async function findTargetDevice() {
   };
 }
 
-/**
- * Send a file via the pairing relay binary channel.
- *
- * Emits file-offer + relay-bind, waits briefly for the receiver to bind, then
- * streams base64-decoded bytes as chunked binary frames, finishing with
- * file-complete + relay-release.
- *
- * Shared between the SEND_FILE message handler (popup path) and the context
- * menu image handler so both code paths go through identical logic.
- *
- * @param {{
- *   fileName: string,
- *   fileSize: number,
- *   mimeType: string,
- *   data: string,                // base64-encoded file bytes
- *   targetDeviceId: string,
- *   rendezvousId: string,
- * }} payload
- * @returns {string} The generated transferId for this transfer.
- */
-function sendFileViaRelay(payload) {
-  const { fileName, fileSize, mimeType, data, targetDeviceId, rendezvousId } = payload;
-  const transferId = 'tf-' + Date.now() + '-' + Math.random().toString(36).slice(2, 8);
-
-  // Send file-offer + relay-bind, then wait for file-accept before sending data.
-  sendPairingMessage({ type: 'file-offer', targetDeviceId, rendezvousId, fileName, fileSize, mimeType, transferId });
-  sendPairingMessage({ type: 'relay-bind', transferId, targetDeviceId, rendezvousId });
-
-  const _sendFileData = () => {
-    const binaryStr = atob(data);
-    const bytes = new Uint8Array(binaryStr.length);
-    for (let i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
-
-    const CHUNK_SIZE = 200 * 1024;
-    let offset = 0;
-
-    // Send chunks with small delays to avoid overwhelming the relay.
-    function sendNextChunk() {
-      if (offset >= bytes.length) {
-        // All chunks sent — send file-complete + release after a brief pause.
-        setTimeout(() => {
-          sendPairingMessage({ type: 'file-complete', targetDeviceId, rendezvousId, transferId });
-          sendPairingMessage({ type: 'relay-release', transferId });
-          console.log('[Beam SW] File send complete:', fileName);
-        }, 200);
-        return;
-      }
-      const end = Math.min(offset + CHUNK_SIZE, bytes.length);
-      sendBinary(bytes.slice(offset, end).buffer);
-      offset = end;
-      // 50ms between chunks — gives relay time to forward.
-      setTimeout(sendNextChunk, 50);
-    }
-    sendNextChunk();
-  };
-
-  // Wait 2 seconds for receiver to bind, then start sending.
-  // The receiver auto-assembles when bytesReceived >= fileSize.
-  setTimeout(_sendFileData, 2000);
-
-  return transferId;
-}
+// Legacy plaintext sendFileViaRelay has been removed — all outgoing files
+// now go through sendFileEncrypted (Beam E2E). The receiver still accepts
+// legacy plaintext frames via background-relay.js as a dormant safety net
+// until Task 9/10.
 
 // ---------------------------------------------------------------------------
 

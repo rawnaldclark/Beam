@@ -42,6 +42,11 @@ const SIGNALING_TYPES = new Set([
   MSG.FILE_OFFER,
   MSG.FILE_ACCEPT,
   MSG.FILE_COMPLETE,
+  // Beam E2E handshake — relay is a passthrough; rendezvous membership
+  // is still enforced so these go through the same sender/target check.
+  MSG.TRANSFER_INIT,
+  MSG.TRANSFER_ACCEPT,
+  MSG.TRANSFER_REJECT,
 ]);
 
 // ---------------------------------------------------------------------------

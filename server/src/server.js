@@ -54,12 +54,14 @@ import { MSG }             from './protocol.js';
 const PORT = parseInt(process.env.PORT ?? '8080', 10);
 
 /**
- * Maximum WebSocket payload size in bytes (256 KB).
- * Binary relay frames are capped at MAX_BINARY_SIZE (256 KB) by protocol;
- * this value is set identically so the ws library rejects over-sized frames
- * before they reach application code.
+ * Maximum WebSocket payload size in bytes (512 KB).
+ * Sized to accommodate encrypted Beam file chunks: a 200 KB plaintext
+ * padded to the next power-of-2 bucket (256 KB) plus the 16-byte
+ * Poly1305 tag and 24-byte Beam binary header. Kept identical to
+ * MAX_BINARY_SIZE so the ws library rejects over-sized frames before
+ * they reach application code.
  */
-const MAX_PAYLOAD_BYTES = 256 * 1024; // 256 KB
+const MAX_PAYLOAD_BYTES = 512 * 1024; // 512 KB
 
 // ---------------------------------------------------------------------------
 // Rate limiter (singleton, spec values)
@@ -344,6 +346,9 @@ gateway.onMessage((deviceId, msg, ws) => {
     case MSG.FILE_OFFER:
     case MSG.FILE_ACCEPT:
     case MSG.FILE_COMPLETE:
+    case MSG.TRANSFER_INIT:
+    case MSG.TRANSFER_ACCEPT:
+    case MSG.TRANSFER_REJECT:
       signaling.handleMessage(deviceId, msg, ws);
       break;
 
