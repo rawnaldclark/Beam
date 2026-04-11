@@ -34,6 +34,18 @@ import { getCryptoContext } from './beam-crypto-context.js';
 // After AEAD + power-of-2 padding the on-the-wire frame is ~256 KB which
 // comfortably stays under the relay's MAX_BINARY_SIZE.
 const FILE_CHUNK_SIZE = 200 * 1024;
+
+// Receiver-side caps on incoming file metadata. These must be validated
+// before any per-transfer buffer is allocated to prevent a malicious
+// paired peer from causing OOM via an oversized `fileSize` or
+// `totalChunks` declaration in the encrypted metadata envelope.
+//
+// MAX_FILE_SIZE matches the server's existing SESSION_LIMIT (500 MB in
+// server/src/relay.js), so no legitimate transfer that would succeed
+// against the server is blocked here. MAX_CHUNKS is sized for the
+// 500 MB budget at ~175 KB effective per chunk.
+export const MAX_FILE_SIZE = 500 * 1024 * 1024; // 500 MB
+export const MAX_CHUNKS    = 3000;
 // 20ms spacing between file chunk sends — gives the relay breathing room
 // and prevents OkHttp / browser WebSocket buffers from spiking.
 const CHUNK_SEND_SPACING_MS = 20;
@@ -523,14 +535,43 @@ export async function handleIncomingBeamFrame({
         transcript: session.transcript,
       });
       const metadata = JSON.parse(new TextDecoder().decode(metaBytes));
+
+      // Validate peer-supplied metadata BEFORE mutating any session state
+      // or allocating per-transfer buffers. A malicious paired peer could
+      // otherwise declare an oversized fileSize / totalChunks and cause
+      // the receiver to OOM once chunks start arriving. AEAD authenticity
+      // only guarantees the envelope came from the paired peer — it does
+      // not bound the declared values.
+      const fileName    = metadata.fileName;
+      const fileSize    = metadata.fileSize;
+      const mimeType    = metadata.mime;
+      const totalChunks = metadata.totalChunks;
+
+      if (typeof fileSize !== 'number' || !Number.isFinite(fileSize) || fileSize <= 0 || fileSize > MAX_FILE_SIZE) {
+        console.warn('[Beam SW] rejected file metadata: invalid fileSize', fileSize);
+        await ctx.registry.destroy(session.transferId, ERROR_CODES.DECRYPT_FAIL);
+        return true;
+      }
+      if (typeof totalChunks !== 'number' || !Number.isInteger(totalChunks) || totalChunks <= 0 || totalChunks > MAX_CHUNKS) {
+        console.warn('[Beam SW] rejected file metadata: invalid totalChunks', totalChunks);
+        await ctx.registry.destroy(session.transferId, ERROR_CODES.DECRYPT_FAIL);
+        return true;
+      }
+      if (typeof fileName !== 'string' || fileName.length === 0 || fileName.length > 255) {
+        console.warn('[Beam SW] rejected file metadata: invalid fileName length', fileName?.length);
+        await ctx.registry.destroy(session.transferId, ERROR_CODES.DECRYPT_FAIL);
+        return true;
+      }
+      if (typeof mimeType !== 'string') {
+        console.warn('[Beam SW] rejected file metadata: invalid mime type', mimeType);
+        await ctx.registry.destroy(session.transferId, ERROR_CODES.DECRYPT_FAIL);
+        return true;
+      }
+
       session.fileMetadata = metadata;
-      session.totalChunks = metadata.totalChunks | 0;
+      session.totalChunks = totalChunks;
       session.fileChunks = [];
       session.bytesReceivedPlain = 0;
-      if (session.totalChunks <= 0) {
-        console.error('[Beam SW] file metadata has invalid totalChunks:', session.totalChunks);
-        await ctx.registry.destroy(session.transferId, ERROR_CODES.DECRYPT_FAIL);
-      }
       return true;
     }
 

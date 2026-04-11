@@ -170,21 +170,33 @@ export function renderQR(canvas, data) {
 // ---------------------------------------------------------------------------
 
 /**
- * Generate a cryptographically random 8-digit PIN string.
+ * Generate an 8-digit PIN string, cryptographically random via
+ * crypto.getRandomValues with rejection sampling to avoid modulo bias.
  *
- * The PIN provides a weak secondary channel that the Android app can use to
- * confirm it scanned the correct QR code before the SAS step is reached.
- * It is NOT a security-critical secret — the SAS emoji step provides the
- * binding guarantee.
+ * The PIN is purely informational — it is displayed to let the user do a
+ * quick visual cross-check with the Android app, and is NOT used in any
+ * authentication decision. The SAS emoji step provides the real binding
+ * guarantee. Even so, there is no reason to use weak randomness when a
+ * CSPRNG is freely available, and the previous Math.random() source was
+ * drifting out of sync with the (incorrect) JSDoc claim of cryptographic
+ * randomness.
  *
  * Pad with leading zeros so the display width is always exactly 8 characters.
  *
  * @returns {string} Zero-padded 8-digit PIN, e.g. "00731842".
  */
 export function generatePIN() {
-  // Math.random() is sufficient here; the PIN is purely informational.
-  const pin = String(Math.floor(Math.random() * 100_000_000)).padStart(8, '0');
-  return pin;
+  // Uniform 8-digit PIN via rejection sampling. 4_200_000_000 is the
+  // largest multiple of 100_000_000 that fits in a uint32; any uint32
+  // below it maps bias-free via modulo. Draws above the threshold are
+  // retried. Expected draws per call ~= 1.02.
+  const buf = new Uint32Array(1);
+  let r;
+  do {
+    crypto.getRandomValues(buf);
+    r = buf[0];
+  } while (r >= 4_200_000_000);
+  return String(r % 100_000_000).padStart(8, '0');
 }
 
 /**
@@ -256,26 +268,66 @@ export function displaySAS(container, emojis) {
  * @param {Function}    onSubmit       - Callback: ({ name: string, icon: string }) => void
  */
 export function createNamingForm(container, suggestedName, onSubmit) {
-  // Sanitise suggestedName to avoid XSS via attribute injection.
-  const safeName = (suggestedName || '').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+  // Build the form via imperative DOM construction. `suggestedName` arrives
+  // from a peer-supplied pairing-request message, so it must never flow
+  // into innerHTML. Using `.value` / `.textContent` makes the browser treat
+  // the string as data regardless of its contents — no escape function to
+  // get wrong as the template evolves.
+  const form = document.createElement('div');
+  form.className = 'naming-form';
 
-  container.innerHTML = `
-    <div class="naming-form">
-      <label for="device-name">Name this device</label>
-      <input type="text" id="device-name" value="${safeName}"
-             placeholder="e.g., Work Laptop" maxlength="30" autocomplete="off">
-      <div class="icon-picker" id="icon-picker">
-        <button type="button" data-icon="laptop"  class="icon-btn selected">💻</button>
-        <button type="button" data-icon="desktop" class="icon-btn">🖥️</button>
-        <button type="button" data-icon="phone"   class="icon-btn">📱</button>
-        <button type="button" data-icon="tablet"  class="icon-btn">📟</button>
-      </div>
-      <button id="naming-done" type="button" class="primary-btn" disabled>Done</button>
-    </div>
-  `;
+  const label = document.createElement('label');
+  label.setAttribute('for', 'device-name');
+  label.textContent = 'Name this device';
+  form.appendChild(label);
 
-  const nameInput    = container.querySelector('#device-name');
-  const doneBtn      = container.querySelector('#naming-done');
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.id = 'device-name';
+  nameInput.value = suggestedName || '';
+  nameInput.placeholder = 'e.g., Work Laptop';
+  nameInput.maxLength = 30;
+  nameInput.autocomplete = 'off';
+  form.appendChild(nameInput);
+
+  const iconPicker = document.createElement('div');
+  iconPicker.className = 'icon-picker';
+  iconPicker.id = 'icon-picker';
+
+  const iconSpecs = [
+    { icon: 'laptop',  glyph: '\u{1F4BB}' },       // 💻
+    { icon: 'desktop', glyph: '\u{1F5A5}\u{FE0F}' }, // 🖥️
+    { icon: 'phone',   glyph: '\u{1F4F1}' },       // 📱
+    { icon: 'tablet',  glyph: '\u{1F4DF}' },       // 📟
+  ];
+  iconSpecs.forEach((spec, idx) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = idx === 0 ? 'icon-btn selected' : 'icon-btn';
+    btn.dataset.icon = spec.icon;
+    btn.textContent = spec.glyph;
+    iconPicker.appendChild(btn);
+  });
+  form.appendChild(iconPicker);
+
+  const doneBtn = document.createElement('button');
+  doneBtn.id = 'naming-done';
+  doneBtn.type = 'button';
+  doneBtn.className = 'primary-btn';
+  doneBtn.disabled = true;
+  doneBtn.textContent = 'Done';
+  form.appendChild(doneBtn);
+
+  // Clear any prior content and mount the new form. `replaceChildren` is
+  // the modern atomic clear; fall back to setting innerHTML to '' for
+  // environments (e.g. older jsdom) that don't implement it.
+  if (typeof container.replaceChildren === 'function') {
+    container.replaceChildren(form);
+  } else {
+    container.innerHTML = '';
+    container.appendChild(form);
+  }
+
   const iconBtns     = container.querySelectorAll('.icon-btn');
   let   selectedIcon = 'laptop';
 
