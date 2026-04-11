@@ -102,7 +102,10 @@ describe('Presence', () => {
 
   beforeEach(() => {
     gateway = createMockGateway();
-    presence = new Presence({ gateway });
+    // Disable the reconnect grace period by default so existing tests
+    // that expect synchronous unregister semantics continue to work.
+    // The grace behaviour has dedicated tests later in this suite.
+    presence = new Presence({ gateway, reconnectGraceMs: 0 });
   });
 
   afterEach(() => {
@@ -191,8 +194,9 @@ describe('Presence', () => {
   // Test 5 — Silence timeout: devices marked offline after silenceTimeoutMs
   // -------------------------------------------------------------------------
   it('startSilenceChecker() unregisters devices silent longer than silenceTimeoutMs', async () => {
-    // Use a very short timeout for deterministic testing
-    presence = new Presence({ gateway, silenceTimeoutMs: 100, checkIntervalMs: 50 });
+    // Use a very short timeout for deterministic testing. Keep grace at 0
+    // so the silence checker's teardown is observable within this test.
+    presence = new Presence({ gateway, silenceTimeoutMs: 100, checkIntervalMs: 50, reconnectGraceMs: 0 });
 
     presence.register('device-A', ['rv1']);
     presence.register('device-B', ['rv1']);
@@ -261,5 +265,75 @@ describe('Presence', () => {
       toB.some((m) => m.type === 'peer-offline' && m.deviceId === 'device-A'),
       'device-B should receive peer-offline when device-A leaves rv1',
     );
+  });
+
+  // -------------------------------------------------------------------------
+  // Test 8 — Reconnect grace: unregister + re-register within grace window
+  //           does NOT emit PEER_OFFLINE to peers.
+  // -------------------------------------------------------------------------
+  it('reconnect grace period absorbs a quick unregister + register cycle', async () => {
+    const gracePresence = new Presence({ gateway, reconnectGraceMs: 100 });
+    try {
+      gracePresence.register('device-B', ['rv1']);
+      gracePresence.register('device-A', ['rv1']);
+      gateway.sent.length = 0;
+
+      // Simulate a flaky disconnect + immediate reconnect for device-A.
+      gracePresence.unregister('device-A');
+      // During the grace window, device-A is still tracked as online so
+      // signaling can keep routing.
+      assert.ok(
+        gracePresence.isOnline('device-A'),
+        'device-A should still be online during the grace window',
+      );
+
+      // Reconnect with the same rendezvous IDs BEFORE the grace expires.
+      gracePresence.register('device-A', ['rv1']);
+
+      // Wait past the grace window to confirm the pending teardown was
+      // cancelled and no offline message ever fires.
+      await new Promise((r) => setTimeout(r, 200));
+
+      const toB = messagesTo(gateway.sent, 'device-B');
+      assert.ok(
+        !toB.some((m) => m.type === 'peer-offline'),
+        'device-B should NOT receive peer-offline for device-A across the grace window',
+      );
+      assert.ok(
+        gracePresence.isOnline('device-A'),
+        'device-A should still be online after the grace window',
+      );
+    } finally {
+      gracePresence.destroy();
+    }
+  });
+
+  // -------------------------------------------------------------------------
+  // Test 9 — Reconnect grace: if the device never comes back, PEER_OFFLINE
+  //           is delivered after the grace window expires.
+  // -------------------------------------------------------------------------
+  it('reconnect grace: genuine disconnect still fires PEER_OFFLINE after window', async () => {
+    const gracePresence = new Presence({ gateway, reconnectGraceMs: 50 });
+    try {
+      gracePresence.register('device-B', ['rv1']);
+      gracePresence.register('device-A', ['rv1']);
+      gateway.sent.length = 0;
+
+      gracePresence.unregister('device-A');
+      // Wait well past the grace window.
+      await new Promise((r) => setTimeout(r, 150));
+
+      const toB = messagesTo(gateway.sent, 'device-B');
+      assert.ok(
+        toB.some((m) => m.type === 'peer-offline' && m.deviceId === 'device-A'),
+        'device-B should receive peer-offline for device-A after the grace window',
+      );
+      assert.ok(
+        !gracePresence.isOnline('device-A'),
+        'device-A should be offline after the grace window',
+      );
+    } finally {
+      gracePresence.destroy();
+    }
   });
 });

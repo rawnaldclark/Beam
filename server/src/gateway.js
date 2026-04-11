@@ -358,6 +358,19 @@ export class Gateway extends EventEmitter {
 
     // --- Auth success ---
     this.pendingChallenges.delete(ws);
+
+    // Zombie-tolerant re-auth: if this deviceId already has an authenticated
+    // socket (e.g. the client reconnected before the old socket's TCP close
+    // has propagated), we simply overwrite `devices[deviceId]` with the new
+    // socket. The old socket's `wsToDevice` entry remains in place; when
+    // the old socket eventually closes, `_onClose` will notice it is no
+    // longer the current registration and skip the teardown.
+    //
+    // We deliberately do NOT actively close the old socket here, because
+    // doing so races with clients that may be in the middle of a normal
+    // reconnect flow and creates an eviction cascade. The defensive check
+    // in `_onClose` is sufficient to prevent the stale close from wiping
+    // the new registration.
     this.devices.set(deviceId, ws);
     this.wsToDevice.set(ws, deviceId);
 
@@ -379,12 +392,23 @@ export class Gateway extends EventEmitter {
     // Remove pending challenge (covers unauthenticated closes)
     this.pendingChallenges.delete(ws);
 
-    // Clean up authenticated device registration
+    // Clean up authenticated device registration — but ONLY if the closing
+    // ws is still the current registration for its deviceId.
+    //
+    // Defense in depth: if a re-auth has already installed a replacement
+    // socket for this deviceId (via the zombie-eviction path in
+    // _handleAuth), we must NOT wipe the new registration when the old
+    // one's TCP close eventually fires. The eviction path explicitly
+    // clears wsToDevice[oldWs] first, so this check is normally dead
+    // code, but it remains a safety net in case any future code path
+    // forgets to clear the reverse mapping.
     const deviceId = this.wsToDevice.get(ws);
     if (deviceId !== undefined) {
       this.wsToDevice.delete(ws);
-      this.devices.delete(deviceId);
-      this.emit('disconnect', deviceId);
+      if (this.devices.get(deviceId) === ws) {
+        this.devices.delete(deviceId);
+        this.emit('disconnect', deviceId);
+      }
     }
   }
 }

@@ -6,6 +6,9 @@
 # Gradle build cache and daemon files
 .gradle
 
+# Kotlin compiler session files — created by the Kotlin daemon, not committed
+.kotlin/
+
 # Local SDK/NDK path configuration — machine-specific, never shared
 /local.properties
 

@@ -33,6 +33,18 @@ private const val TAG = "SignalingClient"
 /** Exponential backoff delay sequence per spec §6.8 (ms): 0, 500, 1000, 2000, 4000, 8000, 16000, 30000. */
 private val BACKOFF_MS = longArrayOf(0, 500, 1_000, 2_000, 4_000, 8_000, 16_000, 30_000)
 
+/**
+ * Retry delay (ms) used for transient network-layer failures that should
+ * NOT advance the exponential backoff counter — e.g. DNS unavailable right
+ * after an Android background/foreground transition, connection aborts
+ * from the OS network stack during a wifi handoff.
+ *
+ * 500 ms is long enough to let the OS network stack settle but short
+ * enough that a recovering device reconnects in under two seconds in
+ * the common case.
+ */
+private const val TRANSIENT_RETRY_DELAY_MS = 500L
+
 /** Interval between heartbeat pings per spec §6.7. */
 private const val HEARTBEAT_INTERVAL_MS = 30_000L
 
@@ -137,18 +149,68 @@ class SignalingClient @Inject constructor(
 
     /**
      * OkHttpClient configured with generous timeouts for a persistent WebSocket.
-     * Ping interval is NOT set here — we manage heartbeats manually to control
-     * the state machine precisely.
+     *
+     * `pingInterval` is CRITICAL for half-open detection. Without it, a phone
+     * that backgrounds, roams, or sleeps leaves the TCP connection in a state
+     * where `send()` silently buffers, no callbacks fire, and the app believes
+     * the WebSocket is healthy indefinitely. OkHttp's pingInterval sends a
+     * native WebSocket PING frame at the given cadence and fires
+     * `WebSocketListener.onFailure` if no PONG arrives within the interval,
+     * which drives our reconnect loop.
+     *
+     * 25s is short enough to detect a dead socket well within the server's
+     * 90s silence timeout, and short enough that a user reopening the app
+     * after 20s of background gets an immediate half-open detection.
      */
     private val httpClient = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(0, TimeUnit.SECONDS)   // disable read timeout — WS is long-lived
+        .readTimeout(0, TimeUnit.SECONDS)       // disable read timeout — WS is long-lived
         .writeTimeout(15, TimeUnit.SECONDS)
+        .pingInterval(25, TimeUnit.SECONDS)     // native WS ping/pong keepalive
         .build()
 
     /** Current live WebSocket handle; null when disconnected or connecting. */
     @Volatile
     private var webSocket: WebSocket? = null
+
+    /**
+     * Set by `onFailure` when the last failure was a transient network
+     * layer error (DNS unavailable, connection aborted, etc.) rather than
+     * a protocol / server issue. The reconnect loop uses this to decide
+     * whether to advance the exponential backoff counter — transient
+     * network failures immediately after an app backgrounding / foreground
+     * transition can burst for several seconds while the OS network stack
+     * re-initializes, and exponentially backing off in that window pushes
+     * the recovery window out to 15+ seconds.
+     */
+    @Volatile
+    private var lastFailureWasTransient: Boolean = false
+
+    /**
+     * Rendezvous IDs most recently provided via [registerRendezvous]. The
+     * SignalingClient re-sends a `register-rendezvous` message automatically
+     * after every successful auth so the relay always has fresh membership
+     * info after reconnects — without requiring the caller (ViewModel) to
+     * observe every connectionState transition.
+     *
+     * This is THE CRITICAL FIX for presence flakiness on cold reopen: the
+     * `attemptConnect` loop may reconnect many times within a single
+     * singleton lifetime (process cached, VM destroyed and recreated, etc.),
+     * and without auto-re-registering we'd be authenticated but invisible
+     * to any rendezvous.
+     */
+    @Volatile
+    private var pendingRendezvousIds: List<String>? = null
+
+    /**
+     * Reference to the currently-running attemptConnect coroutine, if any.
+     * Used to make `connect()` re-entrant: a second `connect()` call while
+     * a loop is already active does not spawn a duplicate loop, but does
+     * force the current socket to close so the loop cycles and acquires
+     * a fresh connection. This is how cold-reopen-from-cached-process is
+     * handled — a stale ConnectionState.Connected value is refreshed.
+     */
+    private var attemptConnectJob: kotlinx.coroutines.Job? = null
 
     /** Controls whether the reconnect loop should continue. False after [disconnect]. */
     @Volatile
@@ -205,8 +267,28 @@ class SignalingClient @Inject constructor(
      */
     fun connect(relayUrl: String = RELAY_URL) {
         intentionalDisconnect = false
+
+        // Cancel any existing attempt loop and its in-flight socket. This is
+        // the CRITICAL path for cold-reopen-from-cached-process and for
+        // app-foreground after a network transition: the previous loop may
+        // be asleep inside `delay(backoffMs)` for up to 30 seconds (far
+        // worse than the user's patience), and `cancel()` on the coroutine
+        // unblocks any pending suspend function including `delay()`.
+        //
+        // We also cancel the WebSocket itself (OkHttp `cancel`, NOT `close`)
+        // to force `onFailure` immediately — `close()` sends a graceful
+        // close frame that waits for the peer's close ack, which on a
+        // half-open socket never arrives.
+        attemptConnectJob?.cancel()
+        webSocket?.cancel()
+
+        // Reset the backoff counter so the new attempt fires immediately.
         reconnectAttempt.set(0)
-        scope.launch { attemptConnect(relayUrl) }
+
+        // Launch a fresh loop. The previous job's cancellation will
+        // unwind at its next suspension point; the new loop runs
+        // independently and will establish a new connection.
+        attemptConnectJob = scope.launch { attemptConnect(relayUrl) }
     }
 
     /**
@@ -255,6 +337,18 @@ class SignalingClient @Inject constructor(
      * @return true if the message was enqueued; false if the socket is unavailable.
      */
     fun registerRendezvous(rendezvousIds: List<String>): Boolean {
+        // Remember these for automatic replay on future reconnects.
+        pendingRendezvousIds = rendezvousIds.toList()
+        return sendRegisterRendezvousNow(rendezvousIds)
+    }
+
+    /**
+     * Internal: emit a `register-rendezvous` message immediately using the
+     * given IDs. Used both from the public [registerRendezvous] entry point
+     * and from the auth-success path so a reconnect automatically replays
+     * the most recent registration.
+     */
+    private fun sendRegisterRendezvousNow(rendezvousIds: List<String>): Boolean {
         val msg = JSONObject().apply {
             put("type", "register-rendezvous")
             put("rendezvousIds", org.json.JSONArray(rendezvousIds))
@@ -297,6 +391,10 @@ class SignalingClient @Inject constructor(
             _connectionState.value = ConnectionState.Connecting(attempt)
             Log.d(TAG, "Connecting to $relayUrl (attempt $attempt)")
 
+            // Reset the transient flag before each attempt so onFailure can
+            // freshly classify this iteration's failure (if any).
+            lastFailureWasTransient = false
+
             val request = Request.Builder().url(relayUrl).build()
             val listener = ZapWebSocketListener()
 
@@ -307,8 +405,17 @@ class SignalingClient @Inject constructor(
 
             if (intentionalDisconnect) break
 
-            // Advance the backoff counter (capped at the last slot)
-            reconnectAttempt.compareAndSet(attempt, minOf(attempt + 1, BACKOFF_MS.size - 1))
+            // Decide how to advance. Transient network-layer failures
+            // (DNS unavailable, connection aborted by OS) keep the attempt
+            // counter pinned near zero and use a short fixed retry delay,
+            // so a burst of background/foreground DNS failures doesn't
+            // push us into 8+ second exponential waits.
+            if (lastFailureWasTransient) {
+                Log.d(TAG, "Transient failure — fast retry without advancing backoff")
+                delay(TRANSIENT_RETRY_DELAY_MS)
+            } else {
+                reconnectAttempt.compareAndSet(attempt, minOf(attempt + 1, BACKOFF_MS.size - 1))
+            }
         }
     }
 
@@ -381,6 +488,22 @@ class SignalingClient @Inject constructor(
                         _connectionState.value = ConnectionState.Connected
                         reconnectAttempt.set(0)  // reset backoff on successful auth
                         startHeartbeat()
+
+                        // Auto-replay the last register-rendezvous so the
+                        // relay's presence module always has fresh membership
+                        // info after a reconnect. Without this, the
+                        // attemptConnect loop can reconnect silently many
+                        // times within a single SignalingClient lifetime
+                        // (cached process, recreated ViewModel, transient
+                        // network failures) and the device would be
+                        // authenticated but invisible to every rendezvous —
+                        // which is exactly the "won't come back online
+                        // without force-stop" presence flakiness bug.
+                        val ids = pendingRendezvousIds
+                        if (ids != null && ids.isNotEmpty()) {
+                            Log.d(TAG, "Auto-replaying register-rendezvous on reconnect: $ids")
+                            sendRegisterRendezvousNow(ids)
+                        }
                     }
 
                     // Pong response to our heartbeat pings — no action needed
@@ -420,6 +543,23 @@ class SignalingClient @Inject constructor(
             val msg = t.message ?: "unknown error"
             Log.w(TAG, "WebSocket failure: $msg")
             heartbeatJob?.cancel()
+
+            // Classify the failure. Network-layer errors (DNS unavailable,
+            // connection reset, socket timeout) are typically transient —
+            // they clear within a few seconds after an Android background/
+            // foreground transition and we should NOT let them drive the
+            // exponential backoff up to 8+ second waits.
+            lastFailureWasTransient = when (t) {
+                is java.net.UnknownHostException -> true
+                is java.net.ConnectException -> true
+                is java.net.SocketTimeoutException -> true
+                is java.io.IOException -> msg.contains("connection abort", ignoreCase = true) ||
+                    msg.contains("software caused", ignoreCase = true) ||
+                    msg.contains("EHOSTUNREACH", ignoreCase = true) ||
+                    msg.contains("ENETUNREACH", ignoreCase = true)
+                else -> false
+            }
+
             _connectionState.value = ConnectionState.Error(msg)
             closeChannel.trySend(Unit)
         }

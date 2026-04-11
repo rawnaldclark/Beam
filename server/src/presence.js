@@ -32,6 +32,22 @@ const DEFAULT_SILENCE_TIMEOUT_MS = 90_000;
 /** Default sweep interval for the silence checker in milliseconds. */
 const DEFAULT_CHECK_INTERVAL_MS = 30_000;
 
+/**
+ * Default reconnect grace period in milliseconds.
+ *
+ * When `unregister(deviceId)` is called (typically from a WebSocket close),
+ * the device is not immediately torn down. Instead a timer fires PEER_OFFLINE
+ * to peers after this delay. If `register(deviceId)` is called again within
+ * the window with the same rendezvous IDs — which is what happens on a
+ * normal reconnect — the pending teardown is cancelled and peers never see
+ * any offline/online flap.
+ *
+ * Tuned high enough to absorb a typical reconnect (2s client backoff +
+ * handshake round-trip) and low enough that a real disconnect is visible
+ * to the user within a human timescale.
+ */
+const DEFAULT_RECONNECT_GRACE_MS = 3_000;
+
 // ---------------------------------------------------------------------------
 // Presence class
 // ---------------------------------------------------------------------------
@@ -63,6 +79,7 @@ export class Presence {
     gateway,
     silenceTimeoutMs = DEFAULT_SILENCE_TIMEOUT_MS,
     checkIntervalMs = DEFAULT_CHECK_INTERVAL_MS,
+    reconnectGraceMs = DEFAULT_RECONNECT_GRACE_MS,
   } = {}) {
     /**
      * The gateway used to send PEER_ONLINE/PEER_OFFLINE messages.
@@ -88,8 +105,21 @@ export class Presence {
     /** Sweep interval in milliseconds. @type {number} */
     this._checkIntervalMs = checkIntervalMs;
 
+    /** Reconnect grace period in milliseconds. @type {number} */
+    this._reconnectGraceMs = reconnectGraceMs;
+
     /** Handle returned by setInterval, if the silence checker is running. @type {NodeJS.Timeout|null} */
     this._silenceTimer = null;
+
+    /**
+     * Pending teardowns keyed by deviceId. Each entry holds the timer that
+     * will finalize the offline transition and the snapshot of peers that
+     * should be notified when it fires. Cleared on successful reconnect
+     * inside the grace window.
+     *
+     * @type {Map<string, { timer: NodeJS.Timeout, peers: Set<string> }>}
+     */
+    this._pendingOffline = new Map();
 
     // Wire into gateway disconnect events so devices are cleaned up when
     // their WebSocket closes (complements the silence checker for immediate cleanup).
@@ -119,6 +149,43 @@ export class Presence {
    * @param {string[]} rendezvousIds - One or more rendezvous ID strings
    */
   register(deviceId, rendezvousIds) {
+    // ─── Reconnect grace cancellation ──────────────────────────────────
+    // If this device is mid-teardown, the new register is a reconnect
+    // inside the grace window. Cancel the pending PEER_OFFLINE — peers
+    // never saw us go offline, so they also don't need a PEER_ONLINE.
+    //
+    // Only applies when the rendezvous IDs are unchanged. If they differ,
+    // we fire the deferred offline immediately and fall through to a
+    // clean full registration below.
+    const pending = this._pendingOffline.get(deviceId);
+    if (pending) {
+      const existing = this._devices.get(deviceId);
+      const sameIds =
+        existing &&
+        existing.rendezvousIds.length === rendezvousIds.length &&
+        existing.rendezvousIds.every((id) => rendezvousIds.includes(id));
+
+      clearTimeout(pending.timer);
+      this._pendingOffline.delete(deviceId);
+
+      if (sameIds && existing) {
+        // Smooth reconnect: bump lastSeen and quietly return.
+        existing.lastSeen = Date.now();
+        return;
+      }
+
+      // Rendezvous IDs changed during the grace window — fire the deferred
+      // offline now so old peers see us leave cleanly, then fall through
+      // to the normal registration path to rebuild state from scratch.
+      for (const peerId of pending.peers) {
+        this._gateway.send(peerId, { type: MSG.PEER_OFFLINE, deviceId });
+      }
+      if (existing) {
+        this._removeFromRendezvous(deviceId);
+        this._devices.delete(deviceId);
+      }
+    }
+
     if (this._devices.has(deviceId)) {
       // --- Re-registration: compute peer diff before modifying maps ---
 
@@ -204,15 +271,64 @@ export class Presence {
   unregister(deviceId) {
     if (!this._devices.has(deviceId)) return;
 
-    // Collect all unique peers before removing the device from the maps
+    // If a teardown is already pending, leave it in place — the original
+    // unregister already captured the peer snapshot and scheduled the timer.
+    if (this._pendingOffline.has(deviceId)) return;
+
+    // Capture the peer snapshot NOW so we notify exactly the peers that
+    // were sharing a rendezvous with this device at the moment it left,
+    // even if the rendezvous membership changes during the grace window.
     const deviceState = this._devices.get(deviceId);
     const peers = this._collectPeers(deviceId, deviceState.rendezvousIds);
 
-    // Remove the device from all rendezvous sets and from _devices
+    // graceMs <= 0 disables the deferral entirely (used by tests that
+    // require synchronous semantics). Perform the teardown inline.
+    if (this._reconnectGraceMs <= 0) {
+      this._removeFromRendezvous(deviceId);
+      this._devices.delete(deviceId);
+      for (const peerId of peers) {
+        this._gateway.send(peerId, { type: MSG.PEER_OFFLINE, deviceId });
+      }
+      return;
+    }
+
+    // Defer the actual teardown + notification. The device stays in
+    // `_devices` and `_rendezvous` during the grace window so signaling
+    // lookups still resolve; callers that need to send to the peer will
+    // hit a closed gateway entry and simply get `send()` returning false,
+    // which is already the expected behaviour for a flaky peer.
+    const timer = setTimeout(
+      () => this._finalizeOffline(deviceId, peers),
+      this._reconnectGraceMs,
+    );
+    if (timer.unref) timer.unref();
+    this._pendingOffline.set(deviceId, { timer, peers });
+  }
+
+  /**
+   * Complete a deferred unregister once the grace window expires without
+   * the device reconnecting. Removes the device from all maps and fires
+   * PEER_OFFLINE to the snapshot of peers captured at unregister time.
+   *
+   * @param {string} deviceId
+   * @param {Set<string>} peers - peer set captured at the moment of unregister
+   */
+  _finalizeOffline(deviceId, peers) {
+    this._pendingOffline.delete(deviceId);
+    // If the device was re-registered during the grace window via a
+    // different code path that didn't cancel the timer, the device may
+    // still be in `_devices`. In that case, do not tear it down — treat
+    // this as a no-op.
+    if (!this._devices.has(deviceId)) {
+      // Already gone via another path; still notify peers since we owe
+      // them the offline snapshot we captured.
+      for (const peerId of peers) {
+        this._gateway.send(peerId, { type: MSG.PEER_OFFLINE, deviceId });
+      }
+      return;
+    }
     this._removeFromRendezvous(deviceId);
     this._devices.delete(deviceId);
-
-    // Notify every peer that this device is now offline
     for (const peerId of peers) {
       this._gateway.send(peerId, { type: MSG.PEER_OFFLINE, deviceId });
     }
@@ -304,6 +420,12 @@ export class Presence {
       clearInterval(this._silenceTimer);
       this._silenceTimer = null;
     }
+    // Cancel any pending teardown timers so the Node.js event loop can
+    // exit cleanly on shutdown.
+    for (const pending of this._pendingOffline.values()) {
+      clearTimeout(pending.timer);
+    }
+    this._pendingOffline.clear();
   }
 
   // ---------------------------------------------------------------------------

@@ -380,4 +380,86 @@ describe('Gateway', () => {
       await closeServer(fastCtx.server);
     }
   });
+
+  // -------------------------------------------------------------------------
+  // Test 9 — Zombie-tolerant re-auth: a second auth with the same deviceId
+  //           takes ownership of the registration without actively closing
+  //           the old socket, and the OLD socket's eventual close does NOT
+  //           fire a disconnect event (because `devices[id] === ws` check
+  //           in `_onClose` guards against wiping the new registration).
+  //
+  // Regression test for the "needs force-stop" presence flakiness bug.
+  // -------------------------------------------------------------------------
+  it('zombie-tolerant re-auth preserves the new registration', async () => {
+    const zombieCtx = await createTestServer();
+    try {
+      const { privKey, pubKey } = generateKeypair();
+      const deviceId = deriveDeviceId(pubKey);
+      const publicKey = Buffer.from(pubKey).toString('base64');
+
+      let disconnectCount = 0;
+      const onDisconnect = (id) => {
+        if (id === deviceId) disconnectCount += 1;
+      };
+      zombieCtx.gateway.on('disconnect', onDisconnect);
+
+      // --- First auth ---
+      const first = await connectAndGetChallenge(zombieCtx.port);
+      const ts1 = Date.now();
+      const sig1 = signAuth(first.challenge, ts1, privKey);
+      const reply1 = await sendAndReceive(first.ws, {
+        type: 'auth', deviceId, publicKey, signature: sig1, timestamp: ts1,
+      });
+      assert.equal(reply1.type, 'auth-ok');
+      const firstWs = zombieCtx.gateway.devices.get(deviceId);
+      assert.ok(firstWs, 'first auth should register the device');
+
+      // --- Second auth (simulates a zombie reconnect before the old TCP close) ---
+      const second = await connectAndGetChallenge(zombieCtx.port);
+      const ts2 = Date.now();
+      const sig2 = signAuth(second.challenge, ts2, privKey);
+      const reply2 = await sendAndReceive(second.ws, {
+        type: 'auth', deviceId, publicKey, signature: sig2, timestamp: ts2,
+      });
+      assert.equal(reply2.type, 'auth-ok');
+
+      const currentWs = zombieCtx.gateway.devices.get(deviceId);
+      assert.ok(currentWs, 'device should still be registered after re-auth');
+      assert.notEqual(currentWs, firstWs, 'device should point at the new socket');
+
+      // Now close the OLD socket (as would happen naturally when its TCP
+      // close propagates). This must NOT wipe the new registration or
+      // emit a disconnect — the defensive check in `_onClose` compares
+      // `devices[id]` to the closing ws before tearing anything down.
+      const firstClosed = new Promise((resolve) => first.ws.once('close', resolve));
+      first.ws.close();
+      await firstClosed;
+      await new Promise((r) => setTimeout(r, 50));
+
+      assert.ok(
+        zombieCtx.gateway.devices.has(deviceId),
+        'device should still be registered after old socket closes',
+      );
+      assert.equal(
+        disconnectCount,
+        0,
+        'no disconnect event should fire for the stale socket close',
+      );
+
+      // Finally close the NEW socket; this is the current registration
+      // so we DO expect a disconnect.
+      const secondClosed = new Promise((resolve) => {
+        zombieCtx.gateway.once('disconnect', () => resolve());
+      });
+      second.ws.close();
+      await secondClosed;
+
+      assert.ok(
+        !zombieCtx.gateway.devices.has(deviceId),
+        'device should be unregistered after the active socket closes',
+      );
+    } finally {
+      await closeServer(zombieCtx.server);
+    }
+  });
 });
