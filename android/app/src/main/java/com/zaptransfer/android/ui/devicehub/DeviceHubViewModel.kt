@@ -42,8 +42,73 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.launch
+import androidx.annotation.VisibleForTesting
 import org.json.JSONObject
 import javax.inject.Inject
+
+/**
+ * Maximum declared size for an incoming Beam file transfer.
+ *
+ * Matches the server's SESSION_LIMIT (500 MB) so no legitimate transfer is
+ * blocked client-side, while preventing a malicious paired peer from
+ * declaring a multi-GB transfer to force an unbounded ByteArray allocation
+ * on assembly.
+ */
+internal const val MAX_FILE_SIZE_BYTES: Long = 500L * 1024 * 1024
+
+/**
+ * Maximum declared chunk count for an incoming Beam file transfer.
+ *
+ * Sized for the 500 MB SESSION_LIMIT against the ~175 KB effective wire
+ * chunk size (ciphertext + AEAD overhead).
+ */
+internal const val MAX_CHUNKS: Int = 3000
+
+/** Maximum filename length accepted in a Beam file metadata envelope. */
+internal const val MAX_FILENAME_LENGTH: Int = 255
+
+/**
+ * Validate a decrypted Beam file metadata envelope.
+ *
+ * Returns null if the metadata is acceptable, or a short human-readable
+ * error description suitable for logging if it must be rejected. Rejection
+ * means the caller MUST destroy the session with DECRYPT_FAIL and MUST NOT
+ * store any state for this transfer — otherwise a malicious paired peer
+ * can cause unbounded memory allocation on assembly.
+ *
+ * Caps are sized to match the server's existing SESSION_LIMIT so no
+ * legitimate transfer is blocked client-side.
+ *
+ * @param fileName    Proposed file name from the decrypted envelope.
+ * @param fileSize    Proposed total byte size (read as Long to avoid
+ *                    silent Int overflow on attacker-supplied values
+ *                    above 2^31).
+ * @param mimeType    Proposed MIME type (defaulted non-null upstream).
+ * @param totalChunks Proposed chunk count.
+ * @return null if valid, otherwise a non-null error description.
+ */
+@VisibleForTesting
+@Suppress("UNUSED_PARAMETER")
+internal fun validateFileMetadata(
+    fileName: String,
+    fileSize: Long,
+    mimeType: String,
+    totalChunks: Int,
+): String? {
+    if (fileSize <= 0L || fileSize > MAX_FILE_SIZE_BYTES) {
+        return "invalid fileSize=$fileSize"
+    }
+    if (totalChunks <= 0 || totalChunks > MAX_CHUNKS) {
+        return "invalid totalChunks=$totalChunks"
+    }
+    if (fileName.isBlank() || fileName.length > MAX_FILENAME_LENGTH) {
+        return "invalid fileName length=${fileName.length}"
+    }
+    // mimeType has a non-null default from optString upstream; no further
+    // check needed here. Parameter retained so the signature matches the
+    // fields read from the metadata envelope in one place.
+    return null
+}
 
 private const val TAG = "DeviceHubVM"
 
@@ -516,18 +581,26 @@ class DeviceHubViewModel @Inject constructor(
                 val metaBytes = beamCrypto.cipher.decryptFileMetadata(ciphertext, metaKey, transcript)
                 val metaJson = JSONObject(String(metaBytes, Charsets.UTF_8))
                 val fileName = metaJson.optString("fileName", "file")
-                val fileSize = metaJson.optInt("fileSize", 0)
+                // Read as Long to avoid silent Int overflow for attacker-supplied
+                // values above 2^31. The validated value (<= MAX_FILE_SIZE_BYTES)
+                // fits in Int safely when stored in IncomingBeamFile below.
+                val fileSize = metaJson.optLong("fileSize", 0L)
                 val mimeType = metaJson.optString("mime", "application/octet-stream")
                 val totalChunks = metaJson.optInt("totalChunks", 0)
-                if (totalChunks <= 0) {
-                    Log.e(TAG, "file metadata has invalid totalChunks: $totalChunks")
+                validateFileMetadata(fileName, fileSize, mimeType, totalChunks)?.let { error ->
+                    // Rejection path: destroy the session with DECRYPT_FAIL and
+                    // ensure NO entry is added to pendingBeamFiles. A malicious
+                    // paired peer declaring a multi-GB transfer or thousands of
+                    // chunks is rejected here, before any allocation.
+                    Log.w(TAG, "rejected file metadata: $error")
                     beamCrypto.registry.destroy(session.transferId, BeamSessionRegistry.ErrorCodes.DECRYPT_FAIL)
                     return
                 }
                 session.totalChunks = totalChunks
                 pendingBeamFiles[idHex] = IncomingBeamFile(
                     fileName = fileName,
-                    fileSize = fileSize,
+                    // fileSize Long input validated <= MAX_FILE_SIZE_BYTES fits in Int safely.
+                    fileSize = fileSize.toInt(),
                     mimeType = mimeType,
                     totalChunks = totalChunks,
                 )
