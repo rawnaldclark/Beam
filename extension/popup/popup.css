@@ -1,6 +1,6 @@
 /* ==========================================================================
    Beam Popup — Dark Theme (v1 redesign)
-   Width: 360px  |  Max-height: 540px  |  Overflow: auto
+   Width: 380px  |  Max-height: 500px  |  Overflow: auto
 
    Token values are from the Beam design direction v1 (Signal Cyan accent,
    cool-gray neutrals, Inter Variable, zero shadows). The CSS variable NAMES
@@ -59,9 +59,9 @@
 }
 
 html, body {
-  width:      360px;
+  width:      380px;
   min-height: 200px;
-  max-height: 540px;
+  max-height: 500px;
   background: var(--bg);
   color:      var(--text-hi);
   font-family: var(--beam-font-sans);
@@ -74,8 +74,8 @@ html, body {
 #app {
   display:        flex;
   flex-direction: column;
-  width:          360px;
-  max-height:     540px;
+  width:          380px;
+  max-height:     500px;
   overflow-y:     auto;
   overflow-x:     hidden;
   /* Custom scrollbar */
@@ -88,46 +88,92 @@ html, body {
 #app::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
 
 /* --------------------------------------------------------------------------
-   Header
+   Identity strip (Phase 2a — replaces old header)
    -------------------------------------------------------------------------- */
-header {
-  display:          flex;
-  align-items:      center;
-  justify-content:  space-between;
-  padding:          10px 14px;
-  background:       var(--surface);
-  border-bottom:    1px solid var(--border);
-  position:         sticky;
-  top:              0;
-  z-index:          10;
+#identity-strip {
+  display:         flex;
+  align-items:     center;
+  justify-content: space-between;
+  height:          32px;
+  padding:         0 12px;
+  background:      var(--beam-bg-1, var(--surface));
+  border-bottom:   1px solid var(--beam-border-subtle, var(--border));
+  position:        sticky;
+  top:             0;
+  z-index:         10;
+  flex-shrink:     0;
 }
 
-.logo {
+.identity-left {
   display:     flex;
   align-items: center;
-  gap:         6px;
-  font-weight: 700;
-  font-size:   16px;
-  letter-spacing: -0.3px;
-  color:       var(--text-hi);
+  gap:         0;
 }
 
-.logo-icon {
-  font-size:   18px;
+.beam-wordmark {
+  font-size:      var(--beam-size-lg, 16px);
+  font-weight:    600;
+  color:          var(--beam-text-hi, var(--text-hi));
+  letter-spacing: -0.01em;
+  line-height:    1;
+}
+
+.identity-dot {
+  width:         8px;
+  height:        8px;
+  border-radius: 50%;
+  background:    var(--beam-online, var(--success));
+  display:       inline-block;
+  margin-left:   8px;
+  flex-shrink:   0;
+}
+
+.identity-dot.disconnected {
+  background: var(--beam-text-lo, var(--text-lo));
+}
+
+.identity-right {
+  display:     flex;
+  align-items: center;
+  gap:         0;
+}
+
+.identity-alias {
+  font-size:   var(--beam-size-sm, 12px);
+  color:       var(--beam-text-mid, var(--text-md));
+  margin-right: 8px;
   line-height: 1;
-  color:       var(--primary);
-  /* Unicode lightning bolt rendered crisp */
-  font-style:  normal;
+  white-space: nowrap;
+  overflow:    hidden;
+  text-overflow: ellipsis;
+  max-width:   140px;
 }
 
-.logo-text {
-  color: var(--text-hi);
+.identity-gear {
+  display:         flex;
+  align-items:     center;
+  justify-content: center;
+  width:           24px;
+  height:          24px;
+  border:          none;
+  border-radius:   var(--beam-radius-md, var(--radius-sm));
+  background:      transparent;
+  color:           var(--beam-text-mid, var(--text-md));
+  cursor:          pointer;
+  transition:      background var(--beam-dur-fast, 120ms) var(--beam-ease-out, ease),
+                   color var(--beam-dur-fast, 120ms) var(--beam-ease-out, ease);
 }
 
-.header-actions {
-  display: flex;
-  gap:     6px;
+.identity-gear:hover {
+  background: var(--beam-accent-12, var(--primary-dim));
+  color:      var(--beam-accent, var(--primary));
 }
+
+/* Legacy .logo classes kept for overlay views that may still reference them */
+.logo { display: none; }
+.logo-icon { display: none; }
+.logo-text { display: none; }
+.header-actions { display: none; }
 
 /* --------------------------------------------------------------------------
    Icon buttons (header, icon-picker)
@@ -157,6 +203,203 @@ header {
 .icon-btn:active {
   background: var(--primary);
   color:      #fff;
+}
+
+/* --------------------------------------------------------------------------
+   Main list (Phase 2a — unified device + activity scrollable region)
+   -------------------------------------------------------------------------- */
+#main-list {
+  flex:       1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  scrollbar-width:       thin;
+  scrollbar-color:       var(--beam-border-subtle, var(--border)) transparent;
+}
+
+#main-list::-webkit-scrollbar       { width: 4px; }
+#main-list::-webkit-scrollbar-track { background: transparent; }
+#main-list::-webkit-scrollbar-thumb { background: var(--beam-border-subtle, var(--border)); border-radius: 2px; }
+
+.section-header {
+  font-size:       var(--beam-size-sm, 12px);
+  font-weight:     500;
+  color:           var(--beam-text-mid, var(--text-md));
+  padding:         8px 12px 4px;
+  text-transform:  uppercase;
+  letter-spacing:  0.05em;
+  line-height:     1;
+  user-select:     none;
+}
+
+.row-list {
+  display:        flex;
+  flex-direction: column;
+}
+
+/* --------------------------------------------------------------------------
+   Device rows (Phase 2a — flat 36px list items, replacing card layout)
+   -------------------------------------------------------------------------- */
+.device-row {
+  height:      36px;
+  display:     flex;
+  align-items: center;
+  padding:     0 12px;
+  gap:         8px;
+  cursor:      pointer;
+  transition:  background var(--beam-dur-fast, 120ms) var(--beam-ease-out, ease);
+  user-select: none;
+}
+
+.device-row:hover {
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.device-row.selected {
+  background:  var(--beam-accent-12, var(--primary-dim));
+  border-left: 2px solid var(--beam-accent, var(--primary));
+  padding-left: 10px; /* 12px - 2px border */
+}
+
+.device-row.offline {
+  opacity: 0.55;
+  cursor:  default;
+}
+
+.device-row.offline:hover {
+  background: transparent;
+}
+
+.device-row .row-dot {
+  width:         8px;
+  height:        8px;
+  border-radius: 50%;
+  flex-shrink:   0;
+}
+
+.device-row .row-dot.dot-online {
+  background: var(--beam-online, var(--success));
+}
+
+.device-row .row-dot.dot-offline {
+  background: var(--beam-text-lo, var(--text-lo));
+}
+
+.device-row .row-icon {
+  display:     flex;
+  align-items: center;
+  flex-shrink: 0;
+  color:       var(--beam-text-mid, var(--text-md));
+  line-height: 1;
+}
+
+.device-row .row-icon svg {
+  width:  16px;
+  height: 16px;
+}
+
+.device-row .row-name {
+  flex:          1;
+  font-size:     var(--beam-size-base, 13px);
+  font-weight:   500;
+  color:         var(--beam-text-hi, var(--text-hi));
+  white-space:   nowrap;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  line-height:   1;
+}
+
+.device-row .row-trailing {
+  font-size:   var(--beam-size-xs, 11px);
+  color:       var(--beam-text-lo, var(--text-lo));
+  font-family: var(--beam-font-mono);
+  flex-shrink: 0;
+  line-height: 1;
+}
+
+/* --------------------------------------------------------------------------
+   Activity rows (Phase 2a — transfer + clipboard history in flat rows)
+   -------------------------------------------------------------------------- */
+.activity-row {
+  height:      36px;
+  display:     flex;
+  align-items: center;
+  padding:     0 12px;
+  gap:         8px;
+  cursor:      default;
+}
+
+.activity-row .row-icon {
+  display:     flex;
+  align-items: center;
+  flex-shrink: 0;
+  color:       var(--beam-text-mid, var(--text-md));
+  line-height: 1;
+}
+
+.activity-row .row-icon svg {
+  width:  16px;
+  height: 16px;
+}
+
+.activity-row .row-name {
+  flex:          1;
+  font-size:     var(--beam-size-base, 13px);
+  font-weight:   500;
+  color:         var(--beam-text-hi, var(--text-hi));
+  white-space:   nowrap;
+  overflow:      hidden;
+  text-overflow: ellipsis;
+  line-height:   1;
+}
+
+.activity-row .row-meta {
+  font-size:   var(--beam-size-xs, 11px);
+  color:       var(--beam-text-lo, var(--text-lo));
+  font-family: var(--beam-font-mono);
+  flex-shrink: 0;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+/* Empty activity state */
+.activity-empty {
+  font-size:   var(--beam-size-sm, 12px);
+  color:       var(--beam-text-lo, var(--text-lo));
+  text-align:  center;
+  padding:     12px;
+  line-height: 1.4;
+}
+
+/* --------------------------------------------------------------------------
+   Shortcut footer (Phase 2a)
+   -------------------------------------------------------------------------- */
+#shortcut-footer {
+  height:       28px;
+  display:      flex;
+  align-items:  center;
+  justify-content: flex-end;
+  gap:          6px;
+  padding:      0 12px;
+  background:   var(--beam-bg-1, var(--surface));
+  border-top:   1px solid var(--beam-border-subtle, var(--border));
+  flex-shrink:  0;
+}
+
+.shortcut-chip {
+  font-family:  var(--beam-font-mono);
+  font-size:    11px;
+  color:        var(--beam-text-lo, var(--text-lo));
+  background:   var(--beam-bg-2, var(--surface-2));
+  padding:      2px 6px;
+  border-radius: var(--beam-radius-sm, 4px);
+  line-height:  1;
+  white-space:  nowrap;
+  user-select:  none;
+  cursor:       default;
+}
+
+.shortcut-chip:hover {
+  color: var(--beam-text-mid, var(--text-md));
 }
 
 /* --------------------------------------------------------------------------
@@ -403,13 +646,11 @@ header {
 }
 
 /* --------------------------------------------------------------------------
-   Main view — device list
+   Main view — device list (Phase 2a: now a .row-list, old gap/padding removed)
    -------------------------------------------------------------------------- */
 .device-list {
   display:        flex;
   flex-direction: column;
-  gap:            6px;
-  padding:        10px 12px 4px;
 }
 
 .device-card {
@@ -527,25 +768,20 @@ header {
   display:        flex;
   flex-direction: column;
   align-items:    center;
-  gap:            10px;
+  gap:            8px;
   padding:        28px 24px;
   text-align:     center;
 }
 
-.empty-icon {
-  font-size:   40px;
-  line-height: 1;
-}
-
 .empty-state h3 {
-  font-size:   15px;
+  font-size:   var(--beam-size-lg, 16px);
   font-weight: 600;
-  color:       var(--text-hi);
+  color:       var(--beam-text-hi, var(--text-hi));
 }
 
 .empty-state p {
-  font-size: 13px;
-  color:     var(--text-md);
+  font-size: var(--beam-size-base, 13px);
+  color:     var(--beam-text-mid, var(--text-md));
 }
 
 /* --------------------------------------------------------------------------
@@ -559,12 +795,12 @@ header {
   gap:            6px;
   margin:         8px 12px;
   padding:        14px;
-  border:         2px dashed var(--border);
-  border-radius:  var(--radius-md);
+  border:         1px dashed var(--beam-border-subtle, var(--border));
+  border-radius:  var(--beam-radius-lg, 8px);
   cursor:         pointer;
   transition:     border-color var(--transition), background var(--transition);
   text-align:     center;
-  background:     transparent;
+  background:     var(--beam-bg-1, var(--surface));
 }
 
 .drop-zone:hover,

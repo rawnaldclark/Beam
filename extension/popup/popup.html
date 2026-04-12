@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=360">
+  <meta name="viewport" content="width=380">
   <title>Beam</title>
   <!--
     tokens.css defines the Beam design-system tokens introduced in the
@@ -17,19 +17,18 @@
 <body>
   <div id="app">
 
-    <!-- ===== Header ===== -->
-    <header>
-      <div class="logo">
-        <span class="logo-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg></span>
-        <span class="logo-text">Beam</span>
+    <!-- ===== Identity strip (Phase 2a) ===== -->
+    <div id="identity-strip">
+      <div class="identity-left">
+        <span class="beam-wordmark">beam</span>
+        <span class="identity-dot" id="relay-status-dot"></span>
       </div>
-      <div class="header-actions">
-        <button id="btn-pair"     class="icon-btn" title="Pair new device"
-                aria-label="Pair new device"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
-        <button id="btn-settings" class="icon-btn" title="Settings"
+      <div class="identity-right">
+        <span class="identity-alias" id="identity-alias"></span>
+        <button id="btn-settings" class="identity-gear" title="Settings"
                 aria-label="Settings"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
       </div>
-    </header>
+    </div>
 
     <!-- ===== Toast notification strip ===== -->
     <div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
@@ -127,19 +126,31 @@
     </div>
 
     <!-- ====================================================== -->
-    <!--  VIEW: Main — device list, drop zone, history          -->
+    <!--  VIEW: Main — device + activity list, drop zone        -->
     <!-- ====================================================== -->
     <div id="view-main" class="view" role="main">
 
-      <!-- Device list -->
-      <div id="device-list" class="device-list" aria-label="Paired devices"></div>
+      <!-- Unified scrolling list: Devices + Activity -->
+      <div id="main-list">
+        <div class="section-header">Devices</div>
+        <div id="device-list" class="row-list" aria-label="Paired devices"></div>
 
-      <!-- Empty state (shown when no devices paired) -->
-      <div id="empty-state" class="empty-state hidden" aria-live="polite">
-        <div class="empty-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></div>
-        <h3>Pair Your First Device</h3>
-        <p>Scan a QR code to connect your devices instantly.</p>
-        <button id="btn-pair-first" class="btn primary">Pair Device</button>
+        <!-- Empty state (shown when no devices paired) -->
+        <div id="empty-state" class="empty-state hidden" aria-live="polite">
+          <h3>No devices paired.</h3>
+          <p>Pair one to start sending.</p>
+          <button id="btn-pair-first" class="btn primary">Pair a device</button>
+        </div>
+
+        <div class="section-header">Activity</div>
+        <div id="activity-list" class="row-list" aria-label="Activity"></div>
+
+        <!-- Active transfers (in-progress bars) -->
+        <div id="active-transfers" class="active-section" aria-live="polite" aria-label="Active transfers"></div>
+
+        <!-- Received file download banner -->
+        <div id="received-file-section" class="recent-section hidden" aria-live="polite"
+             aria-label="Received file"></div>
       </div>
 
       <!-- Drop zone for file transfers -->
@@ -166,31 +177,15 @@
         </button>
       </div>
 
-      <!-- Active transfers -->
-      <div id="active-transfers" class="active-section" aria-live="polite" aria-label="Active transfers">
-        <!-- Injected by JS when transfers are in progress -->
-      </div>
-
-      <!-- Received file download banner -->
-      <div id="received-file-section" class="recent-section hidden" aria-live="polite"
-           aria-label="Received file"></div>
-
-      <!-- Recent transfers history -->
-      <div id="recent-transfers" class="recent-section">
-        <h4 class="section-title">Recent</h4>
-        <div id="transfer-list" aria-label="Transfer history"></div>
-      </div>
-
-      <!-- Clipboard history -->
-      <div id="clipboard-section" class="recent-section">
-        <h4 class="section-title">
-          Clipboard History
-          <span id="clipboard-count" class="badge"></span>
-        </h4>
-        <div id="clipboard-list" aria-label="Clipboard history"></div>
-      </div>
-
     </div><!-- /view-main -->
+
+    <!-- ===== Shortcut footer (Phase 2a) ===== -->
+    <div id="shortcut-footer">
+      <span class="shortcut-chip">&#x23CE; send</span>
+      <span class="shortcut-chip">&#x2191;&#x2193; select</span>
+      <span class="shortcut-chip">p pair</span>
+      <span class="shortcut-chip">, settings</span>
+    </div>
 
   </div><!-- /app -->
 

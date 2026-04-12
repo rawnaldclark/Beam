@@ -73,6 +73,18 @@ let selectedDeviceId = null;
  */
 const activeTransfers = new Map();
 
+/**
+ * Cached transfer history for the unified activity list (Phase 2a).
+ * @type {Array<{transferId: string, fileName: string, fileSize: number, direction: string, status: string, timestamp: number, targetDeviceName?: string}>}
+ */
+let cachedTransferHistory = [];
+
+/**
+ * Cached clipboard history for the unified activity list (Phase 2a).
+ * @type {Array<{id: string, content: string, timestamp: number, fromDeviceId?: string}>}
+ */
+let cachedClipboardHistory = [];
+
 /** Handle returned by setInterval for the PIN countdown. */
 let pinTimerHandle = null;
 
@@ -120,10 +132,37 @@ document.addEventListener('DOMContentLoaded', async () => {
   await loadClipboardHistory();
   await loadReceivedFile();
   await consumeAutoCopyPending();
+  populateIdentityStrip();
   setupEventListeners();
   listenForStorageChanges();
   startKeepalive();
 });
+
+/**
+ * Populate the identity strip with the device's own name and relay status.
+ *
+ * Reads the device name from chrome.storage.local settings. The relay status
+ * dot defaults to online (green) — the service worker heartbeat manages the
+ * actual connection state. A future Phase 2b pass will wire up real-time
+ * relay status updates.
+ *
+ * @returns {Promise<void>}
+ */
+async function populateIdentityStrip() {
+  try {
+    const stored = await chrome.storage.local.get(['settings', 'deviceId']);
+    const alias  = stored.settings?.deviceName || 'Chrome';
+    const aliasEl = document.getElementById('identity-alias');
+    if (aliasEl) aliasEl.textContent = alias;
+  } catch {
+    // Non-critical — identity strip shows empty alias if storage read fails.
+  }
+
+  // Relay status dot: default to online. The SW manages relay connectivity
+  // and will send RELAY_STATUS messages in a future phase.
+  const dot = document.getElementById('relay-status-dot');
+  if (dot) dot.classList.remove('disconnected');
+}
 
 /**
  * Check for and consume any pending auto-copy clipboard content.
@@ -229,6 +268,8 @@ async function loadReceivedFile() {
 /**
  * Re-render the device list (or show the empty state when no devices exist).
  * Preserves the currently selected device across re-renders.
+ *
+ * Phase 2a: uses flat 36px device-row items instead of bordered cards.
  */
 function renderDevices() {
   const list  = el('device-list');
@@ -257,50 +298,34 @@ function renderDevices() {
   setQuickActionsDisabled(!hasOnline);
 
   list.innerHTML = currentDevices
-    .map(d => deviceCardHTML(d))
+    .map(d => deviceRowHTML(d))
     .join('');
-
-  // Mark the currently selected card.
-  if (selectedDeviceId) {
-    list.querySelector(`[data-id="${CSS.escape(selectedDeviceId)}"]`)
-        ?.classList.add('selected');
-  }
 
   // Attach click handlers via event delegation on the list container.
   list.onclick = handleDeviceListClick;
 }
 
 /**
- * Build the inner HTML for a single device card.
+ * Build the inner HTML for a single device row (Phase 2a flat 36px row).
  * All user-provided text is escaped.
  *
  * @param {{deviceId: string, name: string, icon: string, isOnline: boolean}} d
  * @returns {string}
  */
-function deviceCardHTML(d) {
-  const icon       = ICON_MAP[d.icon] ?? '💻';
-  const statusClass = d.isOnline ? 'online' : 'offline';
-  const statusDot  = d.isOnline ? 'green' : 'gray';
-  const statusText = d.isOnline ? 'Online' : 'Offline';
-  const sendBtn    = d.isOnline
-    ? `<div class="device-actions">
-         <button class="send-file-btn" data-id="${escapeAttr(d.deviceId)}"
-                 aria-label="Send file to ${escapeAttr(d.name)}">Send</button>
-       </div>`
-    : '';
+function deviceRowHTML(d) {
+  const statusClass  = d.isOnline ? 'online' : 'offline';
+  const dotClass     = d.isOnline ? 'dot-online' : 'dot-offline';
+  const icon         = ICON_MAP[d.icon] ?? beamIcon.laptop();
+  const trailing     = d.isOnline ? 'send' : 'offline';
+  const selectedClass = d.deviceId === selectedDeviceId ? 'selected' : '';
 
   return `
-    <div class="device-card ${statusClass}" data-id="${escapeAttr(d.deviceId)}"
-         role="button" tabindex="0" aria-label="${escapeAttr(d.name)}, ${statusText}">
-      <div class="device-icon" aria-hidden="true">${icon}</div>
-      <div class="device-info">
-        <div class="device-name">${escapeHtml(d.name)}</div>
-        <div class="device-status">
-          <span class="status-dot ${statusDot}"></span>
-          ${statusText}
-        </div>
-      </div>
-      ${sendBtn}
+    <div class="device-row ${statusClass} ${selectedClass}" data-id="${escapeAttr(d.deviceId)}"
+         role="button" tabindex="0" aria-label="${escapeAttr(d.name)}, ${statusClass}">
+      <span class="row-dot ${dotClass}"></span>
+      <span class="row-icon" aria-hidden="true">${icon}</span>
+      <span class="row-name">${escapeHtml(d.name)}</span>
+      <span class="row-trailing">${trailing}</span>
     </div>
   `;
 }
@@ -337,84 +362,94 @@ function renderActiveTransfers() {
 }
 
 /**
- * Render the recent transfer history list.
+ * Cache transfer history and trigger a unified activity list re-render.
  *
  * @param {Array<{transferId: string, fileName: string, fileSize: number,
  *   direction: string, status: string, timestamp: number, targetDeviceName?: string}>} history
  */
 function renderTransferHistory(history) {
-  const list    = el('transfer-list');
-  const section = el('recent-transfers');
-
-  if (!history.length) {
-    section.classList.add('hidden');
-    return;
-  }
-
-  section.classList.remove('hidden');
-  list.innerHTML = history.map(item => {
-    const icon       = item.direction === 'in' ? beamIcon.arrow_down() : beamIcon.arrow_up();
-    const statusCls  = item.status === 'complete' ? 'ok' : 'fail';
-    const statusText = item.status === 'complete' ? '✓' : '✗';
-    const meta       = [
-      formatBytes(item.fileSize),
-      item.targetDeviceName ? escapeHtml(item.targetDeviceName) : null,
-      formatRelativeTime(item.timestamp),
-    ].filter(Boolean).join(' · ');
-
-    return `
-      <div class="history-item">
-        <div class="history-item-icon" aria-hidden="true">${icon}</div>
-        <div class="history-item-body">
-          <div class="history-item-name">${escapeHtml(item.fileName)}</div>
-          <div class="history-item-meta">${meta}</div>
-        </div>
-        <span class="history-item-status ${statusCls}" aria-label="${item.status}">${statusText}</span>
-      </div>
-    `;
-  }).join('');
+  cachedTransferHistory = history;
+  renderActivityList();
 }
 
 /**
- * Render the clipboard history list with per-item "Resend" copy buttons.
+ * Cache clipboard history and trigger a unified activity list re-render.
  *
  * @param {Array<{id: string, content: string, timestamp: number}>} history
  */
 function renderClipboardHistory(history) {
-  const list    = el('clipboard-list');
-  const section = el('clipboard-section');
-  const count   = el('clipboard-count');
+  cachedClipboardHistory = history;
+  renderActivityList();
+}
 
-  if (!history.length) {
-    section.classList.add('hidden');
-    return;
+/**
+ * Unified activity list renderer (Phase 2a).
+ *
+ * Merges transfer history and clipboard history into a single time-sorted
+ * list of flat 36px activity-row items, capped at 8 visible rows.
+ * Renders into #activity-list.
+ */
+function renderActivityList() {
+  const list = document.getElementById('activity-list');
+  if (!list) return;
+
+  // Build unified activity entries from both sources.
+  /** @type {Array<{type: string, html: string, timestamp: number}>} */
+  const entries = [];
+
+  // Transfer history entries
+  for (const item of cachedTransferHistory) {
+    const icon     = item.direction === 'in' ? beamIcon.arrow_down() : beamIcon.arrow_up();
+    const sizeMeta = formatBytes(item.fileSize);
+    const device   = item.targetDeviceName ? escapeHtml(item.targetDeviceName) : '';
+    const time     = formatRelativeTime(item.timestamp);
+
+    entries.push({
+      type: 'transfer',
+      timestamp: item.timestamp,
+      html: `
+        <div class="activity-row">
+          <span class="row-icon" aria-hidden="true">${icon}</span>
+          <span class="row-name">${escapeHtml(item.fileName)}</span>
+          <span class="row-meta">${sizeMeta}</span>
+          ${device ? `<span class="row-meta">${device}</span>` : ''}
+          <span class="row-meta">${time}</span>
+        </div>
+      `,
+    });
   }
 
-  section.classList.remove('hidden');
-  count.textContent = String(history.length);
+  // Clipboard history entries
+  for (const item of cachedClipboardHistory) {
+    const preview = escapeHtml(item.content.slice(0, 40)) +
+                    (item.content.length > 40 ? '...' : '');
+    const time    = formatRelativeTime(item.timestamp);
 
-  list.innerHTML = history.map(item => {
-    const preview = escapeHtml(item.content.slice(0, 80)) +
-                    (item.content.length > 80 ? '…' : '');
-    const from = item.fromDeviceId ? `From device` : '';
-    const time = formatRelativeTime(item.timestamp);
-    return `
-      <div class="history-item">
-        <div class="history-item-icon" aria-hidden="true">${beamIcon.clipboard()}</div>
-        <div class="history-item-body">
-          <div class="history-item-name">${preview}</div>
-          <div class="history-item-meta">${from} ${time}</div>
+    entries.push({
+      type: 'clipboard',
+      timestamp: item.timestamp,
+      html: `
+        <div class="activity-row" data-clip-content="${escapeAttr(item.content)}">
+          <span class="row-icon" aria-hidden="true">${beamIcon.clipboard()}</span>
+          <span class="row-name">${preview}</span>
+          <span class="row-meta">${time}</span>
         </div>
-        <button class="copy-clip-btn"
-                data-content="${escapeAttr(item.content)}"
-                aria-label="Copy to clipboard"
-                style="padding:4px 10px;border-radius:6px;border:1px solid var(--border);background:var(--surface);color:var(--text-primary);cursor:pointer;font-size:12px;">Copy</button>
-      </div>
-    `;
-  }).join('');
+      `,
+    });
+  }
 
-  // Delegate resend clicks.
-  list.onclick = handleClipboardResend;
+  // Sort by most recent first, cap at 8.
+  entries.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
+  const visible = entries.slice(0, 8);
+
+  if (visible.length === 0) {
+    list.innerHTML = '<div class="activity-empty">Nothing sent yet. Paste or drop to start.</div>';
+  } else {
+    list.innerHTML = visible.map(e => e.html).join('');
+  }
+
+  // Delegate clipboard copy on click.
+  list.onclick = handleActivityListClick;
 }
 
 /**
@@ -694,9 +729,6 @@ function cancelSAS() {
 
 /** Wire up all static event listeners after DOM is ready. */
 function setupEventListeners() {
-  // Header: Pair button
-  document.getElementById('btn-pair')?.addEventListener('click', showPairingView);
-
   // Empty state: Pair first device button
   document.getElementById('btn-pair-first')?.addEventListener('click', showPairingView);
 
@@ -761,8 +793,31 @@ function setupEventListeners() {
   document.getElementById('btn-screenshot')?.addEventListener('click', sendScreenshot);
   document.getElementById('btn-tab-url')?.addEventListener('click', sendTabUrl);
 
+  // Shortcut footer: delegate clicks on chips (Phase 2a)
+  document.getElementById('shortcut-footer')?.addEventListener('click', handleShortcutClick);
+
   // Runtime messages (pairing events, transfer progress, presence changes)
   chrome.runtime.onMessage.addListener(handleMessage);
+}
+
+/**
+ * Handle clicks on shortcut chips in the footer (Phase 2a).
+ * Maps chip text content to actions.
+ *
+ * @param {MouseEvent} e
+ */
+function handleShortcutClick(e) {
+  const chip = e.target.closest('.shortcut-chip');
+  if (!chip) return;
+
+  const text = chip.textContent.trim().toLowerCase();
+  if (text.includes('pair')) {
+    showPairingView();
+  } else if (text.includes('settings')) {
+    showSettingsView();
+  }
+  // 'send' and 'select' chips are informational labels for keyboard shortcuts
+  // which will be wired in Phase 2b.
 }
 
 // ---------------------------------------------------------------------------
@@ -1173,32 +1228,51 @@ async function sendTabUrl() {
 // ---------------------------------------------------------------------------
 
 /**
- * Handle clicks in the device list:
- *   - Clicking a .device-card selects it as the transfer target.
- *   - Clicking a .send-file-btn triggers the file picker immediately.
+ * Handle clicks in the device list (Phase 2a):
+ *   - Clicking a .device-row selects it as the transfer target.
+ *   - Clicking the trailing "send" text on an online row opens the file picker.
  *
  * @param {MouseEvent} e
  */
 function handleDeviceListClick(e) {
-  // Send button
-  const sendBtn = e.target.closest('.send-file-btn');
-  if (sendBtn) {
-    e.stopPropagation();
-    selectedDeviceId = sendBtn.dataset.id;
-    el('file-input').click();
-    return;
-  }
+  // Row selection
+  const row = e.target.closest('.device-row');
+  if (!row || row.classList.contains('offline')) return;
 
-  // Card selection
-  const card = e.target.closest('.device-card');
-  if (!card || card.classList.contains('offline')) return;
+  // If user clicked the "send" trailing text, open file picker.
+  const trailing = e.target.closest('.row-trailing');
+  if (trailing && row.dataset.id) {
+    selectedDeviceId = row.dataset.id;
+    el('file-input').click();
+    // Still select the row visually below.
+  }
 
   // Update selection
   el('device-list')
-    .querySelectorAll('.device-card')
-    .forEach(c => c.classList.remove('selected'));
-  card.classList.add('selected');
-  selectedDeviceId = card.dataset.id;
+    .querySelectorAll('.device-row')
+    .forEach(r => r.classList.remove('selected'));
+  row.classList.add('selected');
+  selectedDeviceId = row.dataset.id;
+}
+
+/**
+ * Handle clicks in the unified activity list (Phase 2a).
+ * Clipboard activity rows can be clicked to copy content.
+ *
+ * @param {MouseEvent} e
+ */
+function handleActivityListClick(e) {
+  const row = e.target.closest('.activity-row[data-clip-content]');
+  if (!row) return;
+
+  const content = row.dataset.clipContent;
+  if (!content) return;
+
+  navigator.clipboard.writeText(content).then(() => {
+    showToast('Copied to clipboard.', 'success');
+  }).catch(() => {
+    showToast('Could not copy to clipboard.', 'error');
+  });
 }
 
 /**
