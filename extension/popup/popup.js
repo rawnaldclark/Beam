@@ -1514,3 +1514,304 @@ function formatRelativeTime(timestamp) {
   if (diff < 86_400_000)   return `${Math.floor(diff / 3_600_000)}h ago`;
   return `${Math.floor(diff / 86_400_000)}d ago`;
 }
+
+// ---------------------------------------------------------------------------
+// Phase 2b — Selection model
+// ---------------------------------------------------------------------------
+
+/**
+ * Update the selected device visually and in state.
+ * Removes `.selected` from all device rows, applies it to the row matching
+ * newDeviceId, and scrolls that row into view.
+ *
+ * @param {string|null} newDeviceId
+ */
+function updateSelection(newDeviceId) {
+  selectedDeviceId = newDeviceId;
+
+  const rows = document.querySelectorAll('#device-list .device-row');
+  rows.forEach(r => r.classList.remove('selected'));
+
+  if (!newDeviceId) return;
+
+  const target = document.querySelector(`#device-list .device-row[data-id="${CSS.escape(newDeviceId)}"]`);
+  if (target) {
+    target.classList.add('selected');
+    target.scrollIntoView({ block: 'nearest' });
+  }
+}
+
+/**
+ * Get the ordered list of visible online device IDs from the DOM.
+ * During filter mode, only non-hidden rows are included.
+ *
+ * @returns {string[]}
+ */
+function getOnlineDeviceIds() {
+  const rows = document.querySelectorAll('#device-list .device-row:not(.offline)');
+  const ids = [];
+  for (const row of rows) {
+    // Skip rows hidden by the filter (display:none).
+    if (row.offsetParent === null && row.style.display === 'none') continue;
+    if (row.dataset.id) ids.push(row.dataset.id);
+  }
+  return ids;
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b — Filter state machine
+// ---------------------------------------------------------------------------
+
+/** Whether the device filter bar is currently active. */
+let filterActive = false;
+
+/** The device selection before the filter was activated, to restore on cancel. */
+let preFilterSelection = null;
+
+/**
+ * Activate the filter bar: insert the filter-bar element above the device
+ * section header, focus the input, and add `.filter-active` to #main-list.
+ */
+function activateFilter() {
+  if (filterActive) return;
+  filterActive = true;
+  preFilterSelection = selectedDeviceId;
+
+  const mainList = document.getElementById('main-list');
+  if (!mainList) return;
+
+  // Build and insert filter bar at the top of #main-list.
+  const bar = document.createElement('div');
+  bar.id = 'filter-bar';
+  bar.innerHTML = `
+    <span class="filter-prefix">/</span>
+    <input type="text" id="filter-input" placeholder="Filter devices" autocomplete="off">
+    <span class="filter-hint">esc</span>
+  `;
+  mainList.insertBefore(bar, mainList.firstChild);
+  mainList.classList.add('filter-active');
+
+  const input = document.getElementById('filter-input');
+  if (input) {
+    input.focus();
+    input.addEventListener('input', handleFilterInput);
+  }
+}
+
+/**
+ * Deactivate the filter bar: remove the element, restore device list visibility,
+ * restore the prior selection, and remove `.filter-active`.
+ */
+function deactivateFilter() {
+  if (!filterActive) return;
+  filterActive = false;
+
+  const bar = document.getElementById('filter-bar');
+  if (bar) bar.remove();
+
+  const mainList = document.getElementById('main-list');
+  if (mainList) mainList.classList.remove('filter-active');
+
+  // Restore all device rows to visible.
+  const rows = document.querySelectorAll('#device-list .device-row');
+  rows.forEach(r => { r.style.display = ''; });
+
+  // Restore the Devices section header to its original text.
+  const header = document.querySelector('#main-list .section-header');
+  if (header) header.textContent = 'Devices';
+
+  // Restore prior selection.
+  updateSelection(preFilterSelection);
+  preFilterSelection = null;
+}
+
+/**
+ * Handle input events on the filter text field.
+ * Filters device rows by prefix+substring match on device alias (case-insensitive).
+ * Updates the Devices section header with a count, and auto-selects the first match.
+ *
+ * @param {Event} e
+ */
+function handleFilterInput(e) {
+  const query = (e.target.value || '').toLowerCase();
+  const rows = document.querySelectorAll('#device-list .device-row');
+  let visibleCount = 0;
+  const totalCount = rows.length;
+  let firstVisibleId = null;
+
+  rows.forEach(r => {
+    const name = (r.querySelector('.row-name')?.textContent || '').toLowerCase();
+    const matches = !query || name.includes(query);
+    r.style.display = matches ? '' : 'none';
+    if (matches) {
+      visibleCount++;
+      if (!firstVisibleId) firstVisibleId = r.dataset.id;
+    }
+  });
+
+  // Update section header with count.
+  const header = document.querySelector('#main-list .section-header');
+  if (header) {
+    header.textContent = query
+      ? `Devices ${visibleCount} of ${totalCount}`
+      : 'Devices';
+  }
+
+  // Auto-select the first visible online device.
+  const onlineIds = getOnlineDeviceIds();
+  if (onlineIds.length > 0) {
+    updateSelection(onlineIds[0]);
+  } else if (firstVisibleId) {
+    updateSelection(firstVisibleId);
+  } else {
+    updateSelection(null);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Phase 2b — Global keyboard handler
+// ---------------------------------------------------------------------------
+
+/**
+ * Returns the name of the currently visible view.
+ * @returns {'main'|'pairing'|'sas'|'naming'|'settings'}
+ */
+function currentView() {
+  const views = ['main', 'pairing', 'sas', 'naming', 'settings'];
+  for (const v of views) {
+    const el = document.getElementById(`view-${v}`);
+    if (el && !el.classList.contains('hidden')) return v;
+  }
+  return 'main';
+}
+
+/**
+ * Global keydown handler implementing Raycast/Linear-style keyboard navigation.
+ * Attached to `document` in setupEventListeners().
+ *
+ * @param {KeyboardEvent} e
+ */
+function handleGlobalKeydown(e) {
+  const tag = e.target.tagName;
+  const isInputFocused = tag === 'INPUT' || tag === 'TEXTAREA';
+
+  // Escape always works, even when an input is focused.
+  if (e.key === 'Escape') {
+    e.preventDefault();
+
+    // If filter is active, clear it first.
+    if (filterActive) {
+      deactivateFilter();
+      return;
+    }
+
+    // If on a non-main view, return to main.
+    const view = currentView();
+    if (view !== 'main') {
+      // Clean up pairing state if leaving pairing view.
+      if (view === 'pairing') {
+        if (pinTimerHandle) { clearInterval(pinTimerHandle); pinTimerHandle = null; }
+        cancelPairingRelay();
+        pendingPairing = null;
+        pairingDeviceId = null;
+      }
+      showView('main');
+      return;
+    }
+
+    // On main view with nothing else active — close popup.
+    window.close();
+    return;
+  }
+
+  // All other shortcuts are suppressed when a text input is focused.
+  if (isInputFocused) return;
+
+  // Only handle shortcuts when on main view (except Escape handled above).
+  const view = currentView();
+
+  switch (e.key) {
+    case 'ArrowDown':
+    case 'ArrowUp': {
+      if (view !== 'main') return;
+      e.preventDefault();
+
+      const ids = getOnlineDeviceIds();
+      if (ids.length === 0) return;
+
+      const currentIndex = ids.indexOf(selectedDeviceId);
+      let nextIndex;
+
+      if (e.key === 'ArrowDown') {
+        nextIndex = currentIndex < 0 ? 0 : (currentIndex + 1) % ids.length;
+      } else {
+        nextIndex = currentIndex <= 0 ? ids.length - 1 : currentIndex - 1;
+      }
+
+      updateSelection(ids[nextIndex]);
+      break;
+    }
+
+    case 'Enter': {
+      if (view !== 'main') return;
+      e.preventDefault();
+
+      // In filter mode, commit to the top filtered result and deactivate.
+      if (filterActive) {
+        const ids = getOnlineDeviceIds();
+        if (ids.length > 0) {
+          updateSelection(ids[0]);
+          preFilterSelection = ids[0]; // so deactivate restores to this
+        }
+        deactivateFilter();
+        // Fall through to trigger the device click behavior below.
+      }
+
+      if (!selectedDeviceId) return;
+
+      // Check if the selected device is online.
+      const device = currentDevices.find(d => d.deviceId === selectedDeviceId);
+      if (!device || !device.isOnline) return;
+
+      // Simulate the device row click — trigger file picker (same as clicking
+      // the row's trailing "send" text). This is the existing send trigger.
+      const row = document.querySelector(
+        `#device-list .device-row[data-id="${CSS.escape(selectedDeviceId)}"]`
+      );
+      if (row) {
+        // Pulse to indicate "ready to send" — if there's no staged content,
+        // this gives visual feedback that Enter was registered.
+        row.classList.add('pulse');
+        setTimeout(() => row.classList.remove('pulse'), 300);
+
+        // Trigger the file picker as the send action.
+        el('file-input').click();
+      }
+      break;
+    }
+
+    case '/': {
+      if (view !== 'main') return;
+      e.preventDefault();
+      activateFilter();
+      break;
+    }
+
+    case 'p': {
+      if (view !== 'main') return;
+      e.preventDefault();
+      showPairingView();
+      break;
+    }
+
+    case ',': {
+      if (view !== 'main') return;
+      e.preventDefault();
+      showSettingsView();
+      break;
+    }
+  }
+}
+
+// Attach the global keyboard handler.
+document.addEventListener('keydown', handleGlobalKeydown);

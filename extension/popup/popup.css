@@ -1211,3 +1211,56 @@ html, body {
   background: var(--danger);
   color:      #fff;
 }
+
+/* --------------------------------------------------------------------------
+   Filter bar (Phase 2b — inline device filter activated by `/`)
+   -------------------------------------------------------------------------- */
+#filter-bar {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding: 0 12px;
+  gap: 6px;
+  background: var(--beam-bg-1, var(--surface));
+  border-bottom: 1px solid var(--beam-border-subtle, var(--border));
+}
+.filter-prefix {
+  font-family: var(--beam-font-mono);
+  font-size: 11px;
+  color: var(--beam-text-lo, var(--text-lo));
+}
+#filter-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  outline: none;
+  color: var(--beam-text-hi, var(--text-hi));
+  font-family: var(--beam-font-sans);
+  font-size: 13px;
+}
+#filter-input::placeholder {
+  color: var(--beam-text-lo, var(--text-lo));
+}
+.filter-hint {
+  font-family: var(--beam-font-mono);
+  font-size: 11px;
+  color: var(--beam-text-lo, var(--text-lo));
+}
+
+/* Dim activity section while filter is active */
+#main-list.filter-active .section-header:last-of-type,
+#main-list.filter-active #activity-list {
+  opacity: 0.3;
+  pointer-events: none;
+}
+
+/* --------------------------------------------------------------------------
+   Visual feedback: keyboard "nothing to send" pulse (Phase 2b)
+   -------------------------------------------------------------------------- */
+.device-row.pulse {
+  animation: row-pulse 300ms ease-out;
+}
+@keyframes row-pulse {
+  0%   { background: var(--beam-accent-12, var(--primary-dim)); }
+  100% { background: transparent; }
+}
