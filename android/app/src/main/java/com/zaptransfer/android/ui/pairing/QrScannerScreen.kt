@@ -13,20 +13,21 @@ import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -58,6 +59,11 @@ import androidx.core.content.ContextCompat
 import com.google.mlkit.vision.barcode.BarcodeScanning
 import com.google.mlkit.vision.barcode.common.Barcode
 import com.google.mlkit.vision.common.InputImage
+import com.zaptransfer.android.ui.theme.BeamCorner
+import com.zaptransfer.android.ui.theme.BeamIcons
+import com.zaptransfer.android.ui.theme.BeamPalette
+import com.zaptransfer.android.ui.theme.BeamSpace
+import com.zaptransfer.android.ui.theme.BeamTextStyle
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
@@ -143,16 +149,26 @@ fun QrScannerScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Scan QR Code") },
+                title = {
+                    Text(
+                        text = "Scan QR Code",
+                        style = BeamTextStyle.lgSemibold,
+                        color = BeamPalette.textHi,
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            imageVector = BeamIcons.back,
+                            contentDescription = "Back",
+                            tint = BeamPalette.textMid,
+                        )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = Color.Transparent,
-                    titleContentColor = Color.White,
-                    navigationIconContentColor = Color.White,
+                    containerColor = BeamPalette.bg0,
+                    titleContentColor = BeamPalette.textHi,
+                    navigationIconContentColor = BeamPalette.textMid,
                 ),
             )
         },
@@ -179,15 +195,20 @@ fun QrScannerScreen(
                         Box(
                             modifier = Modifier
                                 .align(Alignment.BottomCenter)
-                                .padding(horizontal = 24.dp, vertical = 120.dp)
-                                .clip(MaterialTheme.shapes.small)
-                                .background(MaterialTheme.colorScheme.errorContainer)
-                                .padding(horizontal = 16.dp, vertical = 10.dp),
+                                .padding(horizontal = BeamSpace.s6, vertical = 120.dp)
+                                .clip(RoundedCornerShape(BeamCorner.lg))
+                                .background(BeamPalette.bg1)
+                                .border(
+                                    width = 1.dp,
+                                    color = BeamPalette.borderSubtle,
+                                    shape = RoundedCornerShape(BeamCorner.lg),
+                                )
+                                .padding(horizontal = BeamSpace.s4, vertical = BeamSpace.s3),
                         ) {
                             Text(
                                 text = errorMsg,
-                                color = MaterialTheme.colorScheme.onErrorContainer,
-                                style = MaterialTheme.typography.bodyMedium,
+                                color = BeamPalette.danger,
+                                style = BeamTextStyle.baseRegular,
                                 textAlign = TextAlign.Center,
                             )
                         }
@@ -200,7 +221,7 @@ fun QrScannerScreen(
                         onRequestPermission = { permissionLauncher.launch(Manifest.permission.CAMERA) },
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(24.dp),
+                            .padding(BeamSpace.s6),
                     )
                 }
 
@@ -209,20 +230,20 @@ fun QrScannerScreen(
                     Column(
                         modifier = Modifier
                             .fillMaxSize()
-                            .padding(24.dp),
+                            .padding(BeamSpace.s6),
                         horizontalAlignment = Alignment.CenterHorizontally,
                         verticalArrangement = Arrangement.Center,
                     ) {
                         Text(
                             text = "Camera access was denied.",
-                            style = MaterialTheme.typography.titleMedium,
-                            color = Color.White,
+                            style = BeamTextStyle.lgSemibold,
+                            color = BeamPalette.textHi,
                         )
-                        Spacer(modifier = Modifier.height(12.dp))
+                        Spacer(modifier = Modifier.height(BeamSpace.s3))
                         Text(
                             text = "Enable camera access in Settings, or use the PIN option below.",
-                            style = MaterialTheme.typography.bodyMedium,
-                            color = Color.White.copy(alpha = 0.75f),
+                            style = BeamTextStyle.baseRegular,
+                            color = BeamPalette.textMid,
                             textAlign = TextAlign.Center,
                         )
                     }
@@ -236,7 +257,8 @@ fun QrScannerScreen(
                     ) {
                         Text(
                             text = "Requesting camera access…",
-                            color = Color.White,
+                            color = BeamPalette.textMid,
+                            style = BeamTextStyle.baseRegular,
                             textAlign = TextAlign.Center,
                         )
                     }
@@ -255,8 +277,8 @@ fun QrScannerScreen(
             ) {
                 Text(
                     text = "Can't scan? Enter PIN",
-                    color = Color.White,
-                    style = MaterialTheme.typography.bodyLarge,
+                    color = BeamPalette.textMid,
+                    style = BeamTextStyle.smRegular,
                 )
             }
         }
@@ -385,12 +407,13 @@ private fun CameraPreviewWithScanner(
  */
 @Composable
 private fun ViewfinderOverlay(modifier: Modifier = Modifier) {
+    val cornerRadiusDp = BeamCorner.lg
     Canvas(modifier = modifier) {
         val scrimColor = Color.Black.copy(alpha = 0.60f)
         val windowSize = minOf(size.width, size.height) * 0.70f
         val windowLeft = (size.width - windowSize) / 2f
         val windowTop = (size.height - windowSize) / 2f
-        val cornerRadius = 24.dp.toPx()
+        val cornerRadius = cornerRadiusDp.toPx()
 
         // Full-screen dark scrim
         drawRect(color = scrimColor)
@@ -435,20 +458,30 @@ private fun CameraPermissionRationale(
     ) {
         Text(
             text = "Camera Access Required",
-            style = MaterialTheme.typography.headlineSmall,
-            color = Color.White,
+            style = BeamTextStyle.lgSemibold,
+            color = BeamPalette.textHi,
         )
-        Spacer(modifier = Modifier.height(16.dp))
+        Spacer(modifier = Modifier.height(BeamSpace.s4))
         Text(
             text = "ZapTransfer uses the camera to scan the QR code on your computer. " +
                 "Your camera feed is never stored or transmitted.",
-            style = MaterialTheme.typography.bodyMedium,
-            color = Color.White.copy(alpha = 0.80f),
+            style = BeamTextStyle.baseRegular,
+            color = BeamPalette.textMid,
             textAlign = TextAlign.Center,
         )
-        Spacer(modifier = Modifier.height(32.dp))
-        Button(onClick = onRequestPermission) {
-            Text("Grant Camera Access")
+        Spacer(modifier = Modifier.height(BeamSpace.s7))
+        Button(
+            onClick = onRequestPermission,
+            colors = ButtonDefaults.buttonColors(
+                containerColor = BeamPalette.accent,
+                contentColor = Color.White,
+            ),
+            shape = RoundedCornerShape(BeamCorner.md),
+        ) {
+            Text(
+                text = "Grant Camera Access",
+                style = BeamTextStyle.baseMedium,
+            )
         }
     }
 }

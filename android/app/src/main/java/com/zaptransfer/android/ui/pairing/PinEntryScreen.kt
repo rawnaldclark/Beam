@@ -13,19 +13,17 @@ import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
-import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.text.KeyboardOptions
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.ArrowBack
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
-import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -38,14 +36,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.ui.focus.focusRequester
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
-import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
-import androidx.compose.ui.unit.sp
+import com.zaptransfer.android.ui.theme.BeamCorner
+import com.zaptransfer.android.ui.theme.BeamIcons
+import com.zaptransfer.android.ui.theme.BeamPalette
+import com.zaptransfer.android.ui.theme.BeamSpace
+import com.zaptransfer.android.ui.theme.BeamTextStyle
 
 private const val PIN_LENGTH = 8
 
@@ -91,38 +91,56 @@ fun PinEntryScreen(
     Scaffold(
         topBar = {
             TopAppBar(
-                title = { Text("Enter Pairing PIN") },
+                title = {
+                    Text(
+                        text = "Enter Pairing PIN",
+                        style = BeamTextStyle.lgSemibold,
+                        color = BeamPalette.textHi,
+                    )
+                },
                 navigationIcon = {
                     IconButton(onClick = onBack) {
-                        Icon(Icons.Filled.ArrowBack, contentDescription = "Back")
+                        Icon(
+                            imageVector = BeamIcons.back,
+                            contentDescription = "Back",
+                            tint = BeamPalette.textMid,
+                        )
                     }
                 },
+                colors = TopAppBarDefaults.topAppBarColors(
+                    containerColor = BeamPalette.bg0,
+                    titleContentColor = BeamPalette.textHi,
+                    navigationIconContentColor = BeamPalette.textMid,
+                ),
             )
         },
+        containerColor = BeamPalette.bg0,
     ) { paddingValues ->
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .padding(paddingValues)
-                .padding(horizontal = 24.dp),
+                .padding(horizontal = BeamSpace.s6),
             horizontalAlignment = Alignment.CenterHorizontally,
             verticalArrangement = Arrangement.Center,
         ) {
             Text(
                 text = "Enter the 8-digit PIN",
-                style = MaterialTheme.typography.headlineSmall,
-            )
-
-            Spacer(modifier = Modifier.height(8.dp))
-
-            Text(
-                text = "Find the PIN displayed on the other device.",
-                style = MaterialTheme.typography.bodyMedium,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = BeamTextStyle.lgSemibold,
+                color = BeamPalette.textHi,
                 textAlign = TextAlign.Center,
             )
 
-            Spacer(modifier = Modifier.height(40.dp))
+            Spacer(modifier = Modifier.height(BeamSpace.s2))
+
+            Text(
+                text = "Find the PIN displayed on the other device.",
+                style = BeamTextStyle.baseRegular,
+                color = BeamPalette.textMid,
+                textAlign = TextAlign.Center,
+            )
+
+            Spacer(modifier = Modifier.height(BeamSpace.s8))
 
             // Hidden BasicTextField that captures all keyboard input.
             // Rendered with 0 alpha but full width so it's focusable.
@@ -147,7 +165,7 @@ fun PinEntryScreen(
             // Visual digit boxes — tapping anywhere re-focuses the hidden input
             // Row 1: digits 1-4
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                horizontalArrangement = Arrangement.spacedBy(BeamSpace.s2, Alignment.CenterHorizontally),
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(
@@ -168,11 +186,11 @@ fun PinEntryScreen(
                 }
             }
 
-            Spacer(modifier = Modifier.height(12.dp))
+            Spacer(modifier = Modifier.height(BeamSpace.s3))
 
             // Row 2: digits 5-8
             Row(
-                horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+                horizontalArrangement = Arrangement.spacedBy(BeamSpace.s2, Alignment.CenterHorizontally),
                 modifier = Modifier
                     .fillMaxWidth()
                     .clickable(
@@ -196,26 +214,34 @@ fun PinEntryScreen(
 
             // Error message
             if (errorMessage != null) {
-                Spacer(modifier = Modifier.height(16.dp))
+                Spacer(modifier = Modifier.height(BeamSpace.s4))
                 Text(
                     text = errorMessage,
-                    color = MaterialTheme.colorScheme.error,
-                    style = MaterialTheme.typography.bodySmall,
+                    color = BeamPalette.danger,
+                    style = BeamTextStyle.smRegular,
                     textAlign = TextAlign.Center,
                 )
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(BeamSpace.s6))
 
             Text(
                 text = "The PIN expires after 60 seconds.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                style = BeamTextStyle.smRegular,
+                color = BeamPalette.textLo,
             )
         }
     }
 }
 
+/**
+ * Individual digit box for the PIN entry grid.
+ *
+ * @param digit     The digit character to display, or empty string if unfilled.
+ * @param isFocused Whether this box is the next to receive input.
+ * @param hasError  Whether the PIN entry is in an error state.
+ * @param modifier  Layout modifier — typically [Modifier.weight] for equal sizing.
+ */
 @Composable
 private fun DigitBox(
     digit: String,
@@ -223,34 +249,33 @@ private fun DigitBox(
     hasError: Boolean,
     modifier: Modifier = Modifier,
 ) {
+    val shape = RoundedCornerShape(BeamCorner.md)
     Box(
         contentAlignment = Alignment.Center,
         modifier = modifier
-            .height(64.dp)
+            .width(48.dp)
+            .height(56.dp)
             .border(
                 width = if (isFocused) 2.dp else 1.dp,
                 color = when {
-                    hasError -> MaterialTheme.colorScheme.error
-                    isFocused -> MaterialTheme.colorScheme.primary
-                    digit.isNotEmpty() -> MaterialTheme.colorScheme.outline
-                    else -> MaterialTheme.colorScheme.outlineVariant
+                    hasError -> BeamPalette.danger
+                    isFocused -> BeamPalette.accent
+                    else -> BeamPalette.borderSubtle
                 },
-                shape = RoundedCornerShape(12.dp),
+                shape = shape,
             )
             .background(
-                color = if (digit.isNotEmpty())
-                    MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.3f)
-                else Color.Transparent,
-                shape = RoundedCornerShape(12.dp),
+                color = BeamPalette.bg1,
+                shape = shape,
             ),
     ) {
-        Text(
-            text = digit,
-            style = TextStyle(
-                fontSize = 28.sp,
+        if (digit.isNotEmpty()) {
+            Text(
+                text = digit,
+                style = BeamTextStyle.xlMono,
+                color = BeamPalette.textHi,
                 textAlign = TextAlign.Center,
-                color = MaterialTheme.colorScheme.onSurface,
-            ),
-        )
+            )
+        }
     }
 }
