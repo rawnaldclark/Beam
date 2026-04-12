@@ -57,10 +57,10 @@ import androidx.compose.ui.unit.dp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.zaptransfer.android.data.db.entity.PairedDeviceEntity
 
-// ── Status colours ─────────────────────────────────────────────────────────────
-// Defined locally to avoid adding a new theme token for a single indicator dot.
-private val OnlineGreen = Color(0xFF4CAF50)
-private val OfflineGrey = Color(0xFF9E9E9E)
+// ── Status colours — from the Beam design token system ────────────────────────
+import com.zaptransfer.android.ui.theme.BeamPalette
+private val OnlineGreen = BeamPalette.online    // #5FB88C — muted green
+private val OfflineGrey = BeamPalette.offline   // #6B7280 — cool gray
 
 /**
  * Device Hub — the main screen of the Beam application.

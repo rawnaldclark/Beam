@@ -1,99 +1,70 @@
 package com.zaptransfer.android.ui.theme
 
-import android.os.Build
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.darkColorScheme
-import androidx.compose.material3.dynamicDarkColorScheme
-import androidx.compose.material3.dynamicLightColorScheme
-import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.SideEffect
-import androidx.compose.ui.platform.LocalContext
-// ─── Dark colour scheme ───────────────────────────────────────────────────────
-// Default for Beam — the app targets a dark-mode-first aesthetic that works well
-// for file-transfer contexts (long sessions, often at night or in low-light).
+import androidx.compose.ui.graphics.Color
+
+// ─── Beam v1 Dark Colour Scheme ──────────────────────────────────────────────
+//
+// Maps Material 3 colorScheme slots to BeamPalette values so every composable
+// that reads `MaterialTheme.colorScheme.*` automatically resolves to the Beam
+// design system tokens. This is the minimally-invasive migration strategy:
+// composable code stays untouched; only the theme mapping changes.
+//
+// Dark-only in v1 (design decision: no light mode shipped in v1). The light
+// color scheme is removed. Dynamic color (Material You) is removed — Beam
+// uses a fixed brand palette.
+//
+// Authoritative source: docs/design/2026-04-11-design-direction-v1.md §6
+// Token definitions: android/.../ui/theme/BeamTokens.kt (BeamPalette)
+//
 private val BeamDarkColorScheme = darkColorScheme(
-    primary = IndigoPrimary,
-    onPrimary = OnPrimary,
-    primaryContainer = IndigoPrimaryDark,
-    onPrimaryContainer = OnPrimary,
+    // Accent — Signal Cyan #5BE4E4 (was Indigo #6366F1)
+    primary = BeamPalette.accent,
+    onPrimary = Color.White,
+    primaryContainer = BeamPalette.bg2,
+    onPrimaryContainer = BeamPalette.textHi,
 
-    secondary = VioletSecondary,
-    onSecondary = OnPrimary,
-    secondaryContainer = VioletSecondaryContainer,
+    // Secondary — mapped to accent for v1 (no distinct secondary hue)
+    secondary = BeamPalette.accent,
+    onSecondary = Color.White,
+    secondaryContainer = BeamPalette.bg2,
 
-    background = DarkBackground,
-    onBackground = OnSurfaceDark,
+    // Canvas and surfaces — stepped depth, zero shadows
+    background = BeamPalette.bg0,
+    onBackground = BeamPalette.textHi,
 
-    surface = DarkSurface,
-    onSurface = OnSurfaceDark,
-    surfaceVariant = DarkSurfaceVariant,
-    onSurfaceVariant = OnSurfaceVariantDark,
-    surfaceTint = DarkSurfaceTint,
+    surface = BeamPalette.bg1,
+    onSurface = BeamPalette.textHi,
+    surfaceVariant = BeamPalette.bg2,
+    onSurfaceVariant = BeamPalette.textMid,
+    surfaceTint = BeamPalette.accent,
 
-    outline = OutlineDark,
+    // Borders
+    outline = BeamPalette.borderStrong,
+    outlineVariant = BeamPalette.borderSubtle,
 
-    error = StatusError,
-    onError = OnPrimary,
-)
-
-// ─── Light colour scheme ─────────────────────────────────────────────────────
-// Provided for users with system light mode preference.
-private val BeamLightColorScheme = lightColorScheme(
-    primary = IndigoPrimaryDark,
-    onPrimary = OnPrimary,
-    primaryContainer = IndigoPrimaryContainer,
-    onPrimaryContainer = IndigoPrimaryContainerOnLight,
-
-    secondary = VioletSecondary,
-    onSecondary = OnPrimary,
-    secondaryContainer = VioletSecondaryContainer,
-
-    background = LightBackground,
-    onBackground = OnSurfaceLight,
-
-    surface = LightSurface,
-    onSurface = OnSurfaceLight,
-    surfaceVariant = LightSurfaceVariant,
-    onSurfaceVariant = OnSurfaceVariantLight,
-
-    outline = OutlineLight,
-
-    error = StatusError,
-    onError = OnPrimary,
+    // Error — muted danger
+    error = BeamPalette.danger,
+    onError = Color.White,
+    errorContainer = BeamPalette.danger12,
+    onErrorContainer = BeamPalette.textHi,
 )
 
 /**
  * Top-level theme composable wrapping the entire Beam application.
  *
- * Usage: call this in [MainActivity.setContent] as the outermost composable.
+ * Dark-only in v1. No dynamic color. No light scheme.
  *
- * @param darkTheme       Whether to apply the dark colour scheme. Defaults to the
- *                        system setting. Can be forced to true/false in previews.
- * @param dynamicColor    Whether to use Android 12+ dynamic colours (Material You).
- *                        Defaults to false — we want consistent brand colours across
- *                        all devices rather than wallpaper-derived palettes.
- * @param content         The Compose content tree to theme.
+ * @param content The Compose content tree to theme.
  */
 @Composable
 fun BeamTheme(
-    darkTheme: Boolean = isSystemInDarkTheme(),
-    dynamicColor: Boolean = false,
     content: @Composable () -> Unit,
 ) {
-    val colorScheme = when {
-        // Dynamic colour (Android 12+) — opt-in via caller, off by default
-        dynamicColor && Build.VERSION.SDK_INT >= Build.VERSION_CODES.S -> {
-            val context = LocalContext.current
-            if (darkTheme) dynamicDarkColorScheme(context) else dynamicLightColorScheme(context)
-        }
-        darkTheme -> BeamDarkColorScheme
-        else -> BeamLightColorScheme
-    }
-
     MaterialTheme(
-        colorScheme = colorScheme,
+        colorScheme = BeamDarkColorScheme,
         typography = BeamTypography,
         content = content,
     )
