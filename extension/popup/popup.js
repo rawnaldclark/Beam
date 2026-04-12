@@ -181,6 +181,19 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupEventListeners();
   listenForStorageChanges();
   startKeepalive();
+
+  // Retry device load after a short delay to catch the cold-start timing
+  // race: on browser restart or extension reload, the SW may still be
+  // connecting to the relay when the popup first renders. The initial
+  // loadDevices() reads empty devicePresence from session storage and
+  // shows all devices offline. By the time this retry fires, the SW has
+  // usually completed auth + received peer-online + written to session
+  // storage, so the second loadDevices() picks up the correct state.
+  //
+  // The storage.onChanged listener handles updates AFTER this window,
+  // but this retry covers the gap between popup-open and listener-ready.
+  setTimeout(loadDevices, 1500);
+  setTimeout(loadDevices, 4000);
 });
 
 /**
