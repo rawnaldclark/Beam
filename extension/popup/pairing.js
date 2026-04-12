@@ -294,18 +294,19 @@ export function createNamingForm(container, suggestedName, onSubmit) {
   iconPicker.className = 'icon-picker';
   iconPicker.id = 'icon-picker';
 
+  // Lucide SVG icons for device types (1.5px stroke, 20px, inherits currentColor)
   const iconSpecs = [
-    { icon: 'laptop',  glyph: '\u{1F4BB}' },       // 💻
-    { icon: 'desktop', glyph: '\u{1F5A5}\u{FE0F}' }, // 🖥️
-    { icon: 'phone',   glyph: '\u{1F4F1}' },       // 📱
-    { icon: 'tablet',  glyph: '\u{1F4DF}' },       // 📟
+    { icon: 'laptop',  svg: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M20 16V7a2 2 0 0 0-2-2H6a2 2 0 0 0-2 2v9m16 0H4m16 0 1.28 2.55a1 1 0 0 1-.9 1.45H3.62a1 1 0 0 1-.9-1.45L4 16"/></svg>' },
+    { icon: 'desktop', svg: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="20" height="14" x="2" y="3" rx="2"/><line x1="8" x2="16" y1="21" y2="21"/><line x1="12" x2="12" y1="17" y2="21"/></svg>' },
+    { icon: 'phone',   svg: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg>' },
+    { icon: 'tablet',  svg: '<svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="16" height="20" x="4" y="2" rx="2" ry="2"/><line x1="12" x2="12.01" y1="18" y2="18"/></svg>' },
   ];
   iconSpecs.forEach((spec, idx) => {
     const btn = document.createElement('button');
     btn.type = 'button';
     btn.className = idx === 0 ? 'icon-btn selected' : 'icon-btn';
     btn.dataset.icon = spec.icon;
-    btn.textContent = spec.glyph;
+    btn.innerHTML = spec.svg;
     iconPicker.appendChild(btn);
   });
   form.appendChild(iconPicker);

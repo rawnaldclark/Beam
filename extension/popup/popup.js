@@ -37,12 +37,14 @@ import {
 // Constants
 // ---------------------------------------------------------------------------
 
-/** Maps icon slug -> emoji for device cards. */
+import * as beamIcon from './beam-icons.js';
+
+/** Maps icon slug -> Lucide SVG (16px, inherits currentColor). */
 const ICON_MAP = Object.freeze({
-  laptop:  '💻',
-  desktop: '🖥️',
-  phone:   '📱',
-  tablet:  '📟',
+  laptop:  beamIcon.laptop(),
+  desktop: beamIcon.monitor(),
+  phone:   beamIcon.smartphone(),
+  tablet:  beamIcon.tablet(),
 });
 
 /** Maximum number of active transfer cards shown simultaneously. */
@@ -351,7 +353,7 @@ function renderTransferHistory(history) {
 
   section.classList.remove('hidden');
   list.innerHTML = history.map(item => {
-    const icon       = item.direction === 'in' ? '⬇️' : '⬆️';
+    const icon       = item.direction === 'in' ? beamIcon.arrow_down() : beamIcon.arrow_up();
     const statusCls  = item.status === 'complete' ? 'ok' : 'fail';
     const statusText = item.status === 'complete' ? '✓' : '✗';
     const meta       = [
@@ -398,7 +400,7 @@ function renderClipboardHistory(history) {
     const time = formatRelativeTime(item.timestamp);
     return `
       <div class="history-item">
-        <div class="history-item-icon" aria-hidden="true">📥</div>
+        <div class="history-item-icon" aria-hidden="true">${beamIcon.clipboard()}</div>
         <div class="history-item-body">
           <div class="history-item-name">${preview}</div>
           <div class="history-item-meta">${from} ${time}</div>
@@ -438,7 +440,7 @@ function renderReceivedFile(file) {
   section.innerHTML = `
     <h4 class="section-title">Received File</h4>
     <div class="history-item" style="align-items:center">
-      <div class="history-item-icon" aria-hidden="true">&#128230;</div>
+      <div class="history-item-icon" aria-hidden="true">${beamIcon.pkg()}</div>
       <div class="history-item-body">
         <div class="history-item-name">${escapeHtml(file.fileName)}</div>
         <div class="history-item-meta">${formatBytes(file.fileSize)} &middot; ${formatRelativeTime(file.timestamp)}</div>
@@ -1313,7 +1315,7 @@ function renderSettingsPairedDevices(devices) {
   }
 
   container.innerHTML = devices.map(d => {
-    const icon = ICON_MAP[d.icon] ?? '\uD83D\uDCBB';
+    const icon = ICON_MAP[d.icon] ?? beamIcon.laptop();
     return `
       <div class="setting-device-row" data-id="${escapeAttr(d.deviceId)}">
         <span class="setting-device-icon">${icon}</span>

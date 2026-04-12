@@ -15,13 +15,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Add
-import androidx.compose.material.icons.filled.Laptop
-import androidx.compose.material.icons.filled.PhoneAndroid
-import androidx.compose.material.icons.filled.Settings
-import androidx.compose.material.icons.filled.Tablet
-import androidx.compose.material.icons.filled.DesktopWindows
+import com.zaptransfer.android.ui.theme.BeamIcons
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
@@ -130,7 +124,7 @@ fun DeviceHubScreen(
                 actions = {
                     IconButton(onClick = onNavigateToSettings) {
                         Icon(
-                            imageVector = Icons.Filled.Settings,
+                            imageVector = BeamIcons.settings,
                             contentDescription = "Settings",
                         )
                     }
@@ -147,7 +141,7 @@ fun DeviceHubScreen(
                 onClick = onNavigateToPairScan,
                 icon = {
                     Icon(
-                        imageVector = Icons.Filled.Add,
+                        imageVector = BeamIcons.plus,
                         contentDescription = null,
                     )
                 },
@@ -462,21 +456,12 @@ private fun SectionHeader(
 
 /**
  * Returns the [ImageVector] that best represents the device's form factor.
- *
- * Mapping:
- *  - icon == "LAPTOP"  → [Icons.Filled.Laptop]
- *  - icon == "DESKTOP" → [Icons.Filled.DesktopWindows]
- *  - icon == "TABLET"  → [Icons.Filled.Tablet]
- *  - anything else     → [Icons.Filled.PhoneAndroid]
+ * Delegates to [BeamIcons.forDeviceType] for the semantic icon mapping.
  *
  * @param entity The paired device entity containing the [icon] field.
  */
-private fun platformIcon(entity: PairedDeviceEntity): ImageVector = when (entity.icon) {
-    "LAPTOP" -> Icons.Filled.Laptop
-    "DESKTOP" -> Icons.Filled.DesktopWindows
-    "TABLET" -> Icons.Filled.Tablet
-    else -> Icons.Filled.PhoneAndroid
-}
+private fun platformIcon(entity: PairedDeviceEntity): ImageVector =
+    BeamIcons.forDeviceType(entity.icon?.lowercase())
 
 /**
  * Returns the human-readable connection type label for a platform identifier.

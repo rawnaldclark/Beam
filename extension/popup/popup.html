@@ -20,14 +20,14 @@
     <!-- ===== Header ===== -->
     <header>
       <div class="logo">
-        <span class="logo-icon" aria-hidden="true">&#9889;</span>
+        <span class="logo-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg></span>
         <span class="logo-text">Beam</span>
       </div>
       <div class="header-actions">
         <button id="btn-pair"     class="icon-btn" title="Pair new device"
-                aria-label="Pair new device">&#43;</button>
+                aria-label="Pair new device"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="M12 5v14"/></svg></button>
         <button id="btn-settings" class="icon-btn" title="Settings"
-                aria-label="Settings">&#9881;</button>
+                aria-label="Settings"><svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12.22 2h-.44a2 2 0 0 0-2 2v.18a2 2 0 0 1-1 1.73l-.43.25a2 2 0 0 1-2 0l-.15-.08a2 2 0 0 0-2.73.73l-.22.38a2 2 0 0 0 .73 2.73l.15.1a2 2 0 0 1 1 1.72v.51a2 2 0 0 1-1 1.74l-.15.09a2 2 0 0 0-.73 2.73l.22.38a2 2 0 0 0 2.73.73l.15-.08a2 2 0 0 1 2 0l.43.25a2 2 0 0 1 1 1.73V20a2 2 0 0 0 2 2h.44a2 2 0 0 0 2-2v-.18a2 2 0 0 1 1-1.73l.43-.25a2 2 0 0 1 2 0l.15.08a2 2 0 0 0 2.73-.73l.22-.39a2 2 0 0 0-.73-2.73l-.15-.08a2 2 0 0 1-1-1.74v-.5a2 2 0 0 1 1-1.74l.15-.09a2 2 0 0 0 .73-2.73l-.22-.38a2 2 0 0 0-2.73-.73l-.15.08a2 2 0 0 1-2 0l-.43-.25a2 2 0 0 1-1-1.73V4a2 2 0 0 0-2-2z"/><circle cx="12" cy="12" r="3"/></svg></button>
       </div>
     </header>
 
@@ -136,7 +136,7 @@
 
       <!-- Empty state (shown when no devices paired) -->
       <div id="empty-state" class="empty-state hidden" aria-live="polite">
-        <div class="empty-icon" aria-hidden="true">&#128225;</div>
+        <div class="empty-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="14" height="20" x="5" y="2" rx="2" ry="2"/><path d="M12 18h.01"/></svg></div>
         <h3>Pair Your First Device</h3>
         <p>Scan a QR code to connect your devices instantly.</p>
         <button id="btn-pair-first" class="btn primary">Pair Device</button>
@@ -145,7 +145,7 @@
       <!-- Drop zone for file transfers -->
       <div id="drop-zone" class="drop-zone" role="button" tabindex="0"
            aria-label="Drop files here or click to browse">
-        <span class="drop-icon" aria-hidden="true">&#128190;</span>
+        <span class="drop-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" x2="12" y1="3" y2="15"/></svg></span>
         <span class="drop-label">Drop files here or click to browse</span>
         <input type="file" id="file-input" multiple hidden aria-hidden="true">
       </div>
@@ -154,15 +154,15 @@
       <div class="quick-actions" role="group" aria-label="Quick send actions">
         <button id="btn-clipboard"   class="quick-btn" title="Send clipboard contents"
                 aria-label="Send clipboard">
-          <span aria-hidden="true">&#128203;</span> Clipboard
+          <span aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><rect width="8" height="4" x="8" y="2" rx="1" ry="1"/><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/></svg></span> Clipboard
         </button>
         <button id="btn-screenshot"  class="quick-btn" title="Send screenshot of current tab"
                 aria-label="Send screenshot">
-          <span aria-hidden="true">&#128248;</span> Screen
+          <span aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M14.5 4h-5L7 7H4a2 2 0 0 0-2 2v9a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2V9a2 2 0 0 0-2-2h-3l-2.5-3z"/><circle cx="12" cy="13" r="3"/></svg></span> Screen
         </button>
         <button id="btn-tab-url"     class="quick-btn" title="Send URL of current tab"
                 aria-label="Send tab URL">
-          <span aria-hidden="true">&#128279;</span> Tab URL
+          <span aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg></span> Tab URL
         </button>
       </div>
 
