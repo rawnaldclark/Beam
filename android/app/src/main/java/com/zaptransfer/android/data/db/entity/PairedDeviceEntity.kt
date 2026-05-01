@@ -73,6 +73,30 @@ data class PairedDeviceEntity(
      */
     @ColumnInfo(name = "last_seen_at")
     val lastSeenAt: Long? = null,
+
+    /**
+     * Beam v2 long-lived symmetric key ring, stored as JSON because Room
+     * does not natively serialise nested generation maps. Schema:
+     *
+     * ```json
+     * {
+     *   "currentGeneration": 0,
+     *   "keys": {
+     *     "0": { "kAB": "<hex 32B>", "createdAt": 1745958123, "expiresAt": 0 }
+     *   }
+     * }
+     * ```
+     *
+     * `expiresAt` is 0 (= no expiry) for the live generation; populated when
+     * a newer generation supersedes this one (via key rotation), giving the
+     * old gen a 24-hour grace window before it stops decrypting.
+     *
+     * Empty string for paired devices created before Beam v2 — the
+     * destructive migration in [ZapDatabase] versions ≥ 2 forbids this in
+     * practice, but the type is non-null so the column has a default.
+     */
+    @ColumnInfo(name = "k_ab_ring_json", defaultValue = "")
+    val kABRingJson: String = "",
 ) {
     // ByteArray structural equality — Room serialises arrays as BLOBs; equals/hashCode
     // must compare contents, not references, to avoid spurious DiffUtil updates in the UI.
@@ -86,7 +110,8 @@ data class PairedDeviceEntity(
             x25519PublicKey.contentEquals(other.x25519PublicKey) &&
             ed25519PublicKey.contentEquals(other.ed25519PublicKey) &&
             pairedAt == other.pairedAt &&
-            lastSeenAt == other.lastSeenAt
+            lastSeenAt == other.lastSeenAt &&
+            kABRingJson == other.kABRingJson
     }
 
     override fun hashCode(): Int {
@@ -98,6 +123,7 @@ data class PairedDeviceEntity(
         result = 31 * result + ed25519PublicKey.contentHashCode()
         result = 31 * result + pairedAt.hashCode()
         result = 31 * result + (lastSeenAt?.hashCode() ?: 0)
+        result = 31 * result + kABRingJson.hashCode()
         return result
     }
 }

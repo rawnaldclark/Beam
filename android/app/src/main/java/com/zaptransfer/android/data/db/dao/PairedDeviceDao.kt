@@ -66,6 +66,17 @@ interface PairedDeviceDao {
     suspend fun updateLastSeen(deviceId: String, lastSeenAt: Long)
 
     /**
+     * Update only the Beam v2 K_AB generation ring (serialised JSON).
+     * Called by the transport on key rotation to swap in a new generation.
+     */
+    @Query("UPDATE paired_devices SET k_ab_ring_json = :kABRingJson WHERE device_id = :deviceId")
+    suspend fun updateKABRingJson(deviceId: String, kABRingJson: String)
+
+    /** Snapshot list — used by the v2 transport to try every K_AB on incoming frames. */
+    @Query("SELECT * FROM paired_devices")
+    suspend fun listAll(): List<PairedDeviceEntity>
+
+    /**
      * Delete a paired device (unpair).
      * Transfer history rows referencing this device have their device_id set to NULL
      * via the FK ON DELETE SET NULL rule.

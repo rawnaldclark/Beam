@@ -47,6 +47,12 @@ const SIGNALING_TYPES = new Set([
   MSG.TRANSFER_INIT,
   MSG.TRANSFER_ACCEPT,
   MSG.TRANSFER_REJECT,
+  // Beam v2: resend request, sender failure, and 3-message rotation handshake.
+  MSG.BEAM_V2_RESEND,
+  MSG.BEAM_V2_FAIL,
+  MSG.BEAM_V2_ROTATE_INIT,
+  MSG.BEAM_V2_ROTATE_ACK,
+  MSG.BEAM_V2_ROTATE_COMMIT,
 ]);
 
 // ---------------------------------------------------------------------------

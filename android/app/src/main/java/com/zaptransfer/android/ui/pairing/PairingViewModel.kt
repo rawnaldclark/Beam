@@ -4,6 +4,7 @@ import android.util.Base64
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.zaptransfer.android.crypto.BeamV2
 import com.zaptransfer.android.crypto.KeyManager
 import com.zaptransfer.android.data.db.entity.PairedDeviceEntity
 import com.zaptransfer.android.data.repository.DeviceRepository
@@ -342,6 +343,33 @@ class PairingViewModel @Inject constructor(
 
         viewModelScope.launch {
             try {
+                // Derive Beam v2 K_AB(gen=0). Both sides arrive at the same value because
+                // X25519 is symmetric and the salt is computed over a lex-sorted concat of
+                // both Ed25519 PKs; see BeamV2.deriveKAB and the JS counterpart in popup/pairing.js.
+                val keys = keyManager.getOrCreateKeys()
+                val kAB = BeamV2().deriveKAB(
+                    ourSk = keys.x25519Sk,
+                    peerPk = current.peerPayload.x25519Pk,
+                    ourEdPk = keys.ed25519Pk,
+                    peerEdPk = current.peerPayload.ed25519Pk,
+                    generation = 0,
+                )
+                val kABRingJson = JSONObject().apply {
+                    put("currentGeneration", 0)
+                    put(
+                        "keys",
+                        JSONObject().apply {
+                            put(
+                                "0",
+                                JSONObject().apply {
+                                    put("kAB", kAB.joinToString("") { "%02x".format(it) })
+                                    put("createdAt", System.currentTimeMillis())
+                                },
+                            )
+                        },
+                    )
+                }.toString()
+
                 val entity = PairedDeviceEntity(
                     deviceId = current.peerPayload.deviceId,
                     name = name.trim(),
@@ -350,6 +378,7 @@ class PairingViewModel @Inject constructor(
                     x25519PublicKey = current.peerPayload.x25519Pk,
                     ed25519PublicKey = current.peerPayload.ed25519Pk,
                     pairedAt = System.currentTimeMillis(),
+                    kABRingJson = kABRingJson,
                 )
 
                 deviceRepo.addDevice(entity)

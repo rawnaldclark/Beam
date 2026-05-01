@@ -1,6 +1,8 @@
 // External bootstrap for beam-crypto.test.html — MV3 CSP forbids inline <script>.
+// Beam v2 codec tests live in `test/beam-v2.test.js` (Node) and the Kotlin
+// side in `BeamV2Test.kt`; the in-browser harness now only verifies the
+// shared crypto primitives.
 import { runTests } from './beam-crypto.test.js';
-import { runSessionRegistryTests } from './session-registry.test.js';
 
 const summaryEl = document.getElementById('summary');
 const resultsEl = document.getElementById('results');
@@ -9,12 +11,9 @@ const resultsEl = document.getElementById('results');
   try {
     // Suite 1: byte-exact crypto vectors.
     const vectorsOut = await runTests();
-    // Suite 2: session registry state machine.
-    const regResults = await runSessionRegistryTests();
 
     const all = [
       { group: 'crypto vectors', results: vectorsOut.results },
-      { group: 'session registry', results: regResults },
     ];
 
     let total = 0;

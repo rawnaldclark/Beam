@@ -1,0 +1,71 @@
+{
+  "description": "Beam v2 cross-implementation interop vectors. See spec at docs/superpowers/specs/2026-04-30-beam-v2-design.md.",
+  "generated_by": "extension/scripts/gen-beam-v2-vectors.js",
+  "kab_derivation": [
+    {
+      "name": "alice_bob_gen0",
+      "a_x_sk": "0101010101010101010101010101010101010101010101010101010101010101",
+      "a_ed_pk": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "b_x_sk": "0202020202020202020202020202020202020202020202020202020202020202",
+      "b_ed_pk": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "a_x_pk": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+      "b_x_pk": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+      "generation": 0,
+      "rotate_nonce": null,
+      "expected_kab": "b26a2f3dfd5d021f64a629f84112d89c9e68b60620dcbaaf2a14551e1dbd4a94"
+    },
+    {
+      "name": "alice_bob_gen1_rotated",
+      "a_x_sk": "0101010101010101010101010101010101010101010101010101010101010101",
+      "a_ed_pk": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "b_x_sk": "0202020202020202020202020202020202020202020202020202020202020202",
+      "b_ed_pk": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "a_x_pk": "a4e09292b651c278b9772c569f5fa9bb13d906b46ab68c9df9dc2b4409f8a209",
+      "b_x_pk": "ce8d3ad1ccb633ec7b70c17814a5c76ecd029685050d344745ba05870e587d59",
+      "generation": 1,
+      "rotate_nonce": "50505050505050505050505050505050",
+      "expected_kab": "cfdc329a3d6aa678c7e142b8ef455a8a56d107a128f9353e5e2deb88be5541b7"
+    }
+  ],
+  "frames": [
+    {
+      "name": "clipboard_hello_beam",
+      "kab": "b26a2f3dfd5d021f64a629f84112d89c9e68b60620dcbaaf2a14551e1dbd4a94",
+      "frame": "424541320203000000112233445566778899aabbccddeeff000000000000000000000000000000000000000000000000303132333435363738393a3b3c3d3e3f404142434445464746b85499a5cdac62bfe85da30a5a87c388f89b3725e5cf1e833543a336552464f1e3bd2343c51e8d826b4c8650482a3e032dc3eee74a",
+      "expected_header": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "index": 0,
+        "isFinal": true,
+        "hasMeta": true,
+        "generation": 0
+      },
+      "expected_plaintext": "001a7b226b696e64223a22636c6970626f617264222c2276223a327d68656c6c6f206265616d"
+    },
+    {
+      "name": "file_metadata_note_txt",
+      "kab": "b26a2f3dfd5d021f64a629f84112d89c9e68b60620dcbaaf2a14551e1dbd4a94",
+      "frame": "424541320202000000112233445566778899aabbccddeeff000000000000000000000000000000000000000000000000303132333435363738393a3b3c3d3e3f404142434445464746fe5499a5cdac62bfe85da60f5f9283cbbb9f713dfbc14ac7661dbb1051256dbcf9fd284ddce5f1b7b8301c3f022158142428bec63f3cc7fd971b3112151972e071fe0477559203c83fcc372a9cc317cc5dba92157d71236be8675b8e32570af3e0a208544f847d6da84a0f41c0",
+      "expected_header": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "index": 0,
+        "isFinal": false,
+        "hasMeta": true,
+        "generation": 0
+      },
+      "expected_plaintext": "005c7b226b696e64223a2266696c65222c2276223a322c2266696c654e616d65223a226e6f74652e747874222c2266696c6553697a65223a352c226d696d65223a22746578742f706c61696e222c22746f74616c4368756e6b73223a317d"
+    },
+    {
+      "name": "file_chunk_hello",
+      "kab": "b26a2f3dfd5d021f64a629f84112d89c9e68b60620dcbaaf2a14551e1dbd4a94",
+      "frame": "424541320201000000112233445566778899aabbccddeeff000000010000000000000000000000000000000000000000303132333435363738393a3b3c3d3e3f40414243444546472ec743d7a1b55f114efb94afebcd1d7232f551ac57",
+      "expected_header": {
+        "transferId": "00112233445566778899aabbccddeeff",
+        "index": 1,
+        "isFinal": true,
+        "hasMeta": false,
+        "generation": 0
+      },
+      "expected_plaintext": "68656c6c6f"
+    }
+  ]
+}

@@ -45,6 +45,16 @@ private val BACKOFF_MS = longArrayOf(0, 500, 1_000, 2_000, 4_000, 8_000, 16_000,
  */
 private const val TRANSIENT_RETRY_DELAY_MS = 500L
 
+/**
+ * Maximum consecutive transient-classified failures before we escalate to
+ * the regular exponential backoff. Without this cap a permanent network
+ * outage (DNS server down, captive portal, blocked domain) was hammering
+ * DNS at 500 ms intervals indefinitely — burning battery and CPU for no
+ * gain. Six attempts ≈ 3 s of fast retry covers the common transient
+ * window (wifi handover, brief modem reset) without becoming abusive.
+ */
+private const val MAX_TRANSIENT_STREAK = 6
+
 /** Interval between heartbeat pings per spec §6.7. */
 private const val HEARTBEAT_INTERVAL_MS = 30_000L
 
@@ -268,6 +278,18 @@ class SignalingClient @Inject constructor(
     fun connect(relayUrl: String = RELAY_URL) {
         intentionalDisconnect = false
 
+        // Fast path: if we are already authenticated and the WebSocket is
+        // alive, do NOTHING. Without this guard, every `refreshPresence`
+        // fired on lifecycle ON_RESUME (e.g. returning from the system file
+        // picker) tore down the live socket, causing every in-flight
+        // sendFile / sendClipboard to fail with "Socket closed". The cancel-
+        // and-reconnect path below remains intact for the cold-reopen,
+        // backoff-sleeping, and post-network-transition cases it was
+        // designed for.
+        if (_connectionState.value is ConnectionState.Connected && webSocket != null) {
+            return
+        }
+
         // Cancel any existing attempt loop and its in-flight socket. This is
         // the CRITICAL path for cold-reopen-from-cached-process and for
         // app-foreground after a network transition: the previous loop may
@@ -377,6 +399,7 @@ class SignalingClient @Inject constructor(
      * @param relayUrl WSS URL of the relay server.
      */
     private suspend fun attemptConnect(relayUrl: String) {
+        var transientStreak = 0
         while (scope.isActive && !intentionalDisconnect) {
             val attempt = reconnectAttempt.get()
             val backoff = if (attempt < BACKOFF_MS.size) BACKOFF_MS[attempt] else BACKOFF_MS.last()
@@ -409,11 +432,20 @@ class SignalingClient @Inject constructor(
             // (DNS unavailable, connection aborted by OS) keep the attempt
             // counter pinned near zero and use a short fixed retry delay,
             // so a burst of background/foreground DNS failures doesn't
-            // push us into 8+ second exponential waits.
-            if (lastFailureWasTransient) {
-                Log.d(TAG, "Transient failure — fast retry without advancing backoff")
+            // push us into 8+ second exponential waits — but only up to
+            // MAX_TRANSIENT_STREAK consecutive attempts. Beyond that, the
+            // failure is no longer "transient"; escalate to the regular
+            // exponential backoff so a real outage doesn't pin a 500 ms
+            // retry loop forever.
+            if (lastFailureWasTransient && transientStreak < MAX_TRANSIENT_STREAK) {
+                transientStreak += 1
+                Log.d(TAG, "Transient failure — fast retry $transientStreak/$MAX_TRANSIENT_STREAK")
                 delay(TRANSIENT_RETRY_DELAY_MS)
             } else {
+                if (lastFailureWasTransient) {
+                    Log.w(TAG, "Transient failures exceeded $MAX_TRANSIENT_STREAK — escalating to exponential backoff")
+                }
+                transientStreak = 0
                 reconnectAttempt.compareAndSet(attempt, minOf(attempt + 1, BACKOFF_MS.size - 1))
             }
         }

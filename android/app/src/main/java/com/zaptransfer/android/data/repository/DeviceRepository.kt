@@ -158,6 +158,21 @@ class DeviceRepository @Inject constructor(
     }
 
     /**
+     * Snapshot of all paired devices. Used by the Beam v2 transport on
+     * incoming frames so it can try each peer's K_AB until one decrypts.
+     */
+    suspend fun listDevices(): List<PairedDeviceEntity> = dao.listAll()
+
+    /**
+     * Update only the Beam v2 K_AB ring JSON for a device. Used when
+     * rotation completes (rotate-commit): the transport hands us a new
+     * ring shape and we persist it without rewriting the rest of the row.
+     */
+    suspend fun updateKABRing(deviceId: String, kABRingJson: String) {
+        dao.updateKABRingJson(deviceId, kABRingJson)
+    }
+
+    /**
      * Returns true if there are no paired devices.
      *
      * Used by the Device Hub to decide whether to show the onboarding empty state

@@ -49,7 +49,11 @@ object DatabaseModule {
             context,
             ZapDatabase::class.java,
             "zap_db"
-        ).build()
+        )
+            // Pre-launch: schema changes wipe the local store. After 1.0
+            // launch this MUST be replaced with explicit Migration objects.
+            .fallbackToDestructiveMigration()
+            .build()
     }
 
     /**

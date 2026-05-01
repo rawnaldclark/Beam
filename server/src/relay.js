@@ -159,22 +159,24 @@ export class DataRelay {
    * @param {import('ws').WebSocket} fromWs - Sender's WebSocket connection.
    */
   relayBinary(fromDeviceId, data, fromWs) {
+    const chunkSize = Buffer.isBuffer(data) ? data.length : data.byteLength;
+
     // --- Step 1: Find session ---
     const session = this._sessionForDevice(fromDeviceId);
     if (!session) {
-      // No active session — silently discard (device may have sent a late frame
-      // after a release; flooding protection handled by rate limiter in Task 7).
+      console.log(`[relay] binary DROPPED from=${fromDeviceId} size=${chunkSize} reason=no-session`);
       return;
     }
 
     // Ensure both sides are bound before relaying
     if (!session.senderWs || !session.receiverWs) {
+      console.log(`[relay] binary DROPPED from=${fromDeviceId} size=${chunkSize} reason=peer-not-bound senderWs=${!!session.senderWs} receiverWs=${!!session.receiverWs}`);
       return;
     }
 
     // --- Step 2: Byte-cap check ---
-    const chunkSize = Buffer.isBuffer(data) ? data.length : data.byteLength;
     if (session.bytesRelayed + chunkSize > SESSION_LIMIT) {
+      console.log(`[relay] binary DROPPED from=${fromDeviceId} size=${chunkSize} reason=session-limit`);
       if (this._gateway) {
         this._gateway.sendTo(fromWs, {
           type:    MSG.ERROR,
@@ -187,19 +189,16 @@ export class DataRelay {
     // --- Step 3: Identify peer ---
     const isSender = fromDeviceId === session.senderDeviceId;
     const peerWs   = isSender ? session.receiverWs : session.senderWs;
+    const peerDeviceId = isSender ? session.receiverDeviceId : session.senderDeviceId;
 
     // --- Step 4: Backpressure check ---
-    // If the peer's write buffer is above the high-water mark, pause the sender
-    // at the TCP level so the Node.js event loop stops reading from that socket.
-    // Register a drain handler to resume once the buffer falls below the low-water
-    // mark, providing hysteresis.
     if (peerWs.bufferedAmount > BACKPRESSURE_HIGH) {
       this._applyBackpressure(fromWs, peerWs);
     }
 
     // --- Step 5: Forward frame ---
-    // Use binary send (options object signals ws to treat payload as binary).
     peerWs.send(data, { binary: true });
+    console.log(`[relay] binary FWD from=${fromDeviceId} → ${peerDeviceId} size=${chunkSize}`);
 
     // --- Step 6: Track bytes ---
     session.bytesRelayed += chunkSize;
@@ -259,6 +258,25 @@ export class DataRelay {
         bytesRelayed:     0,
         rendezvousId,
       };
+
+      // Beam v2: the receiver does not bind — it learns the transferId only
+      // by decrypting the first frame. Pre-populate `receiverWs` from the
+      // gateway's authenticated-device map so the very first binary frame
+      // forwards instead of being dropped. Backwards-compatible with v1
+      // because v1's second-side bind would simply overwrite this with the
+      // same WS reference.
+      let proactiveLookup = 'no-gateway';
+      if (this._gateway && this._gateway.devices) {
+        const peerWs = this._gateway.devices.get(targetDeviceId);
+        if (peerWs && peerWs !== ws) {
+          session.receiverWs = peerWs;
+          proactiveLookup = 'found';
+        } else {
+          proactiveLookup = peerWs ? 'self-target' : 'not-online';
+        }
+      }
+      console.log(`[relay] BIND new transferId=${transferId} from=${deviceId} → ${targetDeviceId} proactive=${proactiveLookup}`);
+
       this.sessions.set(transferId, session);
     } else {
       // Second device to bind — complete the session.
@@ -277,6 +295,7 @@ export class DataRelay {
         session.receiverDeviceId = deviceId;
         session.receiverWs       = ws;
       }
+      console.log(`[relay] BIND existing transferId=${transferId} from=${deviceId} (now sender=${!!session.senderWs} receiver=${!!session.receiverWs})`);
     }
 
     // Maintain reverse-lookup for both participants

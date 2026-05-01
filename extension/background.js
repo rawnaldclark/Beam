@@ -31,7 +31,7 @@
 import { MSG }                  from './shared/message-types.js';
 import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
 import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted } from './background-relay.js';
-import { beamErrorMessage } from './crypto/session-registry.js';
+import { beamErrorMessage } from './crypto/beam-errors.js';
 
 // ---------------------------------------------------------------------------
 // Badge state — tracks a pending "failure" clear so we can dismiss it on the
@@ -53,25 +53,23 @@ let badgeShowingFailure = false;
 /**
  * On install: register the keepalive alarm so the offscreen document is
  * never left dormant for longer than one Chrome alarm period (~1 minute).
+ *
+ * Boot-time work (offscreen doc, relay auto-start, context menus) is
+ * intentionally NOT duplicated here — the top-level statements below run
+ * on every SW initialisation, including the one immediately after install
+ * or update. Calling autoStartRelayIfPaired() from both paths produced
+ * two concurrent startPairingListener invocations and a racing
+ * orphan-socket failure.
  */
 chrome.runtime.onInstalled.addListener(() => {
   const periodInMinutes = Math.max(1, KEEPALIVE_INTERVAL_MS / 60_000);
   chrome.alarms.create('keepalive', { periodInMinutes });
-  autoStartRelayIfPaired();
-  rebuildContextMenusFromStorage();
 });
 
-/**
- * On browser startup: ensure the offscreen document is running so the
- * extension is ready before the user interacts with the popup.
- */
-chrome.runtime.onStartup.addListener(() => {
-  ensureOffscreen();
-  autoStartRelayIfPaired();
-  rebuildContextMenusFromStorage();
-});
-
-// Auto-start on SW initialization (fires every time SW wakes up)
+// Boot work — fires on every SW initialisation (install, browser startup,
+// and event-driven SW wake). startPairingListener is now single-flight
+// guarded, but we still keep this single call site to make the intent
+// obvious and avoid extra work.
 ensureOffscreen(); // boot the offscreen doc so it opens the keepalive port
 autoStartRelayIfPaired();
 rebuildContextMenusFromStorage();
@@ -248,7 +246,9 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
 
     // ── Pairing relay (runs in SW so it survives popup close) ────────────────
     case 'START_PAIRING_LISTENER': {
-      console.log('[Beam SW] START_PAIRING_LISTENER received, deviceId:', msg.payload?.deviceId);
+      console.log('[Beam SW] START_PAIRING_LISTENER received, deviceId:', msg.payload?.deviceId,
+        'ed25519Sk.len=', msg.payload?.ed25519Sk?.length,
+        'ed25519Pk.len=', msg.payload?.ed25519Pk?.length);
       const { deviceId, ed25519Sk, ed25519Pk } = msg.payload;
       startPairingListener(deviceId, ed25519Sk, ed25519Pk)
         .then(() => {
@@ -256,8 +256,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
           sendResponse({ ok: true });
         })
         .catch(err => {
-          console.error('[Beam SW] Pairing listener failed:', err.message);
-          sendResponse({ ok: false, error: err.message });
+          // Log full error object so empty/missing .message no longer hides
+          // the underlying cause; also include stack when available.
+          console.error('[Beam SW] Pairing listener failed:', err, '| stack:', err?.stack);
+          sendResponse({ ok: false, error: String(err?.message || err || 'unknown') });
         });
       return true; // async sendResponse
     }

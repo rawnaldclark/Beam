@@ -11,8 +11,8 @@ import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
-import com.zaptransfer.android.crypto.BeamCryptoContext
-import com.zaptransfer.android.crypto.BeamSessionRegistry
+import com.zaptransfer.android.crypto.BeamV2Transport
+import com.zaptransfer.android.crypto.BeamV2Wiring
 import com.zaptransfer.android.data.db.dao.ClipboardDao
 import com.zaptransfer.android.data.db.dao.TransferHistoryDao
 import com.zaptransfer.android.data.db.entity.ClipboardEntryEntity
@@ -142,17 +142,62 @@ class DeviceHubViewModel @Inject constructor(
     private val clipboardDao: ClipboardDao,
     private val signalingClient: SignalingClient,
     private val userPreferences: UserPreferences,
-    private val beamCrypto: BeamCryptoContext,
+    private val beamV2Wiring: BeamV2Wiring,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
+    init {
+        // Register the in-app delivery surface with the v2 wiring. This is
+        // the single place transport-decoded clipboards/files reach the UI.
+        beamV2Wiring.setDelivery(object : BeamV2Wiring.Delivery {
+            override suspend fun onClipboardReceived(content: String, fromDeviceId: String) {
+                deliverIncomingClipboard(content, fromDeviceId)
+            }
+            override suspend fun onFileReceived(args: BeamV2Transport.FileDelivery) {
+                deliverIncomingFileV2(args)
+            }
+            override fun onReceiveError(transferIdHex: String, code: String) {
+                Log.w(TAG, "Beam v2 receive error: $code (id=$transferIdHex)")
+                _toastEvents.tryEmit("Receive failed — $code")
+            }
+        })
+    }
+
     /**
-     * Pending sender-side waiters for transfer-accept messages, keyed by
-     * the lowercase hex transferId. Populated by sendClipboardEncrypted()
-     * and completed by the relay listener when the peer accepts or rejects.
+     * Delivery callback for v2 file transfers. Saves to public Downloads
+     * via MediaStore — required since Android 10 (scoped storage). Direct
+     * `java.io.File` writes to `Environment.DIRECTORY_DOWNLOADS` fail
+     * with `EACCES` on every modern device.
      */
-    private val pendingAccepts =
-        java.util.concurrent.ConcurrentHashMap<String, CompletableDeferred<BeamSessionRegistry.Session>>()
+    private suspend fun deliverIncomingFileV2(args: BeamV2Transport.FileDelivery) {
+        try {
+            val values = ContentValues().apply {
+                put(MediaStore.Downloads.DISPLAY_NAME, args.fileName)
+                put(MediaStore.Downloads.MIME_TYPE, args.mimeType)
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.Downloads.IS_PENDING, 1)
+                }
+            }
+            val uri = appContext.contentResolver.insert(
+                MediaStore.Downloads.EXTERNAL_CONTENT_URI, values,
+            ) ?: throw Exception("Failed to create MediaStore entry")
+
+            appContext.contentResolver.openOutputStream(uri)?.use { it.write(args.bytes) }
+                ?: throw Exception("Failed to open output stream for $uri")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                values.clear()
+                values.put(MediaStore.Downloads.IS_PENDING, 0)
+                appContext.contentResolver.update(uri, values, null, null)
+            }
+
+            _toastEvents.tryEmit("Saved ${args.fileName} to Downloads")
+            Log.i(TAG, "Beam v2 file saved: ${args.fileName} (${args.fileSize} bytes)")
+        } catch (e: Exception) {
+            Log.e(TAG, "deliverIncomingFileV2 failed: ${e.message}", e)
+            _toastEvents.tryEmit("File save failed: ${e.message}")
+        }
+    }
 
     /** Shared flow for one-shot UI events (e.g., toast messages). */
     private val _toastEvents = MutableSharedFlow<String>(extraBufferCapacity = 5)
@@ -170,45 +215,24 @@ class DeviceHubViewModel @Inject constructor(
      * clipboard-transfer / file-offer / file-complete handlers were removed
      * in Task 9 — every transfer now goes through the Beam E2E path.
      */
+    /**
+     * Listener for relay text messages this ViewModel still cares about
+     * (presence updates). Binary frames and Beam v2 JSON are handled by
+     * [BeamV2Wiring]'s dedicated listener; everything else is dropped.
+     */
     private val relayListener = object : SignalingListener {
         override fun onMessage(message: RelayMessage) {
-            when (message) {
-                is RelayMessage.Binary -> {
-                    val bytes = message.data
-                    if (!isBeamFrame(bytes)) {
-                        Log.w(TAG, "dropped non-Beam binary frame (${bytes.size} bytes)")
-                        _toastEvents.tryEmit("Received transfer could not be decrypted.")
-                        return
-                    }
-                    viewModelScope.launch { handleIncomingBeamFrame(bytes) }
+            if (message !is RelayMessage.Text) return
+            when (message.json.optString("type")) {
+                "peer-online" -> {
+                    val peerId = message.json.optString("deviceId", "")
+                    if (peerId.isNotEmpty()) deviceRepo.handlePresence(peerId, true)
                 }
-                is RelayMessage.Text -> {
-                    val json = message.json
-                    when (json.optString("type")) {
-                        "transfer-init"   -> viewModelScope.launch { handleTransferInit(json) }
-                        "transfer-accept" -> viewModelScope.launch { handleTransferAccept(json) }
-                        "transfer-reject" -> {
-                            Log.w(TAG, "transfer-reject: ${json.optString("errorCode")}")
-                            viewModelScope.launch { handleTransferReject(json) }
-                        }
-                        "file-complete" -> {
-                            // Advisory only — completion is driven by chunksReceived
-                            // == totalChunks inside handleIncomingBeamFileFrame.
-                        }
-                        "peer-online" -> {
-                            val peerId = json.optString("deviceId", "")
-                            if (peerId.isNotEmpty()) {
-                                deviceRepo.handlePresence(peerId, true)
-                            }
-                        }
-                        "peer-offline" -> {
-                            val peerId = json.optString("deviceId", "")
-                            if (peerId.isNotEmpty()) {
-                                deviceRepo.handlePresence(peerId, false)
-                            }
-                        }
-                    }
+                "peer-offline" -> {
+                    val peerId = message.json.optString("deviceId", "")
+                    if (peerId.isNotEmpty()) deviceRepo.handlePresence(peerId, false)
                 }
+                else -> { /* ignored — handled elsewhere */ }
             }
         }
     }
@@ -359,12 +383,12 @@ class DeviceHubViewModel @Inject constructor(
                 sendClipboardEncrypted(targetDeviceId, text)
                 val preview = if (text.length > 40) text.take(37) + "..." else text
                 _toastEvents.tryEmit("Clipboard sent (encrypted): $preview")
-            } catch (e: BeamSessionRegistry.HandshakeException) {
+            } catch (e: com.zaptransfer.android.crypto.BeamV2Exception) {
                 Log.e(TAG, "Encrypted clipboard send failed: ${e.code}", e)
-                _toastEvents.tryEmit("Send failed — ${BeamSessionRegistry.ErrorMessages.forCode(e.code)}")
+                _toastEvents.tryEmit("Send failed — ${e.code}")
             } catch (e: Exception) {
                 Log.e(TAG, "Encrypted clipboard send failed", e)
-                _toastEvents.tryEmit("Send failed — ${BeamSessionRegistry.ErrorMessages.forCode(BeamSessionRegistry.ErrorCodes.INTERNAL)}")
+                _toastEvents.tryEmit("Send failed")
             }
         }
     }
@@ -374,402 +398,13 @@ class DeviceHubViewModel @Inject constructor(
     // -------------------------------------------------------------------------
 
     /**
-     * Run the Beam Triple-DH handshake with [targetDeviceId] and send [text]
-     * as an encrypted clipboard payload over the binary channel.
+     * Send `text` as an encrypted clipboard payload via the Beam v2 transport.
+     * One stateless AEAD frame; receiver decrypts on arrival, no handshake.
      */
     private suspend fun sendClipboardEncrypted(targetDeviceId: String, text: String) {
-        val peerStaticPk = beamCrypto.peerStaticPk(targetDeviceId)
-            ?: throw BeamSessionRegistry.HandshakeException(
-                BeamSessionRegistry.ErrorCodes.INTERNAL,
-                "no static key for peer $targetDeviceId",
-            )
-        val rendezvousId = targetDeviceId // Chrome's deviceId is the rendezvous
-
-        val init = beamCrypto.registry.startInit(
-            peerId = targetDeviceId,
-            peerStaticPk = peerStaticPk,
-            kind = BeamSessionRegistry.Kind.CLIPBOARD,
-        )
-        // Wire encoding: 16 raw bytes → base64url. MUST match Chrome exactly
-        // so the relay pairs relay-bind strings and the peer looks up the
-        // session by the same key.
-        val transferIdWire = base64UrlFromBytes(init.wireMessage.transferId)
-        val waiter = CompletableDeferred<BeamSessionRegistry.Session>()
-        pendingAccepts[transferIdWire] = waiter
-
-        signalingClient.send(JSONObject().apply {
-            put("type", "transfer-init")
-            put("v", init.wireMessage.v)
-            put("targetDeviceId", targetDeviceId)
-            put("rendezvousId", rendezvousId)
-            put("transferId", transferIdWire)
-            put("kind", init.wireMessage.kind.wire)
-            put("ephPkA", base64UrlFromBytes(init.wireMessage.ephPkA))
-            put("salt", base64UrlFromBytes(init.wireMessage.salt))
-        })
-        signalingClient.send(JSONObject().apply {
-            put("type", "relay-bind")
-            put("transferId", transferIdWire)
-            put("targetDeviceId", targetDeviceId)
-            put("rendezvousId", rendezvousId)
-        })
-
-        val session = try {
-            withTimeout(10_000) { waiter.await() }
-        } catch (e: TimeoutCancellationException) {
-            pendingAccepts.remove(transferIdWire)
-            signalingClient.send(JSONObject().apply {
-                put("type", "transfer-reject")
-                put("targetDeviceId", targetDeviceId)
-                put("rendezvousId", rendezvousId)
-                put("transferId", transferIdWire)
-                put("errorCode", BeamSessionRegistry.ErrorCodes.TIMEOUT)
-            })
-            signalingClient.send(JSONObject().apply {
-                put("type", "relay-release")
-                put("transferId", transferIdWire)
-            })
-            beamCrypto.registry.destroy(init.session.transferId, BeamSessionRegistry.ErrorCodes.TIMEOUT)
-            throw BeamSessionRegistry.HandshakeException(
-                BeamSessionRegistry.ErrorCodes.TIMEOUT,
-                "handshake timed out waiting for transfer-accept",
-            )
-        }
-
-        try {
-            val plaintext = text.toByteArray(Charsets.UTF_8)
-            val chunkKey = session.chunkKey
-                ?: throw IllegalStateException("chunkKey null after handshake")
-            val transcript = session.transcript
-                ?: throw IllegalStateException("transcript null after handshake")
-            val ciphertext = beamCrypto.cipher.encryptClipboard(plaintext, chunkKey, transcript)
-            val frame = encodeBeamFrame(session.transferId, 0, ciphertext)
-            signalingClient.sendBinary(frame)
-        } finally {
-            signalingClient.send(JSONObject().apply {
-                put("type", "relay-release")
-                put("transferId", transferIdWire)
-            })
-            beamCrypto.registry.destroy(session.transferId)
-        }
+        beamV2Wiring.transport.sendClipboard(targetDeviceId, text)
     }
 
-    /**
-     * Handle an incoming transfer-init message from the peer. Derives session
-     * keys, responds with transfer-accept + relay-bind, and parks the session
-     * in ACTIVE state awaiting the encrypted binary frame.
-     */
-    private suspend fun handleTransferInit(json: JSONObject) {
-        val fromDeviceId = json.optString("fromDeviceId", json.optString("deviceId", ""))
-        val rendezvousId = json.optString("rendezvousId", fromDeviceId)
-        val transferIdWire = json.optString("transferId", "")
-        val peerStaticPk = beamCrypto.peerStaticPk(fromDeviceId)
-        if (peerStaticPk == null) {
-            Log.w(TAG, "transfer-init: no peerStaticPk for $fromDeviceId — rejecting")
-            sendTransferReject(fromDeviceId, rendezvousId, transferIdWire, BeamSessionRegistry.ErrorCodes.INTERNAL)
-            return
-        }
-        val kindStr = json.optString("kind", "")
-        val kind = BeamSessionRegistry.Kind.fromWire(kindStr) ?: run {
-            sendTransferReject(fromDeviceId, rendezvousId, transferIdWire, BeamSessionRegistry.ErrorCodes.INTERNAL)
-            return
-        }
-        val wire = try {
-            BeamSessionRegistry.TransferInitMessage(
-                v = json.optInt("v", 0),
-                transferId = base64UrlToBytes(transferIdWire),
-                kind = kind,
-                ephPkA = base64UrlToBytes(json.optString("ephPkA", "")),
-                salt = base64UrlToBytes(json.optString("salt", "")),
-            )
-        } catch (e: Exception) {
-            Log.e(TAG, "transfer-init wire decode error", e)
-            sendTransferReject(fromDeviceId, rendezvousId, transferIdWire, BeamSessionRegistry.ErrorCodes.INTERNAL)
-            return
-        }
-        try {
-            val accept = beamCrypto.registry.onInit(fromDeviceId, peerStaticPk, wire)
-            val replyIdWire = base64UrlFromBytes(accept.wireMessage.transferId)
-            signalingClient.send(JSONObject().apply {
-                put("type", "transfer-accept")
-                put("v", accept.wireMessage.v)
-                put("targetDeviceId", fromDeviceId)
-                put("rendezvousId", rendezvousId)
-                put("transferId", replyIdWire)
-                put("ephPkB", base64UrlFromBytes(accept.wireMessage.ephPkB))
-            })
-            signalingClient.send(JSONObject().apply {
-                put("type", "relay-bind")
-                put("transferId", replyIdWire)
-                put("targetDeviceId", fromDeviceId)
-                put("rendezvousId", rendezvousId)
-            })
-        } catch (e: BeamSessionRegistry.HandshakeException) {
-            Log.w(TAG, "transfer-init rejected: ${e.code}")
-            sendTransferReject(fromDeviceId, rendezvousId, transferIdWire, e.code)
-        } catch (e: Exception) {
-            Log.e(TAG, "transfer-init handling error", e)
-            sendTransferReject(fromDeviceId, rendezvousId, transferIdWire, BeamSessionRegistry.ErrorCodes.INTERNAL)
-        }
-    }
-
-    /**
-     * Handle an incoming transfer-accept: finish sender-side Triple-DH and
-     * resolve the pending sendClipboardEncrypted waiter.
-     */
-    private fun handleTransferAccept(json: JSONObject) {
-        val fromDeviceId = json.optString("fromDeviceId", json.optString("deviceId", ""))
-        val transferIdWire = json.optString("transferId", "")
-        try {
-            val wire = BeamSessionRegistry.TransferAcceptMessage(
-                v = json.optInt("v", 0),
-                transferId = base64UrlToBytes(transferIdWire),
-                ephPkB = base64UrlToBytes(json.optString("ephPkB", "")),
-            )
-            val session = beamCrypto.registry.onAccept(fromDeviceId, wire)
-            pendingAccepts.remove(transferIdWire)?.complete(session)
-        } catch (e: Exception) {
-            Log.e(TAG, "transfer-accept handling error", e)
-            pendingAccepts.remove(transferIdWire)?.completeExceptionally(e)
-        }
-    }
-
-    /**
-     * Handle an incoming transfer-reject.
-     */
-    private fun handleTransferReject(json: JSONObject) {
-        val transferIdWire = json.optString("transferId", "")
-        val code = json.optString("errorCode", BeamSessionRegistry.ErrorCodes.INTERNAL)
-        val err = BeamSessionRegistry.HandshakeException(code, "peer rejected transfer: $code")
-        pendingAccepts.remove(transferIdWire)?.completeExceptionally(err)
-        try {
-            beamCrypto.registry.destroy(base64UrlToBytes(transferIdWire), code)
-        } catch (_: Exception) { /* ignore */ }
-    }
-
-    /**
-     * Decrypt and deliver an incoming Beam binary frame. Routes by the
-     * active session's kind.
-     */
-    private suspend fun handleIncomingBeamFrame(bytes: ByteArray) {
-        val frame = decodeBeamFrame(bytes) ?: return
-        val session = beamCrypto.registry.getByTransferId(frame.transferId) ?: run {
-            Log.w(TAG, "Beam frame for unknown session ${bytesToHex(frame.transferId)}")
-            return
-        }
-        if (session.state != BeamSessionRegistry.State.ACTIVE) {
-            Log.w(TAG, "Beam frame for inactive session (state=${session.state})")
-            return
-        }
-        beamCrypto.registry.touch(session)
-
-        when (session.kind) {
-            BeamSessionRegistry.Kind.CLIPBOARD -> {
-                try {
-                    val chunkKey = session.chunkKey ?: return
-                    val transcript = session.transcript ?: return
-                    val plaintext = beamCrypto.cipher.decryptClipboard(frame.ciphertext, chunkKey, transcript)
-                    val content = String(plaintext, Charsets.UTF_8)
-                    deliverIncomingClipboard(content, session.peerId)
-                } catch (e: Exception) {
-                    Log.e(TAG, "clipboard decrypt failed", e)
-                } finally {
-                    beamCrypto.registry.destroy(session.transferId)
-                }
-            }
-            BeamSessionRegistry.Kind.FILE -> handleIncomingBeamFileFrame(session, frame.index, frame.ciphertext)
-        }
-    }
-
-    /**
-     * Per-session accumulation state for an incoming encrypted file.
-     * Keyed by transferId hex in [pendingBeamFiles].
-     */
-    private data class IncomingBeamFile(
-        val fileName: String,
-        val fileSize: Int,
-        val mimeType: String,
-        val totalChunks: Int,
-        val chunks: MutableList<ByteArray> = mutableListOf(),
-    )
-
-    private val pendingBeamFiles =
-        java.util.concurrent.ConcurrentHashMap<String, IncomingBeamFile>()
-
-    private suspend fun handleIncomingBeamFileFrame(
-        session: BeamSessionRegistry.Session,
-        index: Int,
-        ciphertext: ByteArray,
-    ) {
-        val transcript = session.transcript ?: return
-        val metaKey = session.metaKey ?: return
-        val chunkKey = session.chunkKey ?: return
-        val idHex = bytesToHex(session.transferId)
-
-        try {
-            if (index == 0) {
-                // Encrypted metadata envelope.
-                val metaBytes = beamCrypto.cipher.decryptFileMetadata(ciphertext, metaKey, transcript)
-                val metaJson = JSONObject(String(metaBytes, Charsets.UTF_8))
-                val fileName = metaJson.optString("fileName", "file")
-                // Read as Long to avoid silent Int overflow for attacker-supplied
-                // values above 2^31. The validated value (<= MAX_FILE_SIZE_BYTES)
-                // fits in Int safely when stored in IncomingBeamFile below.
-                val fileSize = metaJson.optLong("fileSize", 0L)
-                val mimeType = metaJson.optString("mime", "application/octet-stream")
-                val totalChunks = metaJson.optInt("totalChunks", 0)
-                validateFileMetadata(fileName, fileSize, mimeType, totalChunks)?.let { error ->
-                    // Rejection path: destroy the session with DECRYPT_FAIL and
-                    // ensure NO entry is added to pendingBeamFiles. A malicious
-                    // paired peer declaring a multi-GB transfer or thousands of
-                    // chunks is rejected here, before any allocation.
-                    Log.w(TAG, "rejected file metadata: $error")
-                    beamCrypto.registry.destroy(session.transferId, BeamSessionRegistry.ErrorCodes.DECRYPT_FAIL)
-                    return
-                }
-                session.totalChunks = totalChunks
-                pendingBeamFiles[idHex] = IncomingBeamFile(
-                    fileName = fileName,
-                    // fileSize Long input validated <= MAX_FILE_SIZE_BYTES fits in Int safely.
-                    fileSize = fileSize.toInt(),
-                    mimeType = mimeType,
-                    totalChunks = totalChunks,
-                )
-                return
-            }
-
-            val state = pendingBeamFiles[idHex]
-            if (state == null) {
-                Log.e(TAG, "file chunk arrived before metadata envelope")
-                beamCrypto.registry.destroy(session.transferId, BeamSessionRegistry.ErrorCodes.DECRYPT_FAIL)
-                return
-            }
-            if (index > state.totalChunks) {
-                Log.e(TAG, "file chunk index $index exceeds totalChunks ${state.totalChunks}")
-                pendingBeamFiles.remove(idHex)
-                beamCrypto.registry.destroy(session.transferId, BeamSessionRegistry.ErrorCodes.DECRYPT_FAIL)
-                return
-            }
-
-            val plain = beamCrypto.cipher.decryptFileChunk(
-                ciphertext = ciphertext,
-                chunkKey = chunkKey,
-                index = index,
-                totalChunks = state.totalChunks,
-                transcript = transcript,
-            )
-            state.chunks.add(plain)
-
-            if (state.chunks.size == state.totalChunks) {
-                // All chunks received — assemble and hand off to legacy delivery UX.
-                val totalLen = state.chunks.sumOf { it.size }
-                val combined = ByteArray(totalLen)
-                var off = 0
-                for (c in state.chunks) {
-                    c.copyInto(combined, off)
-                    off += c.size
-                }
-                if (totalLen != state.fileSize) {
-                    Log.e(TAG, "file size mismatch: expected ${state.fileSize}, got $totalLen")
-                    pendingBeamFiles.remove(idHex)
-                    beamCrypto.registry.destroy(session.transferId, BeamSessionRegistry.ErrorCodes.DECRYPT_FAIL)
-                    return
-                }
-                pendingBeamFiles.remove(idHex)
-                val ft = FileTransferState(
-                    transferId = idHex,
-                    fileName = state.fileName,
-                    fileSize = state.fileSize,
-                    mimeType = state.mimeType,
-                    fromDeviceId = session.peerId,
-                ).also { it.chunks.add(combined); it.bytesReceived = totalLen }
-                handleReceivedFileComplete(ft)
-                beamCrypto.registry.destroy(session.transferId)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "file frame decrypt failed at index $index", e)
-            pendingBeamFiles.remove(idHex)
-            beamCrypto.registry.destroy(session.transferId, BeamSessionRegistry.ErrorCodes.DECRYPT_FAIL)
-        }
-    }
-
-    private fun sendTransferReject(
-        targetDeviceId: String,
-        rendezvousId: String,
-        transferIdHex: String,
-        errorCode: String,
-    ) {
-        signalingClient.send(JSONObject().apply {
-            put("type", "transfer-reject")
-            put("targetDeviceId", targetDeviceId)
-            put("rendezvousId", rendezvousId)
-            put("transferId", transferIdHex)
-            put("errorCode", errorCode)
-        })
-    }
-
-    // -- Beam frame codec -----------------------------------------------------
-
-    private val BEAM_MAGIC = byteArrayOf(0x42, 0x45, 0x41, 0x4d) // "BEAM"
-
-    private fun isBeamFrame(bytes: ByteArray): Boolean =
-        bytes.size >= 24 &&
-            bytes[0] == BEAM_MAGIC[0] &&
-            bytes[1] == BEAM_MAGIC[1] &&
-            bytes[2] == BEAM_MAGIC[2] &&
-            bytes[3] == BEAM_MAGIC[3]
-
-    private fun encodeBeamFrame(transferId: ByteArray, index: Int, ciphertext: ByteArray): ByteArray {
-        require(transferId.size == 16) { "transferId must be 16 bytes" }
-        val out = ByteArray(24 + ciphertext.size)
-        System.arraycopy(BEAM_MAGIC, 0, out, 0, 4)
-        System.arraycopy(transferId, 0, out, 4, 16)
-        out[20] = ((index ushr 24) and 0xff).toByte()
-        out[21] = ((index ushr 16) and 0xff).toByte()
-        out[22] = ((index ushr 8) and 0xff).toByte()
-        out[23] = (index and 0xff).toByte()
-        System.arraycopy(ciphertext, 0, out, 24, ciphertext.size)
-        return out
-    }
-
-    private data class BeamFrame(val transferId: ByteArray, val index: Int, val ciphertext: ByteArray)
-
-    private fun decodeBeamFrame(bytes: ByteArray): BeamFrame? {
-        if (!isBeamFrame(bytes)) return null
-        val transferId = bytes.copyOfRange(4, 20)
-        val index =
-            ((bytes[20].toInt() and 0xff) shl 24) or
-                ((bytes[21].toInt() and 0xff) shl 16) or
-                ((bytes[22].toInt() and 0xff) shl 8) or
-                (bytes[23].toInt() and 0xff)
-        val ciphertext = bytes.copyOfRange(24, bytes.size)
-        return BeamFrame(transferId, index, ciphertext)
-    }
-
-    private fun bytesToHex(b: ByteArray): String {
-        val sb = StringBuilder(b.size * 2)
-        for (x in b) sb.append(String.format("%02x", x.toInt() and 0xff))
-        return sb.toString()
-    }
-
-    /**
-     * Encode raw bytes as unpadded base64url. This is the canonical on-the-wire
-     * encoding for every transferId and ephemeral-public-key field in the Beam
-     * E2E handshake, matching the Chrome extension byte-for-byte.
-     */
-    private fun base64UrlFromBytes(b: ByteArray): String {
-        return android.util.Base64.encodeToString(
-            b,
-            android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
-        )
-    }
-
-    private fun base64UrlToBytes(s: String): ByteArray {
-        return android.util.Base64.decode(
-            s,
-            android.util.Base64.URL_SAFE or android.util.Base64.NO_PADDING or android.util.Base64.NO_WRAP,
-        )
-    }
 
     /**
      * The 10 most recent clipboard entries, ordered newest-first.
@@ -842,20 +477,20 @@ class DeviceHubViewModel @Inject constructor(
                 Log.d(TAG, "Sending encrypted file: $fileName (${bytes.size} bytes) to $targetDeviceId")
                 sendFileEncrypted(targetDeviceId, fileName, mimeType, bytes)
                 _toastEvents.tryEmit("Sent $fileName (encrypted)")
-            } catch (e: BeamSessionRegistry.HandshakeException) {
+            } catch (e: com.zaptransfer.android.crypto.BeamV2Exception) {
                 Log.e(TAG, "Encrypted file send failed: ${e.code}", e)
-                _toastEvents.tryEmit("File send failed — ${BeamSessionRegistry.ErrorMessages.forCode(e.code)}")
+                _toastEvents.tryEmit("File send failed — ${e.code}")
             } catch (e: Exception) {
                 Log.e(TAG, "sendFile failed: ${e.message}", e)
-                _toastEvents.tryEmit("File send failed — ${BeamSessionRegistry.ErrorMessages.forCode(BeamSessionRegistry.ErrorCodes.INTERNAL)}")
+                _toastEvents.tryEmit("File send failed")
             }
         }
     }
 
     /**
-     * Run the Beam handshake and stream an encrypted file to the peer.
-     * Mirrors [sendClipboardEncrypted] but emits an encrypted metadata
-     * envelope followed by N encrypted chunks.
+     * Send a file via Beam v2 transport: meta frame + chunk frames, all
+     * stateless AEAD under K_AB. Receiver assembles via the transport's
+     * inbox and emits via [BeamV2Wiring.Delivery.onFileReceived].
      */
     private suspend fun sendFileEncrypted(
         targetDeviceId: String,
@@ -863,126 +498,15 @@ class DeviceHubViewModel @Inject constructor(
         mimeType: String,
         fileBytes: ByteArray,
     ) {
-        val peerStaticPk = beamCrypto.peerStaticPk(targetDeviceId)
-            ?: throw BeamSessionRegistry.HandshakeException(
-                BeamSessionRegistry.ErrorCodes.INTERNAL,
-                "no static key for peer $targetDeviceId",
-            )
-        val rendezvousId = targetDeviceId
-
-        val chunkSize = 200 * 1024
-        val totalChunks = maxOf(1, (fileBytes.size + chunkSize - 1) / chunkSize)
-
-        val init = beamCrypto.registry.startInit(
-            peerId = targetDeviceId,
-            peerStaticPk = peerStaticPk,
-            kind = BeamSessionRegistry.Kind.FILE,
+        beamV2Wiring.transport.sendFile(
+            targetDeviceId = targetDeviceId,
+            fileName       = fileName,
+            fileSize       = fileBytes.size.toLong(),
+            mimeType       = mimeType.ifBlank { "application/octet-stream" },
+            bytes          = fileBytes,
         )
-        val transferIdWire = base64UrlFromBytes(init.wireMessage.transferId)
-        val waiter = CompletableDeferred<BeamSessionRegistry.Session>()
-        pendingAccepts[transferIdWire] = waiter
-
-        signalingClient.send(JSONObject().apply {
-            put("type", "transfer-init")
-            put("v", init.wireMessage.v)
-            put("targetDeviceId", targetDeviceId)
-            put("rendezvousId", rendezvousId)
-            put("transferId", transferIdWire)
-            put("kind", init.wireMessage.kind.wire)
-            put("ephPkA", base64UrlFromBytes(init.wireMessage.ephPkA))
-            put("salt", base64UrlFromBytes(init.wireMessage.salt))
-        })
-        signalingClient.send(JSONObject().apply {
-            put("type", "relay-bind")
-            put("transferId", transferIdWire)
-            put("targetDeviceId", targetDeviceId)
-            put("rendezvousId", rendezvousId)
-        })
-
-        val session = try {
-            withTimeout(15_000) { waiter.await() }
-        } catch (e: TimeoutCancellationException) {
-            pendingAccepts.remove(transferIdWire)
-            signalingClient.send(JSONObject().apply {
-                put("type", "transfer-reject")
-                put("targetDeviceId", targetDeviceId)
-                put("rendezvousId", rendezvousId)
-                put("transferId", transferIdWire)
-                put("errorCode", BeamSessionRegistry.ErrorCodes.TIMEOUT)
-            })
-            signalingClient.send(JSONObject().apply {
-                put("type", "relay-release")
-                put("transferId", transferIdWire)
-            })
-            beamCrypto.registry.destroy(init.session.transferId, BeamSessionRegistry.ErrorCodes.TIMEOUT)
-            throw BeamSessionRegistry.HandshakeException(
-                BeamSessionRegistry.ErrorCodes.TIMEOUT,
-                "handshake timed out waiting for transfer-accept (file)",
-            )
-        }
-
-        try {
-            val chunkKey = session.chunkKey ?: throw IllegalStateException("chunkKey null after handshake")
-            val metaKey = session.metaKey ?: throw IllegalStateException("metaKey null after handshake")
-            val transcript = session.transcript ?: throw IllegalStateException("transcript null after handshake")
-            session.totalChunks = totalChunks
-
-            // 1. Encrypted metadata envelope at index 0.
-            val metaJson = JSONObject().apply {
-                put("fileName", fileName)
-                put("fileSize", fileBytes.size)
-                put("mime", mimeType)
-                put("totalChunks", totalChunks)
-            }.toString()
-            val metaCt = beamCrypto.cipher.encryptFileMetadata(
-                metaJson.toByteArray(Charsets.UTF_8),
-                metaKey,
-                transcript,
-            )
-            signalingClient.sendBinary(encodeBeamFrame(session.transferId, 0, metaCt))
-
-            // 2. Encrypted chunks at indices 1..N.
-            var offset = 0
-            var chunkIndex = 1
-            while (offset < fileBytes.size) {
-                val end = minOf(offset + chunkSize, fileBytes.size)
-                val chunkPlain = fileBytes.copyOfRange(offset, end)
-                val chunkCt = beamCrypto.cipher.encryptFileChunk(
-                    plaintext = chunkPlain,
-                    chunkKey = chunkKey,
-                    index = chunkIndex,
-                    totalChunks = totalChunks,
-                    transcript = transcript,
-                )
-                signalingClient.sendBinary(encodeBeamFrame(session.transferId, chunkIndex, chunkCt))
-                offset = end
-                chunkIndex += 1
-                if (offset < fileBytes.size) delay(20)
-            }
-
-            // 3. file-complete signal.
-            signalingClient.send(JSONObject().apply {
-                put("type", "file-complete")
-                put("targetDeviceId", targetDeviceId)
-                put("rendezvousId", rendezvousId)
-                put("transferId", transferIdWire)
-            })
-        } finally {
-            signalingClient.send(JSONObject().apply {
-                put("type", "relay-release")
-                put("transferId", transferIdWire)
-            })
-            beamCrypto.registry.destroy(session.transferId)
-        }
     }
 
-    /**
-     * Routes a completed file transfer based on the auto-save setting.
-     *
-     * - Auto-save ON:  immediately saves to Downloads and toasts "Saved [filename]".
-     * - Auto-save OFF: holds the assembled bytes in [_pendingFileSave] so the UI
-     *                  can prompt the user, and toasts "File received: [filename] -- open app to save".
-     */
     private fun handleReceivedFileComplete(ft: FileTransferState) {
         viewModelScope.launch {
             val prefs = userPreferences.preferencesFlow.first()

@@ -46,7 +46,10 @@ import com.zaptransfer.android.data.db.entity.TransferHistoryEntity
         ClipboardEntryEntity::class,
         OfflineQueueEntity::class,
     ],
-    version = 1,
+    // v2 (2026-04-30): Beam v2 added k_ab_ring_json column to paired_devices.
+    // Pre-launch — destructive migration is acceptable. Wire it up in
+    // DatabaseModule via fallbackToDestructiveMigration().
+    version = 2,
     exportSchema = true,   // Schema JSON written to app/schemas/ — committed to git
 )
 abstract class ZapDatabase : RoomDatabase() {

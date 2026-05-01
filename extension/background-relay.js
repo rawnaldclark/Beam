@@ -22,23 +22,74 @@
  * @module background-relay
  */
 
-import {
-  sendClipboardEncrypted as _sendClipboardEncrypted,
-  sendFileEncrypted as _sendFileEncrypted,
-  handleTransferInit,
-  handleTransferAccept,
-  handleTransferReject,
-  handleIncomingBeamFrame,
-  isBeamFrame,
-} from './crypto/beam-relay-handlers.js';
+import { ensureTransport } from './crypto/beam-v2-wiring.js';
 
-const RELAY_URL = 'wss://zaptransfer-relay.fly.dev';
+/**
+ * Lazy accessor for the Beam v2 transport singleton. The hooks intentionally
+ * close over `sendBinary` / `sendPairingMessage` (defined later in this
+ * module) and over `deliverIncomingClipboard` / `deliverIncomingFile` (the
+ * existing user-visible delivery functions, also defined below). The
+ * function-style indirection lets us register hooks before those symbols
+ * are evaluated.
+ */
+function getTransport() {
+  return ensureTransport({
+    sendBinary,
+    sendJson: sendPairingMessage,
+    onClipboardReceived: (content, fromDeviceId) => deliverIncomingClipboard(content, fromDeviceId),
+    onFileReceived: (args) => deliverIncomingFile(args),
+  });
+}
+
+/**
+ * Public surface used by background.js for SEND_CLIPBOARD / SEND_FILE
+ * handlers. Returns the singleton transport so callers can drive sendClipboard
+ * / sendFile / rotateKAB without re-importing the wiring module.
+ */
+export function getBeamV2Transport() {
+  return getTransport();
+}
+
+const DEFAULT_RELAY_URL = 'wss://zaptransfer-relay.fly.dev';
+
+/**
+ * Active relay URL. Defaults to the production endpoint; tests override it
+ * via `_setRelayUrl()` to point at a locally-spun relay on a random port.
+ * Production callers never touch this — it is a test-only seam.
+ *
+ * @type {string}
+ */
+let RELAY_URL = DEFAULT_RELAY_URL;
+
+/**
+ * TEST-ONLY: redirect the relay URL. No production code path calls this.
+ * Exported so the Node test harness in `extension/test/` can drive the SW
+ * code against a local ws://localhost relay fixture.
+ *
+ * @param {string|null} url - New relay URL, or null to restore the default.
+ */
+export function _setRelayUrl(url) {
+  RELAY_URL = url ?? DEFAULT_RELAY_URL;
+}
 
 /** @type {WebSocket|null} Active pairing WebSocket connection. */
 let pairingWs = null;
 
 /** @type {string|null} Device ID for the current pairing session. */
 let pairingDeviceId = null;
+
+/**
+ * Single-flight guard: when a connect is in progress for `_inflightDeviceId`,
+ * concurrent callers receive the same `_inflightConnect` promise instead of
+ * each opening their own WebSocket. Without this, two near-simultaneous
+ * starts (e.g. SW-boot top-level + onInstalled, or SW + popup) created
+ * orphan sockets whose stale handlers nulled out the live successor.
+ *
+ * @type {Promise<void>|null}
+ */
+let _inflightConnect = null;
+/** @type {string|null} */
+let _inflightDeviceId = null;
 
 /**
  * Timestamp of the last pong received from the relay server. Updated every
@@ -73,6 +124,15 @@ const ZOMBIE_DETECTION_MS = 60_000; // 2 missed ping/pong cycles (25s each) + ma
 export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
   console.log('[Beam SW] startPairingListener called for', deviceId);
 
+  // Single-flight: a concurrent caller for the same device awaits the
+  // existing connect instead of opening a parallel socket. This is the
+  // primary defence against the racing-auto-start failure mode where
+  // onInstalled + SW-boot top-level both invoked us simultaneously.
+  if (_inflightConnect && _inflightDeviceId === deviceId) {
+    console.log('[Beam SW] connect already in flight for', deviceId, '— awaiting');
+    return _inflightConnect;
+  }
+
   // If we already have an OPEN connection for this SAME device, don't reconnect.
   if (pairingWs?.readyState === WebSocket.OPEN && pairingDeviceId === deviceId) {
     console.log('[Beam SW] Already connected for', deviceId, '— skipping');
@@ -81,6 +141,30 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
 
   // Different device or no connection — fully close old state before starting new.
   stopPairingListener();
+
+  _inflightDeviceId = deviceId;
+  _inflightConnect = _doConnect(deviceId, ed25519Sk, ed25519Pk).finally(() => {
+    _inflightConnect = null;
+    _inflightDeviceId = null;
+  });
+  return _inflightConnect;
+}
+
+/**
+ * Inner connect routine. Bound to a single `ws` instance throughout —
+ * none of its handlers reach for the module-level `pairingWs`, so an
+ * orphaned socket from an earlier racing call cannot corrupt the live
+ * connection's state. The onclose handler additionally guards mutation
+ * of module state with `pairingWs === ws`, ensuring a stale orphan's
+ * close event is a true no-op for the active session.
+ *
+ * @param {string}   deviceId
+ * @param {number[]} ed25519Sk
+ * @param {number[]} ed25519Pk
+ */
+async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
+  console.log('[Beam SW] _doConnect: entering, deviceId=', deviceId,
+    'skLen=', ed25519Sk?.length, 'pkLen=', ed25519Pk?.length);
   await new Promise(r => setTimeout(r, 100));
 
   // Store credentials for auto-reconnect on unexpected disconnect
@@ -91,29 +175,75 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
 
   pairingDeviceId = deviceId;
 
-  // Import Ed25519 keys from raw/PKCS8 arrays via Web Crypto.
-  const privateKey = await crypto.subtle.importKey(
-    'pkcs8',
-    new Uint8Array(ed25519Sk).buffer,
-    'Ed25519',
-    false,
-    ['sign'],
-  );
-  const publicKey = await crypto.subtle.importKey(
-    'raw',
-    new Uint8Array(ed25519Pk).buffer,
-    'Ed25519',
-    true,
-    ['verify'],
-  );
+  // Import Ed25519 keys from arrays via Web Crypto.
+  //
+  // The popup stores the private key shape that `crypto.subtle.exportKey`
+  // returned. In Chrome 130+ that is unfortunately NOT proper PKCS8 ASN.1
+  // for Ed25519 — it returns a 64-byte `seed || publicKey` blob, which
+  // round-trips via `importKey('pkcs8', …)` with `DataError`. Node's
+  // WebCrypto returns proper PKCS8 (~48 bytes). We try PKCS8 first
+  // (correct path; Node tests, future browsers); on `DataError` we fall
+  // back to JWK with the first 32 bytes as the seed, which handles both
+  // Chrome's 64-byte form and a bare 32-byte seed.
+  let privateKey, publicKey;
+  try {
+    const skArr = new Uint8Array(ed25519Sk);
+    const pkArr = new Uint8Array(ed25519Pk);
+    if (pkArr.byteLength !== 32) {
+      throw new Error('expected 32-byte pk, got ' + pkArr.byteLength);
+    }
+
+    try {
+      privateKey = await crypto.subtle.importKey(
+        'pkcs8', skArr.buffer.slice(skArr.byteOffset, skArr.byteOffset + skArr.byteLength),
+        'Ed25519', false, ['sign'],
+      );
+      console.log('[Beam SW] _doConnect: privateKey imported via PKCS8');
+    } catch (pkcs8Err) {
+      console.warn('[Beam SW] _doConnect: PKCS8 import failed, falling back to JWK seed-extract:',
+        pkcs8Err?.message);
+      const seed = skArr.byteLength >= 32 ? skArr.slice(0, 32) : skArr;
+      if (seed.byteLength !== 32) {
+        throw new Error('cannot derive 32-byte seed from sk of length ' + skArr.byteLength);
+      }
+      privateKey = await crypto.subtle.importKey(
+        'jwk',
+        { kty: 'OKP', crv: 'Ed25519', d: bytesToBase64Url(seed), x: bytesToBase64Url(pkArr) },
+        { name: 'Ed25519' }, false, ['sign'],
+      );
+      console.log('[Beam SW] _doConnect: privateKey imported via JWK fallback');
+    }
+
+    publicKey = await crypto.subtle.importKey(
+      'raw', pkArr.buffer.slice(pkArr.byteOffset, pkArr.byteOffset + pkArr.byteLength),
+      'Ed25519', true, ['verify'],
+    );
+    console.log('[Beam SW] _doConnect: keys imported successfully');
+  } catch (err) {
+    console.error('[Beam SW] _doConnect: importKey failed:', err, '| stack:', err?.stack);
+    throw new Error('importKey failed: ' + (err?.message || String(err)));
+  }
 
   return new Promise((resolve, reject) => {
-    pairingWs = new WebSocket(RELAY_URL);
+    let ws;
+    try {
+      ws = new WebSocket(RELAY_URL);
+      console.log('[Beam SW] _doConnect: WebSocket created, readyState=', ws.readyState);
+    } catch (err) {
+      console.error('[Beam SW] _doConnect: WebSocket constructor threw:', err);
+      reject(new Error('WebSocket constructor failed: ' + (err?.message || String(err))));
+      return;
+    }
+    pairingWs = ws;
 
-    pairingWs.onmessage = async (event) => {
-      // Handle binary frames (file data from relay).
+    ws.onmessage = async (event) => {
+      // Handle binary frames — every binary frame on this socket is now a
+      // Beam v2 frame. The transport routes by transferId/index internally.
       if (event.data instanceof ArrayBuffer || event.data instanceof Blob) {
-        await handleIncomingBinaryFrame(event.data);
+        const bytes = event.data instanceof Blob
+          ? new Uint8Array(await event.data.arrayBuffer())
+          : new Uint8Array(event.data);
+        await getTransport().handleIncomingFrame(bytes);
         return;
       }
 
@@ -139,7 +269,10 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
           const signature = await crypto.subtle.sign('Ed25519', privateKey, payload);
           const publicKeyRaw = await crypto.subtle.exportKey('raw', publicKey);
 
-          pairingWs.send(JSON.stringify({
+          // Use the local `ws` reference, not module-level pairingWs — between
+          // the await above and this send, a concurrent connect could have
+          // replaced pairingWs with a still-CONNECTING socket.
+          ws.send(JSON.stringify({
             type:      'auth',
             deviceId,
             publicKey: bytesToBase64(new Uint8Array(publicKeyRaw)),
@@ -160,7 +293,7 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
         _lastPongAt = Date.now(); // reset zombie timer on fresh auth
         console.log('[Beam SW] Pairing relay authenticated as', deviceId);
         // Register our deviceId as rendezvous so the relay routes Android's message.
-        pairingWs.send(JSON.stringify({
+        ws.send(JSON.stringify({
           type: 'register-rendezvous',
           rendezvousIds: [deviceId],
         }));
@@ -216,29 +349,36 @@ export async function startPairingListener(deviceId, ed25519Sk, ed25519Pk) {
           // Popup closed — it will read from storage when next opened.
         }
       }
-      else if (msg.type === 'transfer-init') {
-        // Beam E2E handshake — peer wants to start an encrypted transfer.
-        await handleTransferInit({ msg, sendJson: sendPairingMessage });
-      }
-      else if (msg.type === 'transfer-accept') {
-        await handleTransferAccept({ msg });
-      }
-      else if (msg.type === 'transfer-reject') {
-        await handleTransferReject({ msg });
-      }
-      else if (msg.type === 'file-complete') {
-        // Advisory signal that the sender has finished — the receiver
-        // already drives completion off chunksReceived === totalChunks
-        // inside handleIncomingBeamFrame, so this is currently a no-op.
+      else {
+        // Try the v2 transport first (resend / fail / rotate-init/ack/commit).
+        // If it doesn't recognise the type, the message is dropped silently —
+        // the v1 transfer-init/accept/reject/file-complete paths have been
+        // removed, and unknown types don't belong on this socket.
+        const handled = await getTransport().handleJsonMessage(msg);
+        if (!handled && msg.type) {
+          // Useful while v1 callers are still around in the wild; drop
+          // quietly once we're confident no client speaks v1.
+          // console.debug('[Beam SW] unhandled relay message type:', msg.type);
+        }
       }
     };
 
-    pairingWs.onerror = (e) => {
-      console.error('[Beam SW] Pairing relay WebSocket error');
-      reject(new Error('WebSocket connection error'));
+    ws.onerror = (e) => {
+      console.error('[Beam SW] Pairing relay WebSocket error event:', e,
+        'readyState=', ws?.readyState);
+      reject(new Error('WebSocket connection error (readyState=' + ws?.readyState + ')'));
     };
 
-    pairingWs.onclose = async (e) => {
+    ws.onclose = async (e) => {
+      // Critical orphan guard: if module-level pairingWs no longer points to
+      // *this* ws, we are a stale leftover from a racing connect — exiting
+      // here is what prevents an orphan close from nulling the live socket
+      // and triggering a spurious reconnect cascade.
+      if (pairingWs !== ws) {
+        console.log('[Beam SW] Orphan WebSocket closed (code:', e.code + ') — ignored');
+        return;
+      }
+
       console.warn('[Beam SW] Pairing relay WebSocket closed. Code:', e.code, 'Reason:', e.reason);
       if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
       pairingWs = null;
@@ -315,6 +455,8 @@ function _startHeartbeat() {
  */
 export function stopPairingListener() {
   _explicitStop = true;
+  _inflightConnect = null;
+  _inflightDeviceId = null;
   if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
   if (pairingWs) {
     pairingWs.onmessage = null;
@@ -341,55 +483,13 @@ export function sendPairingMessage(msg) {
 }
 
 // ---------------------------------------------------------------------------
-// File transfer helpers
+// Incoming delivery (called by Beam v2 transport via the wiring hooks)
 // ---------------------------------------------------------------------------
 
 /**
- * Handle an incoming binary WebSocket frame (a file data chunk).
- * Appends the chunk to the pending file transfer's buffer.
- *
- * @param {ArrayBuffer|Blob} data - Raw binary frame data.
- * @returns {Promise<void>}
- */
-async function handleIncomingBinaryFrame(data) {
-  const bytes = data instanceof Blob
-    ? new Uint8Array(await data.arrayBuffer())
-    : new Uint8Array(data);
-
-  // Every binary frame MUST be a Beam E2E encrypted frame with the 'BEAM'
-  // magic prefix. The legacy plaintext file path has been removed.
-  if (isBeamFrame(bytes)) {
-    try {
-      await handleIncomingBeamFrame({
-        bytes,
-        onClipboardDecrypted: async (content, fromDeviceId) => {
-          await deliverIncomingClipboard(content, fromDeviceId);
-        },
-        onFileComplete: async ({ bytes: fileBytes, fileName, fileSize, mimeType, fromDeviceId }) => {
-          await deliverIncomingFile({
-            bytes: fileBytes,
-            fileName,
-            fileSize,
-            mimeType,
-            fromDeviceId,
-          });
-        },
-      });
-    } catch (err) {
-      console.error('[Beam SW] Beam frame handling failed:', err);
-      notifyReceiveFailure();
-    }
-    return;
-  }
-  console.warn('[Beam SW] Unexpected non-Beam binary frame dropped (size:', bytes.length, 'bytes)');
-  notifyReceiveFailure();
-}
-
-/**
  * Deliver a fully-assembled, fully-decrypted incoming file to the user via
- * the existing auto-save / manual-save UX. Called from the Beam frame
- * handler once a file's metadata + all chunks have been decrypted and
- * assembled.
+ * the existing auto-save / manual-save UX. Called from the Beam v2 transport
+ * once all chunks have been decrypted and assembled.
  */
 export async function deliverIncomingFile({
   bytes,
@@ -540,63 +640,49 @@ export async function deliverIncomingClipboard(content, fromDeviceId) {
 /**
  * Public API: encrypt and send a clipboard payload to a paired device.
  *
- * Runs the Beam Triple-DH handshake on the pairing WebSocket, derives a
- * per-transfer session key, and emits the ciphertext as a single Beam
- * binary frame. Rejects with an Error (with a `code` field from
- * ERROR_CODES) if the peer is unreachable, the handshake times out, or
- * the handshake is actively rejected.
+ * Stateless single AEAD frame under the long-lived pairing key K_AB.
+ * `rendezvousId` is accepted for source-compat with the v1 call sites but is
+ * unused — the transport routes by `targetDeviceId` and the relay handles
+ * binary forwarding via the existing rendezvous registration.
  *
  * @param {string} targetDeviceId
- * @param {string} rendezvousId
+ * @param {string} _rendezvousId  - unused, kept for caller compatibility
  * @param {string} content
  * @returns {Promise<{transferIdHex: string}>}
  */
-export async function sendClipboardEncrypted(targetDeviceId, rendezvousId, content) {
-  return _sendClipboardEncrypted({
-    targetDeviceId,
-    rendezvousId,
-    content,
-    sendJson: sendPairingMessage,
-    sendBinary,
-  });
+export async function sendClipboardEncrypted(targetDeviceId, _rendezvousId, content) {
+  const transferIdHex = await getBeamV2Transport().sendClipboard(targetDeviceId, content);
+  return { transferIdHex };
 }
 
 /**
  * Public API: encrypt and send a file to a paired device.
  *
- * Runs the Beam Triple-DH handshake, encrypts the metadata envelope
- * (fileName/fileSize/mime/totalChunks) under metaKey, then encrypts each
- * 200KB chunk under chunkKey. Frames are emitted on the pairing WebSocket
- * with the 'BEAM' magic prefix so the receiver can demux them from the
- * legacy plaintext file path.
+ * Stateless multi-frame transmission under the long-lived pairing key K_AB.
+ * Frame 0 carries the meta envelope (`{kind:"file", fileName, fileSize, ...}`);
+ * frames 1..N carry chunk plaintext. Resend on dropped chunks is handled by
+ * the transport state machine.
  *
  * @param {{
  *   targetDeviceId: string,
- *   rendezvousId: string,
+ *   rendezvousId?: string,        // unused, kept for caller compatibility
  *   fileName: string,
  *   fileSize: number,
  *   mimeType: string,
- *   data: string, // base64-encoded file bytes (same shape as legacy payload)
+ *   data: string, // base64-encoded file bytes (kept stable for callers)
  * }} payload
  * @returns {Promise<{transferIdHex: string, totalChunks: number}>}
  */
 export async function sendFileEncrypted(payload) {
-  const { fileName, fileSize, mimeType, data, targetDeviceId, rendezvousId } = payload;
-  // Decode the base64 payload once — senders up the stack already produce
-  // base64 (image fetches, popup file picker) so keeping the API stable.
+  const { fileName, fileSize, mimeType, data, targetDeviceId } = payload;
   const binStr = atob(data);
-  const rawBytes = new Uint8Array(binStr.length);
-  for (let i = 0; i < binStr.length; i += 1) rawBytes[i] = binStr.charCodeAt(i);
-  return _sendFileEncrypted({
-    targetDeviceId,
-    rendezvousId,
-    fileName,
-    fileSize,
-    mimeType,
-    rawBytes,
-    sendJson: sendPairingMessage,
-    sendBinary,
+  const bytes = new Uint8Array(binStr.length);
+  for (let i = 0; i < binStr.length; i += 1) bytes[i] = binStr.charCodeAt(i);
+  const result = await getBeamV2Transport().sendFile(targetDeviceId, {
+    fileName, fileSize, mimeType, bytes,
   });
+  // The current callers don't read totalChunks, but preserve the v1 shape.
+  return { transferIdHex: result.transferIdHex, totalChunks: result.totalChunks };
 }
 
 // ---------------------------------------------------------------------------
@@ -625,4 +711,16 @@ function hexToBytes(hex) {
  */
 function bytesToBase64(bytes) {
   return btoa(String.fromCharCode(...bytes));
+}
+
+/**
+ * Encode a Uint8Array to base64url (no padding) — required by JWK fields
+ * `d` and `x` for Ed25519 key material.
+ *
+ * @param {Uint8Array} bytes
+ * @returns {string}
+ */
+function bytesToBase64Url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }

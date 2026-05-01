@@ -538,13 +538,10 @@ async function deriveSasFromRequest(msg, deviceKeys) {
   const peerX25519PkRaw = base64ToBytes(msg.x25519Pk);
   const peerEd25519PkRaw = base64ToBytes(msg.ed25519Pk);
 
-  // X25519 ECDH: derive 256-bit shared secret
-  const x25519PrivateKey = await crypto.subtle.importKey(
-    'pkcs8',
-    new Uint8Array(deviceKeys.x25519.sk).buffer,
-    'X25519',
-    false,
-    ['deriveBits'],
+  // X25519 ECDH: derive 256-bit shared secret. See importX25519PrivateRobust
+  // for why we don't go through 'pkcs8' directly.
+  const x25519PrivateKey = await importX25519PrivateRobust(
+    deviceKeys.x25519.sk, deviceKeys.x25519.pk,
   );
   const peerX25519Pk = await crypto.subtle.importKey(
     'raw',
@@ -631,6 +628,18 @@ export async function confirmPairing(peerId, peerKeys, deviceId) {
     },
   });
 
+  // Derive K_AB(gen=0) for Beam v2. Both sides arrive at the same value
+  // because X25519 is symmetric and the salt is computed over a lex-sorted
+  // concatenation of both Ed25519 public keys.
+  const kAB = await deriveKABViaWebCrypto({
+    ourX25519SkBytes: new Uint8Array(stored.deviceKeys.x25519.sk),
+    ourX25519PkRaw:   new Uint8Array(stored.deviceKeys.x25519.pk),
+    peerX25519PkRaw:  new Uint8Array(peerKeys.x25519Pk),
+    ourEd25519Pk:     new Uint8Array(stored.deviceKeys.ed25519.pk),
+    peerEd25519Pk:    new Uint8Array(peerKeys.ed25519Pk),
+    generation:       0,
+  });
+
   // Save paired device to storage, including the rendezvousId (Chrome's deviceId)
   // so clipboard-transfer knows which rendezvous to route through.
   const existing = await chrome.storage.local.get(['pairedDevices']);
@@ -643,12 +652,142 @@ export async function confirmPairing(peerId, peerKeys, deviceId) {
     ed25519PublicKey: peerKeys.ed25519Pk,
     x25519PublicKey:  peerKeys.x25519Pk,
     pairedAt:        Date.now(),
+    // Beam v2 long-lived symmetric key ring. `currentGeneration` is the gen
+    // used by outgoing frames; `keys` holds every still-acceptable gen.
+    kABRing: {
+      currentGeneration: 0,
+      keys: {
+        '0': { kAB: Array.from(kAB), createdAt: Date.now() },
+      },
+    },
   });
   await chrome.storage.local.set({ pairedDevices: devices });
 
   // NOTE: We intentionally do NOT close the relay WebSocket after pairing.
   // The SW relay stays connected so it can send/receive clipboard-transfer
   // messages between Chrome and Android without requiring a new connection.
+}
+
+/**
+ * Compute Beam v2 `K_AB` using only Web Crypto (no libsodium). Mirrors
+ * `extension/crypto/beam-v2.js#deriveKAB` and Android's `BeamV2.deriveKAB`
+ * byte-for-byte. Lives in popup.js because the popup is the only place we
+ * have the X25519 private key already in scope.
+ *
+ * @param {{
+ *   ourX25519SkBytes: Uint8Array,
+ *   ourX25519PkRaw:   Uint8Array,
+ *   peerX25519PkRaw:  Uint8Array,
+ *   ourEd25519Pk:     Uint8Array,
+ *   peerEd25519Pk:    Uint8Array,
+ *   generation:       number,
+ *   rotateNonce?:     Uint8Array,
+ * }} args
+ * @returns {Promise<Uint8Array>} 32-byte K_AB.
+ */
+async function deriveKABViaWebCrypto({
+  ourX25519SkBytes,
+  ourX25519PkRaw,
+  peerX25519PkRaw,
+  ourEd25519Pk,
+  peerEd25519Pk,
+  generation,
+  rotateNonce = null,
+}) {
+  // ikm = X25519(ourSk, peerPk).
+  const ourPriv = await importX25519PrivateRobust(ourX25519SkBytes, ourX25519PkRaw);
+  const peerPub = await crypto.subtle.importKey(
+    'raw', peerX25519PkRaw.buffer, 'X25519', false, [],
+  );
+  const ikmBits = await crypto.subtle.deriveBits(
+    { name: 'X25519', public: peerPub }, ourPriv, 256,
+  );
+  const ikm = new Uint8Array(ikmBits);
+
+  // salt = SHA-256(sort_lex(edPkA, edPkB))
+  const cmp = compareBytes(ourEd25519Pk, peerEd25519Pk);
+  const lower  = cmp <= 0 ? ourEd25519Pk : peerEd25519Pk;
+  const higher = cmp <= 0 ? peerEd25519Pk : ourEd25519Pk;
+  const concat = new Uint8Array(64);
+  concat.set(lower, 0);
+  concat.set(higher, 32);
+  const saltBuf = await crypto.subtle.digest('SHA-256', concat);
+  const salt = new Uint8Array(saltBuf);
+
+  // info = "beam-v2-pairing-key/" || u32_be(generation) || rotateNonce?
+  const prefix = new TextEncoder().encode('beam-v2-pairing-key/');
+  const genBE  = new Uint8Array(4);
+  new DataView(genBE.buffer).setUint32(0, generation >>> 0, false);
+  const infoLen = prefix.length + 4 + (rotateNonce ? 16 : 0);
+  const info = new Uint8Array(infoLen);
+  info.set(prefix, 0);
+  info.set(genBE, prefix.length);
+  if (rotateNonce) info.set(rotateNonce, prefix.length + 4);
+
+  // HKDF-SHA256(ikm, salt, info, 32)
+  const hkdfKey = await crypto.subtle.importKey('raw', ikm, 'HKDF', false, ['deriveBits']);
+  const kABBits = await crypto.subtle.deriveBits(
+    { name: 'HKDF', hash: 'SHA-256', salt, info }, hkdfKey, 256,
+  );
+  return new Uint8Array(kABBits);
+}
+
+/**
+ * Import an X25519 private key tolerating both proper PKCS8 and Chrome's
+ * 64-byte `seed || publicKey` shape that `crypto.subtle.exportKey('pkcs8', …)`
+ * returns for X25519/Ed25519 keys in some Chrome versions. Tries PKCS8
+ * first (the spec'd path); on `DataError` falls back to JWK with the
+ * first 32 bytes treated as the seed.
+ *
+ * @param {Uint8Array | number[]} skBytes
+ * @param {Uint8Array | number[]} pkBytes  - raw 32-byte X25519 public key
+ * @returns {Promise<CryptoKey>}
+ */
+async function importX25519PrivateRobust(skBytes, pkBytes) {
+  const sk = skBytes instanceof Uint8Array ? skBytes : new Uint8Array(skBytes);
+  const pk = pkBytes instanceof Uint8Array ? pkBytes : new Uint8Array(pkBytes);
+
+  try {
+    return await crypto.subtle.importKey(
+      'pkcs8', sk.buffer.slice(sk.byteOffset, sk.byteOffset + sk.byteLength),
+      'X25519', false, ['deriveBits'],
+    );
+  } catch (_) {
+    // Fall through to JWK with first 32 bytes as the seed.
+  }
+
+  const seed = sk.byteLength >= 32 ? sk.slice(0, 32) : sk;
+  if (seed.byteLength !== 32) {
+    throw new Error('cannot derive 32-byte X25519 seed from sk of length ' + sk.byteLength);
+  }
+  if (pk.byteLength !== 32) {
+    throw new Error('expected 32-byte X25519 pk, got ' + pk.byteLength);
+  }
+  return crypto.subtle.importKey(
+    'jwk',
+    {
+      kty: 'OKP',
+      crv: 'X25519',
+      d: bytesToBase64Url(seed),
+      x: bytesToBase64Url(pk),
+    },
+    { name: 'X25519' },
+    false,
+    ['deriveBits'],
+  );
+}
+
+function bytesToBase64Url(bytes) {
+  return btoa(String.fromCharCode(...bytes))
+    .replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+function compareBytes(a, b) {
+  const len = Math.min(a.byteLength, b.byteLength);
+  for (let i = 0; i < len; i += 1) {
+    if (a[i] !== b[i]) return a[i] - b[i];
+  }
+  return a.byteLength - b.byteLength;
 }
 
 /**

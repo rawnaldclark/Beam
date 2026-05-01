@@ -74,6 +74,15 @@ export const MSG = Object.freeze({
   TRANSFER_ACCEPT:    'transfer-accept',
   TRANSFER_REJECT:    'transfer-reject',
 
+  // Beam v2: stateless E2E transport. The relay is again a passthrough —
+  // these JSON messages carry resend requests and key-rotation handshake
+  // signals between paired peers. See docs/superpowers/specs/2026-04-30.
+  BEAM_V2_RESEND:        'beam-v2-resend',
+  BEAM_V2_FAIL:          'beam-v2-fail',
+  BEAM_V2_ROTATE_INIT:   'beam-v2-rotate-init',
+  BEAM_V2_ROTATE_ACK:    'beam-v2-rotate-ack',
+  BEAM_V2_ROTATE_COMMIT: 'beam-v2-rotate-commit',
+
   // Session management
   RECONNECT:          'reconnect',
   ERROR:              'error',
@@ -261,6 +270,50 @@ const FIELD_RULES = new Map([
   }],
 
   [MSG.RECONNECT, authRule],
+
+  // ── Beam v2 ────────────────────────────────────────────────────────────
+  // Each v2 message carries the standard relay routing pair plus a few
+  // type-specific fields. The server never inspects crypto material.
+
+  [MSG.BEAM_V2_RESEND, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (!isNonEmptyString(msg.transferId))     return 'Missing or invalid field: transferId';
+    if (!Array.isArray(msg.missing) || msg.missing.length === 0)
+      return 'Missing or invalid field: missing (must be a non-empty array)';
+    return null;
+  }],
+  [MSG.BEAM_V2_FAIL, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (!isNonEmptyString(msg.transferId))     return 'Missing or invalid field: transferId';
+    if (!isNonEmptyString(msg.code))           return 'Missing or invalid field: code';
+    return null;
+  }],
+  [MSG.BEAM_V2_ROTATE_INIT, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (typeof msg.fromGen !== 'number' || msg.fromGen < 0)
+      return 'Missing or invalid field: fromGen';
+    if (typeof msg.toGen !== 'number' || msg.toGen <= msg.fromGen)
+      return 'Missing or invalid field: toGen (must be > fromGen)';
+    if (!isNonEmptyString(msg.nonce)) return 'Missing or invalid field: nonce';
+    return null;
+  }],
+  [MSG.BEAM_V2_ROTATE_ACK, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (typeof msg.fromGen !== 'number') return 'Missing or invalid field: fromGen';
+    if (typeof msg.toGen   !== 'number') return 'Missing or invalid field: toGen';
+    if (!isNonEmptyString(msg.nonce)) return 'Missing or invalid field: nonce';
+    return null;
+  }],
+  [MSG.BEAM_V2_ROTATE_COMMIT, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (typeof msg.toGen !== 'number') return 'Missing or invalid field: toGen';
+    return null;
+  }],
 ]);
 
 // ---------------------------------------------------------------------------
