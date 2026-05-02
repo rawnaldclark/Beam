@@ -100,11 +100,10 @@ export function reduceSelfState(state, event) {
     }
 
     // ─── recovery-began: ladder is starting ─────────────────────────────────
-    // Drives every non-RECONNECTING state into RECONNECTING. RECONNECTING
-    // itself stays put (avoid spurious rebroadcasts; the authority can dedupe
-    // ladder restarts on its own).
+    // Drives every state into RECONNECTING. From RECONNECTING this is a
+    // self-transition (no observable change); the authority dedupes ladder
+    // restarts on its own — the reducer just reports the steady state.
     case 'recovery-began': {
-      if (state === SelfState.RECONNECTING) return SelfState.RECONNECTING;
       return SelfState.RECONNECTING;
     }
 
