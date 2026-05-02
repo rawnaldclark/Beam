@@ -7,12 +7,18 @@
  * the authority's notify-methods into the WS lifecycle, peer presence
  * messages, and v2 frame decode/send events.
  *
- * The hooks supplied to {@link ensureConnectionAuthority} let the authority
- * (a) send JSON over the live WS via the wiring's `sendJson`, and (b) know
- * its own deviceId so peer-ping frames carry the correct `rendezvousId`.
+ * The hooks supplied to {@link ensureConnectionAuthority} let the authority:
+ *   - (a) send JSON over the live WS via `sendJson`,
+ *   - (b) know its own deviceId so peer-ping frames carry the correct
+ *         `rendezvousId`,
+ *   - (c) trigger a full WS tear-down + reconnect via `forceWsReconnect`
+ *         when the recovery ladder's Rung 2 fires (Task 8 declares the
+ *         contract; the wiring-layer implementation lands in a follow-up
+ *         task — `background-relay.js` will close `pairingWs` and re-enter
+ *         `_doConnect`).
  *
- * Tasks 8 and 11 will extend the hook bag with reconnect / full-reset
- * triggers; Task 6 only wires the inputs.
+ * Task 11 will extend the hook bag further with full-reset triggers for
+ * Rung 3.
  */
 
 import { ConnectionAuthority } from './connection-authority.js';
@@ -28,7 +34,14 @@ let _authority = null;
  * @param {{
  *   sendJson: (msg: object) => void,
  *   ownDeviceId: string,
+ *   forceWsReconnect?: () => void | Promise<void>,
+ *   register?: () => void | Promise<void>,
  * }} hooks
+ *   `forceWsReconnect` is optional at the type level: skeleton-mode tests
+ *   omit it (Rung 2 surrenders fast in that case), and the wiring-layer
+ *   implementation is a follow-up to Task 8. `register` is an optional
+ *   alternate to the default `sendJson({type:'register-rendezvous', ...})`
+ *   used by Rung 1.
  * @returns {ConnectionAuthority}
  */
 export function ensureConnectionAuthority(hooks) {

@@ -20,9 +20,18 @@
  *   - OFFLINE peers are skipped (the relay-peer-online event resurrects
  *     them through UNKNOWN before any ping is issued).
  *
+ * As of Task 8 the authority also drives the **recovery ladder**:
+ *   - When a peer transitions into FAILED, a {@link RecoveryLadder} is
+ *     started (one at a time across the whole authority — concurrent
+ *     failures share the in-flight ladder).
+ *   - When `selfState` enters RECONNECTING (e.g. ws-closed from ONLINE),
+ *     the same ladder is started if none is running.
+ *   - Rungs 1 + 2 are wired here; Rung 3 is a stub that throws "TODO Rung 3"
+ *     until Task 11.
+ *
  * Subsequent tasks layer on:
- *   - Task 8/11: recovery ladder rungs.
  *   - Task 9: real ensureSendable pre-flight (channel-open, presence, peer-ping probe).
+ *   - Task 11: Rung 3 (full session reset), Rung 4 backoff + surrender.
  *
  * Spec: docs/superpowers/specs/2026-05-02-connection-authority-design.md
  */
@@ -31,7 +40,14 @@ import { Observable } from './observable.js';
 import { PeerPingTracker } from './peer-ping.js';
 import { PeerHealth, reducePeerHealth } from './peer-health.js';
 import { SelfState, reduceSelfState } from './self-state.js';
-import { BG_PING_INTERVAL_MS, PING_TIMEOUT_MS } from './constants.js';
+import { RecoveryLadder, awaitObservableOrTimeout } from './recovery-ladder.js';
+import {
+  BG_PING_INTERVAL_MS,
+  PING_TIMEOUT_MS,
+  RUNG_1_BUDGET_MS,
+  RUNG_2_BUDGET_MS,
+  RUNG_3_BUDGET_MS,
+} from './constants.js';
 
 /**
  * The authoritative coordinator for connection + peer-health state.
@@ -64,8 +80,26 @@ export class ConnectionAuthority {
    * @param {object} args
    * @param {object} args.signalingHooks
    *   Bag of caller-injected hooks. Required: at minimum a `sendJson` function
-   *   for outbound WS messages once a tracker is needed. `ownDeviceId` is
-   *   needed before any peer-ping can fire (Task 7); skeleton does not require it.
+   *   for outbound WS messages once a tracker is needed. Optional fields:
+   *
+   *   - `ownDeviceId`     : `string` — needed before any peer-ping can fire
+   *                         (Task 7); skeleton-mode tests omit it.
+   *   - `forceWsReconnect`: `() => void | Promise<void>` — called by the
+   *                         recovery ladder's Rung 2 to tear down `pairingWs`
+   *                         and trigger a fresh `_doConnect` from the wiring
+   *                         layer (see `connection-authority-wiring.js`).
+   *                         When omitted, Rung 2 still runs but its action
+   *                         immediately surrenders (returns false), advancing
+   *                         the ladder to Rung 3. The wiring-layer
+   *                         implementation lands in a follow-up task; Task 8
+   *                         only documents the contract so test mocks are
+   *                         clear.
+   *   - `register`        : `() => void | Promise<void>` — optional alternate
+   *                         hook for issuing the `register-rendezvous` Rung 1
+   *                         dispatch. When omitted, Rung 1 falls back to
+   *                         `sendJson({type:'register-rendezvous', ...})`
+   *                         using `ownDeviceId`.
+   *
    * @param {object} [args.options]
    * @param {number} [args.options.pingTimeoutMs]
    *   Per-ping deadline in milliseconds, forwarded to PeerPingTracker.
@@ -77,7 +111,8 @@ export class ConnectionAuthority {
    *   Injectable clock + timer surface for unit tests. Must expose
    *   `setTimeout`, `clearTimeout`, and `now()` (returning current ms).
    *   Defaults to `globalThis` for `setTimeout`/`clearTimeout` and
-   *   `Date.now` for `now`.
+   *   `Date.now` for `now`. Also forwarded to the recovery ladder's
+   *   budget-timer helpers so ladder timing is virtual under FakeClock.
    * @throws {TypeError} If `signalingHooks` is missing.
    */
   constructor({ signalingHooks, options = {} }) {
@@ -105,6 +140,14 @@ export class ConnectionAuthority {
     this._now = t && typeof t.now === 'function'
       ? () => t.now()
       : () => Date.now();
+    // Bundle for sub-systems (recovery ladder helpers) that want a
+    // `{setTimeout, clearTimeout, now}` shaped object — we share the same
+    // bindings so the FakeClock is the single source of virtual time.
+    this._timerImpl = {
+      setTimeout: this._setTimeout,
+      clearTimeout: this._clearTimeout,
+      now: this._now,
+    };
 
     // Hooks must provide ownDeviceId before sendPing can fire. The tracker is
     // constructed lazily-by-presence: if the hook bag lacks an identity (e.g.
@@ -140,6 +183,18 @@ export class ConnectionAuthority {
      * @type {Map<string, string>}
      */
     this._nonceToPeer = new Map();
+
+    /**
+     * The currently-running recovery ladder, or `null` when idle. The spec
+     * mandates one-ladder-at-a-time per side: a peer going FAILED while a
+     * ladder is already running is absorbed into that ladder's success
+     * criterion (Rung 2's "any paired peer reaching HEALTHY"). Clearing this
+     * back to `null` when the ladder settles is what allows the next failure
+     * to start at Rung 1 again.
+     *
+     * @type {RecoveryLadder|null}
+     */
+    this._currentLadder = null;
 
     this._shutdown = false;
   }
@@ -260,10 +315,21 @@ export class ConnectionAuthority {
    * Run an event through the selfState reducer; emit only if it produced a
    * different state. Identity check (===) is sufficient since the reducer
    * returns enum string constants.
+   *
+   * Side effect: when the transition crosses *into* `RECONNECTING` from any
+   * other state, kick the recovery ladder (if no ladder is already running).
+   * Per spec §"Recovery ladder", `selfState` going `RECONNECTING` is one of
+   * the two ladder triggers; the other is `peerHealth[X] = FAILED`, handled
+   * in {@link _dispatchPeer}.
    */
   _dispatchSelf(event) {
-    const next = reduceSelfState(this._selfState.value, event);
-    if (next !== this._selfState.value) this._selfState.next(next);
+    const prev = this._selfState.value;
+    const next = reduceSelfState(prev, event);
+    if (next === prev) return;
+    this._selfState.next(next);
+    if (prev !== SelfState.RECONNECTING && next === SelfState.RECONNECTING) {
+      this._kickLadder({ triggerPeerId: null, reason: 'self-reconnecting' });
+    }
   }
 
   /**
@@ -288,6 +354,13 @@ export class ConnectionAuthority {
     const newMap = new Map(map);
     newMap.set(peerId, next);
     this._peerHealth.next(newMap);
+    // Recovery-ladder trigger: any peer crossing INTO FAILED kicks the
+    // ladder if none is running. Concurrent failures share the in-flight
+    // ladder — Rung 2's success criterion ("any paired peer HEALTHY")
+    // covers them. See spec §"Recovery ladder", discipline rules.
+    if (current !== PeerHealth.FAILED && next === PeerHealth.FAILED) {
+      this._kickLadder({ triggerPeerId: peerId, reason: 'peer-failed' });
+    }
   }
 
   // ── Cadence engine (Task 7) ─────────────────────────────────────────────
@@ -375,6 +448,13 @@ export class ConnectionAuthority {
     const dueAt = entry.lastActivityAt + this._bgPingIntervalMs;
     const delay = Math.max(0, dueAt - this._now());
     entry.pingTimer = this._setTimeout(() => this._fireCadenceTick(peerId), delay);
+    // Unref the real-clock variant so a test that doesn't inject a FakeClock
+    // (and so doesn't drive the cadence loop deterministically) still lets
+    // the process exit cleanly. FakeClock returns a plain number — the typeof
+    // guard makes this a no-op there. Note: this does NOT change cadence
+    // semantics in production: in the SW the event loop is kept alive by the
+    // WebSocket / message handlers, not by ping timers.
+    if (entry.pingTimer && typeof entry.pingTimer.unref === 'function') entry.pingTimer.unref();
   }
 
   /**
@@ -405,6 +485,8 @@ export class ConnectionAuthority {
       () => this._handlePingTimeout(peerId, nonce),
       this._pingTimeoutMs,
     );
+    // See _schedulePing for rationale on unref-when-available.
+    if (entry.timeoutTimer && typeof entry.timeoutTimer.unref === 'function') entry.timeoutTimer.unref();
   }
 
   /**
@@ -437,8 +519,10 @@ export class ConnectionAuthority {
 
   /**
    * Tear-down hook. Clears every per-peer ping/timeout timer and forgets all
-   * nonce mappings. After shutdown, further notify calls are still safe but
-   * no new cadence cycles will be scheduled.
+   * nonce mappings. Also cancels any in-flight recovery ladder so its
+   * pending budget timers / observable subscriptions are released. After
+   * shutdown, further notify calls are still safe but no new cadence cycles
+   * or ladder kicks will run.
    */
   shutdown() {
     this._shutdown = true;
@@ -446,5 +530,250 @@ export class ConnectionAuthority {
       this._stopCadence(peerId);
     }
     this._nonceToPeer.clear();
+    if (this._currentLadder) {
+      this._currentLadder.cancel();
+      this._currentLadder = null;
+    }
   }
+
+  // ── Recovery ladder (Task 8) ────────────────────────────────────────────
+
+  /**
+   * Start the recovery ladder if none is currently running. Idempotent:
+   * concurrent failures (multiple peers FAILED in the same tick, or
+   * `selfState = RECONNECTING` while a peer-FAILED ladder is in flight)
+   * are absorbed into the existing ladder rather than starting a second.
+   *
+   * Resets `_currentLadder = null` once the ladder resolves (success,
+   * surrender, or cancellation), so the next failure starts at Rung 1
+   * again — matching the spec's discipline rule "A rung that succeeds
+   * resets the ladder to idle."
+   *
+   * @param {{ triggerPeerId: string|null, reason: string }} args
+   * @private
+   */
+  _kickLadder({ triggerPeerId, reason }) {
+    if (this._shutdown) return;
+    if (this._currentLadder) return; // ladder owns the floor
+    const ladder = this._buildLadder(triggerPeerId);
+    this._currentLadder = ladder;
+    // eslint-disable-next-line no-console
+    console.log(`[CA] ladder: kicked reason=${reason} triggerPeer=${triggerPeerId ?? 'none'}`);
+    ladder.run().then(
+      (result) => {
+        // Only release the slot if this ladder is still the current one.
+        // (`requestReconnect` mid-ladder will swap in a new ladder in
+        // Task 11; here we just unlatch our reference.)
+        if (this._currentLadder === ladder) this._currentLadder = null;
+        if (result.ok) {
+          // The reducer is the source of truth for the resulting state — we
+          // dispatch `recovery-succeeded` to drop FAILED peers back to
+          // UNKNOWN and lift selfState from RECONNECTING (where applicable).
+          this._dispatchSelf({ type: 'recovery-succeeded' });
+          if (triggerPeerId) {
+            this._dispatchPeer(triggerPeerId, { type: 'recovery-succeeded' });
+          }
+        }
+        // ok=false: leave reducer state alone. Rung 4 (Task 11) will surface
+        // surrender to the user.
+      },
+      (err) => {
+        // _runInternal() should never reject — we treat thrown actions as
+        // failures internally — but be defensive.
+        if (this._currentLadder === ladder) this._currentLadder = null;
+        // eslint-disable-next-line no-console
+        console.log(`[CA] ladder: unexpected rejection ${err && err.message}`);
+      },
+    );
+  }
+
+  /**
+   * Build the three-rung ladder for the given trigger. The rung actions
+   * close over `this` so they can subscribe to the live observables. They
+   * use the same FakeClock-aware `_timerImpl` the cadence engine uses, so
+   * tests can drive ladder budget timers via `clock.tick(...)`.
+   *
+   * @param {string|null} triggerPeerId
+   *   The peer that crossed into FAILED, or `null` for self-RECONNECTING.
+   * @returns {RecoveryLadder}
+   * @private
+   */
+  _buildLadder(triggerPeerId) {
+    return new RecoveryLadder({
+      rungs: [
+        {
+          name: 'rung1',
+          budgetMs: RUNG_1_BUDGET_MS,
+          action: ({ signal }) => this._rung1Action(triggerPeerId, signal),
+        },
+        {
+          name: 'rung2',
+          budgetMs: RUNG_2_BUDGET_MS,
+          action: ({ signal }) => this._rung2Action(signal),
+        },
+        {
+          name: 'rung3',
+          budgetMs: RUNG_3_BUDGET_MS,
+          // eslint-disable-next-line no-unused-vars
+          action: async ({ signal: _signal }) => {
+            // Stub — Task 11 implements full session reset.
+            throw new Error('TODO Rung 3');
+          },
+        },
+      ],
+      timerImpl: this._timerImpl,
+    });
+  }
+
+  /**
+   * Rung 1: re-register rendezvous + wait for success indicator.
+   *
+   * Action: dispatch `register-rendezvous` over the existing `sendJson`
+   * hook (relay may have GC'd our session). Success indicator: any path to
+   * `peerHealth[triggerPeerId] === HEALTHY` (relay-peer-online → frame-
+   * received → pong-received) within {@link RUNG_1_BUDGET_MS}. For self-
+   * RECONNECTING triggers (no specific peer) the criterion degrades to
+   * "any peer in `peerHealth` is HEALTHY" — equivalent to Rung 2's
+   * second clause without the `selfState === ONLINE` precondition.
+   *
+   * @param {string|null} triggerPeerId
+   * @param {AbortSignal} signal
+   * @returns {Promise<boolean>}
+   * @private
+   */
+  async _rung1Action(triggerPeerId, signal) {
+    // If the ladder was cancelled before this rung even started, don't
+    // bother dispatching the register frame — it would just hit a relay
+    // we're about to tear down anyway. Symmetric with _rung2Action.
+    if (signal.aborted) return false;
+
+    // Best-effort dispatch. A throwing sendJson (e.g. WS already closed)
+    // shouldn't crash the ladder — it just means Rung 1 cannot recover and
+    // we'll time out and advance to Rung 2.
+    try {
+      if (typeof this._hooks.register === 'function') {
+        await this._hooks.register();
+      } else if (typeof this._hooks.sendJson === 'function' && this._hooks.ownDeviceId) {
+        this._hooks.sendJson({
+          type: 'register-rendezvous',
+          rendezvousId: this._hooks.ownDeviceId,
+        });
+      }
+    } catch {
+      // Intentional swallow — see comment above.
+    }
+
+    const predicate = triggerPeerId
+      ? (map) => map.get(triggerPeerId) === PeerHealth.HEALTHY
+      : (map) => {
+        for (const v of map.values()) if (v === PeerHealth.HEALTHY) return true;
+        return false;
+      };
+
+    return awaitObservableOrTimeout(
+      this._peerHealth,
+      predicate,
+      RUNG_1_BUDGET_MS,
+      signal,
+      this._timerImpl,
+    );
+  }
+
+  /**
+   * Rung 2: tear down the WS and reconnect via `hooks.forceWsReconnect`.
+   *
+   * Success indicator: `selfState === ONLINE` AND at least one paired peer
+   * is HEALTHY, both within {@link RUNG_2_BUDGET_MS}. The two conditions
+   * are tracked via separate observable subscriptions whose results we AND
+   * together in a small composite check.
+   *
+   * If `forceWsReconnect` is missing from the hook bag (skeleton-mode test
+   * harnesses), we surrender Rung 2 immediately: there's no transport to
+   * tear down and the ladder advances to Rung 3.
+   *
+   * @param {AbortSignal} signal
+   * @returns {Promise<boolean>}
+   * @private
+   */
+  async _rung2Action(signal) {
+    const force = this._hooks.forceWsReconnect;
+    if (typeof force !== 'function') {
+      // No transport-tear-down hook wired — skip the rung.
+      return false;
+    }
+    try {
+      await force();
+    } catch {
+      // forceWsReconnect failed synchronously / asynchronously — give the
+      // budget a chance to observe success-by-other-path before surrendering.
+    }
+
+    // The composite predicate fires when BOTH selfState is ONLINE AND any
+    // paired peer is HEALTHY. We can't AND two observables atomically with
+    // the helper, so we subscribe directly here and short-circuit settle.
+    return new Promise((resolve) => {
+      if (signal && signal.aborted) { resolve(false); return; }
+
+      let settled = false;
+      let unsubSelf = null;
+      let unsubPeer = null;
+      let timerId = null;
+      let onAbort = null;
+
+      const cleanup = () => {
+        if (unsubSelf)  { try { unsubSelf();  } catch { /* swallow */ } unsubSelf  = null; }
+        if (unsubPeer)  { try { unsubPeer();  } catch { /* swallow */ } unsubPeer  = null; }
+        if (timerId != null) { try { this._clearTimeout(timerId); } catch { /* swallow */ } timerId = null; }
+        if (signal && onAbort) { try { signal.removeEventListener('abort', onAbort); } catch { /* swallow */ } onAbort = null; }
+      };
+      const settle = (v) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(v);
+      };
+
+      let selfOnline = this._selfState.value === SelfState.ONLINE;
+      let anyPeerHealthy = peerMapHasHealthy(this._peerHealth.value);
+
+      const tryFire = () => { if (selfOnline && anyPeerHealthy) settle(true); };
+
+      timerId = this._setTimeout(() => settle(false), RUNG_2_BUDGET_MS);
+      // Unref-when-available — see comment in awaitObservableOrTimeout. Keeps
+      // the process from hanging when a ladder is kicked from a test that
+      // doesn't await its full lifecycle.
+      if (timerId && typeof timerId.unref === 'function') timerId.unref();
+
+      if (signal) {
+        onAbort = () => settle(false);
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      unsubSelf = this._selfState.subscribe((s) => {
+        selfOnline = s === SelfState.ONLINE;
+        tryFire();
+      });
+      unsubPeer = this._peerHealth.subscribe((m) => {
+        anyPeerHealthy = peerMapHasHealthy(m);
+        tryFire();
+      });
+
+      // The two subscribes above replay current values synchronously;
+      // tryFire was invoked inside each. If both were already true, settle
+      // already fired and cleanup torn everything down. Otherwise we wait.
+    });
+  }
+}
+
+/**
+ * Predicate helper for Rung 2's "any peer HEALTHY" criterion. Pulled out so
+ * it can be unit-tested via the ladder integration tests without monkey-
+ * patching the class.
+ *
+ * @param {Map<string, string>} map
+ * @returns {boolean}
+ */
+function peerMapHasHealthy(map) {
+  for (const v of map.values()) if (v === PeerHealth.HEALTHY) return true;
+  return false;
 }

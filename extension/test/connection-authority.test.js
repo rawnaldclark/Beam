@@ -576,3 +576,156 @@ describe('ConnectionAuthority: background ping cadence', () => {
     assert.equal(clock.pending, 0, 'no cadence timers armed without a tracker');
   });
 });
+
+// ─── Task 8: recovery ladder wiring ──────────────────────────────────────────
+
+/**
+ * Integration coverage for the authority's ladder kickoff. Uses the same
+ * FakeClock so ladder budget timers are virtual; a small forceWsReconnect
+ * spy lets us assert Rung 2 ran. The full per-rung mechanics are unit-tested
+ * in `recovery-ladder.test.js`; here we only verify the wiring contract:
+ *   - which transitions trigger _kickLadder
+ *   - the single-ladder discipline
+ *   - the success path lifts state via `recovery-succeeded`
+ *   - shutdown cancels an in-flight ladder
+ */
+function makeLadderAuthority({ withForceWsReconnect = false } = {}) {
+  const clock = new FakeClock(0);
+  const sent = [];
+  const calls = { forceWsReconnect: 0 };
+  const hooks = {
+    sendJson: (m) => sent.push(m),
+    ownDeviceId: 'self-device-id',
+  };
+  if (withForceWsReconnect) {
+    hooks.forceWsReconnect = () => { calls.forceWsReconnect += 1; };
+  }
+  const auth = new ConnectionAuthority({
+    signalingHooks: hooks,
+    options: { timerImpl: clock },
+  });
+  return { auth, clock, sent, calls };
+}
+
+describe('ConnectionAuthority: recovery ladder wiring', () => {
+  it('kicks the ladder when a peer crosses into FAILED', async () => {
+    const { auth, clock, sent } = makeLadderAuthority();
+    auth.notifyPeerOnline('X'); // UNKNOWN
+
+    // Two consecutive missed pings → STALE → FAILED.
+    clock.tick(BG_PING_INTERVAL_MS); // ping #1
+    clock.tick(PING_TIMEOUT_MS);     // miss → STALE
+    clock.tick(BG_PING_INTERVAL_MS); // ping #2
+    clock.tick(PING_TIMEOUT_MS);     // miss → FAILED + ladder kicks
+
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.FAILED);
+    // Rung 1 dispatches register-rendezvous via sendJson — sent[2] should
+    // be that frame (sent[0] and sent[1] are the two peer-pings).
+    const registerFrame = sent.find((m) => m.type === 'register-rendezvous');
+    assert.ok(registerFrame, 'rung1 must send register-rendezvous');
+    assert.equal(registerFrame.rendezvousId, 'self-device-id');
+    assert.ok(auth._currentLadder, 'ladder is active while Rung 1 is awaiting');
+
+    // Allow the microtask chain to flush and the ladder to settle naturally.
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(auth._currentLadder, null, 'shutdown clears the ladder');
+  });
+
+  it('does not start a second ladder while one is already running', async () => {
+    const { auth, sent } = makeLadderAuthority();
+    auth.notifyPeerOnline('X');
+    auth.notifyPeerOnline('Y');
+
+    // Drive X to FAILED through ping-missed reducer events directly so we
+    // can check the kick semantics without needing two cadence cycles.
+    auth._dispatchPeer('X', { type: 'ping-missed' }); // STALE
+    auth._dispatchPeer('X', { type: 'ping-missed' }); // FAILED → kick #1
+    const ladderRef = auth._currentLadder;
+    assert.ok(ladderRef, 'first FAILED peer kicks the ladder');
+
+    const registersBefore = sent.filter((m) => m.type === 'register-rendezvous').length;
+
+    // Y goes FAILED while the ladder is still running — must NOT start a new ladder.
+    auth._dispatchPeer('Y', { type: 'ping-missed' });
+    auth._dispatchPeer('Y', { type: 'ping-missed' });
+    assert.equal(auth._currentLadder, ladderRef, 'second FAILED peer does not replace the ladder');
+
+    const registersAfter = sent.filter((m) => m.type === 'register-rendezvous').length;
+    assert.equal(registersAfter, registersBefore, 'no extra register-rendezvous from a second kick');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('Rung 1 succeeds when the failed peer becomes HEALTHY within budget', async () => {
+    const { auth, clock } = makeLadderAuthority();
+    auth.notifyPeerOnline('X');
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.FAILED);
+    assert.ok(auth._currentLadder);
+
+    // 2 seconds into Rung 1's 5s budget, a frame arrives from X.
+    clock.tick(2_000);
+    auth.notifyFrameReceived('X');
+
+    // The ladder's success-criterion observer fires synchronously on the
+    // peerHealth.next(); the .then callback then dispatches recovery-
+    // succeeded which moves X back to UNKNOWN, then the frame-received
+    // already promoted it to HEALTHY. Net: X is HEALTHY and the ladder
+    // releases its slot.
+    await new Promise((r) => setImmediate(r));
+    assert.equal(auth._currentLadder, null, 'ladder released after Rung 1 success');
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.HEALTHY);
+  });
+
+  it('selfState entering RECONNECTING also kicks the ladder', async () => {
+    const { auth } = makeLadderAuthority();
+    auth.notifyWsOpening();
+    auth.notifyAuthComplete();
+    assert.equal(auth.selfState.value, SelfState.ONLINE);
+    assert.equal(auth._currentLadder, null);
+
+    auth.notifyWsClosed(); // ONLINE → RECONNECTING
+    assert.equal(auth.selfState.value, SelfState.RECONNECTING);
+    assert.ok(auth._currentLadder, 'self-RECONNECTING transition kicks the ladder');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('Rung 2 calls forceWsReconnect when Rung 1 budget elapses', async () => {
+    const { auth, clock, calls } = makeLadderAuthority({ withForceWsReconnect: true });
+    auth.notifyPeerOnline('X');
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    assert.ok(auth._currentLadder);
+
+    // Advance past Rung 1's 5s budget.
+    clock.tick(5_000);
+    await new Promise((r) => setImmediate(r));
+    // Microtask chain may need a couple of flushes to advance Rung 2.
+    await new Promise((r) => setImmediate(r));
+    assert.equal(calls.forceWsReconnect, 1, 'rung2 invoked forceWsReconnect once');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('shutdown cancels an in-flight ladder cleanly', async () => {
+    const { auth, clock } = makeLadderAuthority({ withForceWsReconnect: true });
+    auth.notifyPeerOnline('X');
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    assert.ok(auth._currentLadder);
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+
+    // No timer should remain armed: shutdown clears cadence timers, and the
+    // ladder's cancel-driven cleanup releases its budget timer + observer.
+    assert.equal(clock.pending, 0, 'no leaked timers after shutdown');
+    assert.equal(auth._currentLadder, null);
+  });
+});
