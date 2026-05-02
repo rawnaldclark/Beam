@@ -128,6 +128,12 @@ Two reactive flows. UI binds to `peerHealth` for per-device dots and to `selfSta
 - `ONLINE` — WS open, auth complete, rendezvous registered
 - `RECONNECTING` — was ONLINE, recovery ladder running
 
+**Entry triggers for `CONNECTING`** (full set, not only the diagram's "user paired" arrow):
+1. User completes pairing (first time)
+2. App / SW cold boot with at least one paired device in storage
+3. `requestReconnect()` invoked by user tap (transitions through `CONNECTING` on the way back to `ONLINE`)
+4. Recovery ladder Rung 2 or Rung 3 begins (re-enters via `RECONNECTING → CONNECTING`)
+
 ### Peer health — for each paired device, "is this peer reachable?"
 
 ```
@@ -163,6 +169,10 @@ Any of these counts as proof of life and resets the state to `HEALTHY`:
 3. Successful outbound transfer completion to that peer (`sendFile` / `sendClipboard` returned OK)
 
 Real send activity is its own liveness signal; we don't redundant-ping in the wake of a successful frame exchange.
+
+### Exit from `OFFLINE`
+
+A relay `peer-online` event for a device currently in `OFFLINE` transitions it to `UNKNOWN`, *not* directly to `HEALTHY`. The relay's view ("their WS is open") is weaker than ours ("they answered our ping"). The next background ping cycle (or first user-tap pre-flight) confirms reachability and promotes to `HEALTHY`. This avoids the "relay says online, app is dead" false-positive that already triggers the `says connected, nothing sends` symptom today.
 
 ### UI mapping
 
@@ -261,6 +271,7 @@ Manual tap always bypasses backoff.
 
 - A rung that succeeds resets the ladder to idle. Next failure starts at Rung 1.
 - Two full Rung-3 failures within 5 min → promote to Rung 4 immediately. Don't thrash.
+- A "full Rung-3 failure" means: the ladder reached Rung 3, ran its 30s budget, and `selfState` did not become `ONLINE` (either because of timeout, thrown exception, or sub-step failure). Successful Rung 1 or Rung 2 in subsequent attempts does not count toward this promotion rule — only Rung 3 attempts.
 - The whole ladder runs as one cancelable coroutine (Android) / promise chain (Chrome). `requestReconnect` mid-ladder cancels and restarts at Rung 3.
 - Every rung transition is logged with timing: `[CA] ladder: rung=2 start`, `[CA] ladder: rung=2 ok t=12.4s`. Diagnoses regressions without manual instrumentation.
 
