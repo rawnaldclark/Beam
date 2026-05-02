@@ -60,12 +60,18 @@ function generateNonce() {
 export class PeerPingTracker {
   /**
    * @param {object} opts
-   * @param {(msg: object) => void} opts.sendJson   Caller-injected send function.
-   * @param {number}               opts.timeoutMs  Milliseconds before a ping times out.
+   * @param {(msg: object) => void} opts.sendJson      Caller-injected send function.
+   * @param {number}               opts.timeoutMs     Milliseconds before a ping times out.
+   * @param {string}               opts.ownDeviceId   This client's own device ID. Used as
+   *                                                   the `rendezvousId` on outbound peer-ping
+   *                                                   frames so the relay's rendezvous-membership
+   *                                                   check resolves to the Chrome-owned set
+   *                                                   that both peers share.
    */
-  constructor({ sendJson, timeoutMs }) {
+  constructor({ sendJson, timeoutMs, ownDeviceId }) {
     this._sendJson = sendJson;
     this._timeoutMs = timeoutMs;
+    this._ownDeviceId = ownDeviceId;
     /** @type {Map<string, {sentAt:number, deadline:number, peerId:string, resolve:Function, reject:Function}>} */
     this._pending = new Map();
   }
@@ -74,7 +80,15 @@ export class PeerPingTracker {
    * Send a peer-ping to `peerId` and return the nonce and a promise that
    * settles when the pong arrives or the deadline is swept.
    *
-   * @param {string} peerId  The device ID to ping (used as both targetDeviceId and rendezvousId).
+   * Wire-shape routing:
+   *   - `targetDeviceId` is the peer being pinged.
+   *   - `rendezvousId`   is THIS client's own deviceId (injected via constructor).
+   *
+   * The relay's signaling path (`Signaling.handleMessage`) enforces rendezvous
+   * membership for both sender and target; the Chrome↔Android pair shares
+   * Chrome's own deviceId as the rendezvous, never the peer's.
+   *
+   * @param {string} peerId  The device ID to ping (used as `targetDeviceId`).
    * @param {number} [now]   Optional fake-clock timestamp (defaults to Date.now()).
    * @returns {{ nonce: string, promise: Promise<{ok:true, rttMs:number}> }}
    */
@@ -95,7 +109,7 @@ export class PeerPingTracker {
       type: 'peer-ping',
       nonce,
       targetDeviceId: peerId,
-      rendezvousId: peerId,
+      rendezvousId: this._ownDeviceId,
     });
 
     return { nonce, promise };

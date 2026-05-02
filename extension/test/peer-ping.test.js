@@ -34,6 +34,7 @@ describe('PeerPingTracker.sendPing', () => {
     const tracker = new PeerPingTracker({
       sendJson: (msg) => sent.push(msg),
       timeoutMs: 5000,
+      ownDeviceId: 'device-self',
     });
 
     const peerId = 'peer-device-abc';
@@ -49,17 +50,36 @@ describe('PeerPingTracker.sendPing', () => {
     assert.equal(msg.type, 'peer-ping', 'type must be "peer-ping"');
     assert.equal(msg.nonce, result.nonce, 'msg.nonce must match result.nonce');
     assert.equal(msg.targetDeviceId, peerId, 'targetDeviceId must be peerId');
-    assert.equal(msg.rendezvousId, peerId, 'rendezvousId must be peerId');
+    assert.equal(msg.rendezvousId, 'device-self', 'rendezvousId must be ownDeviceId, NOT peerId');
 
     // promise is still pending
     const settled = await settleSoon(result.promise);
     assert.equal(settled, PENDING, 'promise should still be pending after sendPing');
   });
 
+  it('rendezvousId is the injected ownDeviceId, not the peerId', () => {
+    const sent = [];
+    const tracker = new PeerPingTracker({
+      sendJson: (msg) => sent.push(msg),
+      timeoutMs: 5000,
+      ownDeviceId: 'chrome-own-id-xyz',
+    });
+
+    const peerId = 'android-peer-id-123';
+    tracker.sendPing(peerId);
+
+    assert.equal(sent.length, 1, 'sendJson should have been called once');
+    const msg = sent[0];
+    assert.equal(msg.targetDeviceId, peerId, 'targetDeviceId must be peerId');
+    assert.equal(msg.rendezvousId, 'chrome-own-id-xyz', 'rendezvousId must equal ownDeviceId');
+    assert.notEqual(msg.rendezvousId, peerId, 'rendezvousId must NOT equal peerId');
+  });
+
   it('nonce is 16-byte b64url without padding, unique across calls', () => {
     const tracker = new PeerPingTracker({
       sendJson: () => {},
       timeoutMs: 5000,
+      ownDeviceId: 'device-self',
     });
 
     const nonces = new Set();
@@ -82,6 +102,7 @@ describe('PeerPingTracker.recordPong', () => {
     const tracker = new PeerPingTracker({
       sendJson: () => {},
       timeoutMs: 5000,
+      ownDeviceId: 'device-self',
     });
 
     const t0 = 1000;
@@ -98,6 +119,7 @@ describe('PeerPingTracker.recordPong', () => {
     const tracker = new PeerPingTracker({
       sendJson: () => {},
       timeoutMs: 5000,
+      ownDeviceId: 'device-self',
     });
     assert.doesNotThrow(() => tracker.recordPong('completely-unknown-nonce'));
   });
@@ -110,6 +132,7 @@ describe('PeerPingTracker.sweepExpired', () => {
     const tracker = new PeerPingTracker({
       sendJson: () => {},
       timeoutMs: 3000,
+      ownDeviceId: 'device-self',
     });
 
     const t0 = 5000;
@@ -141,6 +164,7 @@ describe('PeerPingTracker.sweepExpired', () => {
     const tracker = new PeerPingTracker({
       sendJson: () => {},
       timeoutMs: 1000,
+      ownDeviceId: 'device-self',
     });
 
     const t0 = 0;
@@ -157,6 +181,7 @@ describe('PeerPingTracker.sweepExpired', () => {
     const tracker = new PeerPingTracker({
       sendJson: () => {},
       timeoutMs: 5000,
+      ownDeviceId: 'device-self',
     });
 
     const t0 = 0;
