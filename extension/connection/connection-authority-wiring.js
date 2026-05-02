@@ -67,4 +67,80 @@ export function getConnectionAuthority() {
  */
 export function _resetConnectionAuthority() {
   _authority = null;
+  _popupBroadcasterInstalled = false;
+}
+
+// ---------------------------------------------------------------------------
+// Popup broadcaster (Task 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Single-flight guard so {@link installPopupBroadcaster} cannot subscribe to
+ * the same authority observables twice when called from multiple SW boot
+ * paths. Resets via {@link _resetConnectionAuthority} for tests.
+ *
+ * @type {boolean}
+ */
+let _popupBroadcasterInstalled = false;
+
+/**
+ * Subscribe to the authority's `selfState` and `peerHealth` observables and
+ * push a `CONNECTION_STATE_CHANGED` chrome.runtime message on every change so
+ * the popup can render the latest state without polling.
+ *
+ * The payload's `peerHealth` is serialised as a plain object
+ * (`{[deviceId]: PeerHealthString}`) — Maps do NOT survive the
+ * `chrome.runtime.sendMessage` boundary in MV3, so the popup would see an
+ * empty Map and the UI would silently fail to update.
+ *
+ * Send errors are silently absorbed: when no popup is open, the SW's
+ * `sendMessage` rejects with "Could not establish connection. Receiving end
+ * does not exist." That's the steady state — the popup's `GET_CONNECTION_STATE`
+ * fetch on open recovers the latest snapshot. Any other error (e.g. network
+ * stack tear-down during a runtime restart) is also non-fatal here.
+ *
+ * Safe to call multiple times: a `_popupBroadcasterInstalled` guard ensures
+ * the subscriptions are wired exactly once per authority. Call from
+ * `_doConnect` (or any equivalent boot path) immediately after
+ * `ensureConnectionAuthority` returns the singleton.
+ *
+ * @returns {void}
+ */
+export function installPopupBroadcaster() {
+  if (_popupBroadcasterInstalled) return;
+  const authority = _authority;
+  // No-op when called before the authority is constructed — defensive only;
+  // the wiring layer always calls this AFTER ensureConnectionAuthority.
+  if (!authority) return;
+  _popupBroadcasterInstalled = true;
+
+  const broadcast = () => {
+    const peerHealthObj = {};
+    for (const [peerId, health] of authority.peerHealth.value.entries()) {
+      peerHealthObj[peerId] = health;
+    }
+    const payload = {
+      selfState: authority.selfState.value,
+      peerHealth: peerHealthObj,
+    };
+    try {
+      // Promise-returning chrome.runtime.sendMessage in MV3; .catch absorbs
+      // the "Receiving end does not exist" rejection that fires when the
+      // popup is closed (the steady state for a background SW).
+      const p = chrome.runtime.sendMessage({
+        type: 'CONNECTION_STATE_CHANGED',
+        payload,
+      });
+      if (p && typeof p.catch === 'function') p.catch(() => {});
+    } catch {
+      // Some test environments stub chrome.runtime — swallow synchronously too.
+    }
+  };
+
+  // Subscribing replays the current value synchronously, which dispatches an
+  // initial broadcast. That's harmless: if the popup is closed, the message
+  // is dropped; if open, the popup gets a fresh snapshot it would have asked
+  // for via GET_CONNECTION_STATE anyway.
+  authority.selfState.subscribe(broadcast);
+  authority.peerHealth.subscribe(broadcast);
 }

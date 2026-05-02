@@ -54,6 +54,99 @@ const MAX_ACTIVE_SHOWN = 5;
 const TOAST_DURATION_MS = 3000;
 
 // ---------------------------------------------------------------------------
+// Connection-authority health (Task 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * PeerHealth enum string constants. Mirrors `extension/connection/peer-health.js`;
+ * we re-declare here to avoid pulling the SW-only module into the popup bundle.
+ * The strings are part of the chrome.runtime message contract — keep in sync.
+ *
+ * @readonly
+ * @enum {string}
+ */
+const PEER_HEALTH = Object.freeze({
+  UNKNOWN: 'UNKNOWN',
+  HEALTHY: 'HEALTHY',
+  STALE:   'STALE',
+  FAILED:  'FAILED',
+  OFFLINE: 'OFFLINE',
+});
+
+/**
+ * SelfState enum string constants. Mirrors `extension/connection/self-state.js`.
+ *
+ * @readonly
+ * @enum {string}
+ */
+const SELF_STATE = Object.freeze({
+  OFFLINE:      'OFFLINE',
+  CONNECTING:   'CONNECTING',
+  ONLINE:       'ONLINE',
+  RECONNECTING: 'RECONNECTING',
+});
+
+/**
+ * Map a PeerHealth enum value to the boolean "is this peer presently online?"
+ * shown in `currentDevices[*].isOnline`.
+ *
+ * Per the Task 10 plan:
+ *   HEALTHY, STALE -> online (the device IS reachable; STALE is just
+ *                              "we're double-checking with a ping")
+ *   FAILED, OFFLINE -> offline
+ *   UNKNOWN -> offline (CONSERVATIVE: until we have proof of life, we
+ *                       must not let the user attempt a send that will
+ *                       silently drop. The plan didn't specify; we err
+ *                       on the safe side. The dot will flip green within
+ *                       seconds once the first pong/frame arrives.)
+ *
+ * @param {string} health - PeerHealth enum value (or undefined).
+ * @returns {boolean}
+ */
+function peerHealthToIsOnline(health) {
+  return health === PEER_HEALTH.HEALTHY || health === PEER_HEALTH.STALE;
+}
+
+/**
+ * Map a PeerHealth enum value to the CSS class used on `.row-dot`.
+ *
+ *   HEALTHY  -> dot-online (steady green)
+ *   STALE    -> dot-stale  (green with subtle pulse)
+ *   FAILED   -> dot-failed (yellow/warn — paired with "Reconnecting…" subtext)
+ *   OFFLINE  -> dot-offline (grey)
+ *   UNKNOWN  -> dot-offline (grey; conservative, see peerHealthToIsOnline)
+ *
+ * @param {string|undefined} health
+ * @returns {string} CSS class to apply to `.row-dot`.
+ */
+function peerHealthToDotClass(health) {
+  switch (health) {
+    case PEER_HEALTH.HEALTHY: return 'dot-online';
+    case PEER_HEALTH.STALE:   return 'dot-stale';
+    case PEER_HEALTH.FAILED:  return 'dot-failed';
+    case PEER_HEALTH.OFFLINE: return 'dot-offline';
+    default:                  return 'dot-offline';
+  }
+}
+
+/**
+ * Live peer-health snapshot from the SW, keyed by deviceId.
+ *
+ * @type {Object<string, string>}
+ */
+let peerHealthMap = {};
+
+/**
+ * Live selfState string from the SW. Defaults to UNKNOWN until the first
+ * `CONNECTION_STATE_CHANGED` arrives or `GET_CONNECTION_STATE` resolves;
+ * the banner uses ONLINE as the only "no banner" state, so an unknown
+ * default does not accidentally show the banner.
+ *
+ * @type {string}
+ */
+let selfStateValue = SELF_STATE.ONLINE;
+
+// ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
 
@@ -181,6 +274,15 @@ document.addEventListener('DOMContentLoaded', async () => {
   setupEventListeners();
   listenForStorageChanges();
   startKeepalive();
+
+  // Task 10: prime UI from the connection authority. The SW broadcasts
+  // CONNECTION_STATE_CHANGED on every change, but those fire only on
+  // *transitions*. On popup open we ask for an immediate snapshot so the
+  // dots / banner reflect reality without waiting for the next event.
+  // `loadDevices()` above already populated `currentDevices` from the
+  // legacy `chrome.storage.session.devicePresence` fallback — the snapshot
+  // will overwrite isOnline values as soon as the SW responds.
+  fetchConnectionStateSnapshot();
 
   // ── Refresh-on-focus: actively request fresh presence on every popup open ──
   //
@@ -344,6 +446,123 @@ async function loadReceivedFile() {
 }
 
 // ---------------------------------------------------------------------------
+// Connection authority snapshot + listener (Task 10)
+// ---------------------------------------------------------------------------
+
+/**
+ * Ask the SW for a fresh `{selfState, peerHealth}` snapshot. Called on popup
+ * open so the UI primes from the authority immediately rather than waiting
+ * for the next state change.
+ *
+ * Failures (SW not yet ready, authority not constructed) are non-fatal: we
+ * keep the legacy `chrome.storage.session.devicePresence` fallback that
+ * `loadDevices()` already populated, and the next `CONNECTION_STATE_CHANGED`
+ * broadcast (or the user opening the popup again) will reconcile.
+ *
+ * @returns {Promise<void>}
+ */
+async function fetchConnectionStateSnapshot() {
+  try {
+    const resp = await chrome.runtime.sendMessage({ type: 'GET_CONNECTION_STATE' });
+    if (resp?.ok && resp.payload) {
+      applyConnectionState(resp.payload);
+    }
+  } catch {
+    // SW unavailable — nothing to do. The legacy storage path already loaded.
+  }
+}
+
+/**
+ * Apply a `{selfState, peerHealth}` snapshot from the SW: updates the live
+ * `peerHealthMap` and `selfStateValue` module-level state, recomputes
+ * `currentDevices[*].isOnline`, refreshes the banner, and re-renders rows.
+ *
+ * The peer-health → isOnline mapping follows the Task 10 plan:
+ *   HEALTHY/STALE -> online; FAILED/OFFLINE/UNKNOWN -> offline.
+ *
+ * Defensive: if `payload.peerHealth` is missing/malformed, treat it as an
+ * empty map (everything offline). Same for selfState.
+ *
+ * @param {{selfState?: string, peerHealth?: Object<string, string>}} payload
+ */
+function applyConnectionState(payload) {
+  if (!payload) return;
+  const newPeerHealth = (payload.peerHealth && typeof payload.peerHealth === 'object')
+    ? payload.peerHealth
+    : {};
+  const newSelfState = typeof payload.selfState === 'string'
+    ? payload.selfState
+    : SELF_STATE.OFFLINE;
+
+  peerHealthMap = newPeerHealth;
+  selfStateValue = newSelfState;
+
+  // Reconcile each device's isOnline flag against the new peerHealth map.
+  // Devices not present in the map keep their existing isOnline value — the
+  // authority hasn't observed them yet (e.g. before the relay re-emits
+  // peer-online after a fresh WS), and we don't want to flip them to offline
+  // on partial data and cause the picker to skip past them.
+  currentDevices = currentDevices.map(d => {
+    const health = newPeerHealth[d.deviceId];
+    if (health == null) return d;
+    return { ...d, isOnline: peerHealthToIsOnline(health) };
+  });
+
+  // If any device is now HEALTHY / STALE and the relay-error banner was up,
+  // hide it — the connection has demonstrably recovered. (The connection
+  // banner below is independently controlled by selfState.)
+  if (relayErrorActive && currentDevices.some(d => d.isOnline)) {
+    hideRelayErrorBanner();
+  }
+
+  updateConnectionBanner();
+  renderDevices();
+}
+
+/**
+ * Show / hide / update the connection banner based on `selfStateValue`.
+ *
+ * Visible whenever `selfState != ONLINE`. Message text varies:
+ *   OFFLINE      -> "Not connected"
+ *   CONNECTING   -> "Connecting…"   (no Reconnect button — already trying)
+ *   RECONNECTING -> "Reconnecting…" (button still shown so the user can
+ *                    bypass the in-flight ladder if it's stuck)
+ *
+ * The button always sends REQUEST_RECONNECT; the SW handler decides whether
+ * to delegate to the authority or fall back to a WS bounce.
+ */
+function updateConnectionBanner() {
+  const banner = document.getElementById('connection-banner');
+  if (!banner) return;
+
+  if (selfStateValue === SELF_STATE.ONLINE) {
+    banner.classList.add('hidden');
+    return;
+  }
+
+  banner.classList.remove('hidden');
+
+  const messageEl = document.getElementById('connection-banner-message');
+  const buttonEl  = document.getElementById('connection-banner-button');
+  let messageText;
+  let showButton = true;
+  switch (selfStateValue) {
+    case SELF_STATE.CONNECTING:
+      messageText = 'Connecting\u2026';
+      showButton  = false;
+      break;
+    case SELF_STATE.RECONNECTING:
+      messageText = 'Reconnecting\u2026';
+      break;
+    case SELF_STATE.OFFLINE:
+    default:
+      messageText = 'Not connected';
+  }
+  if (messageEl) messageEl.textContent = messageText;
+  if (buttonEl)  buttonEl.classList.toggle('hidden', !showButton);
+}
+
+// ---------------------------------------------------------------------------
 // Renderers
 // ---------------------------------------------------------------------------
 
@@ -431,10 +650,24 @@ function deviceRowHTML(d) {
   }
 
   // Default idle state.
-  const dotClass = d.isOnline ? 'dot-online' : 'dot-offline';
+  // Task 10: dot colour is driven by the authority's peerHealth value when
+  // we have one; the binary isOnline fallback covers devices we haven't
+  // observed yet (e.g. between popup open and the first authority broadcast).
+  const health   = peerHealthMap[d.deviceId];
+  const dotClass = health
+    ? peerHealthToDotClass(health)
+    : (d.isOnline ? 'dot-online' : 'dot-offline');
   const trailing = relayErrorActive ? 'unavailable'
                  : d.isOnline       ? 'send'
                  :                    'offline';
+
+  // FAILED peers get a "Reconnecting…" subtext below the row so the user
+  // knows the recovery ladder is doing its job. STALE/HEALTHY/OFFLINE/UNKNOWN
+  // do not — STALE is invisible-to-user (just background re-pinging),
+  // OFFLINE/UNKNOWN already say "offline" in the trailing slot.
+  const subtext = health === PEER_HEALTH.FAILED
+    ? `<div class="device-row-subtext">Reconnecting\u2026</div>`
+    : '';
 
   return `
     <div class="device-row ${statusClass} ${selectedClass}" data-id="${escapeAttr(d.deviceId)}"
@@ -444,6 +677,7 @@ function deviceRowHTML(d) {
       <span class="row-name">${escapeHtml(d.name)}</span>
       <span class="row-trailing">${trailing}</span>
     </div>
+    ${subtext}
   `;
 }
 
@@ -1016,18 +1250,44 @@ function setupEventListeners() {
   // Empty state: Pair first device button
   document.getElementById('btn-pair-first')?.addEventListener('click', showPairingView);
 
-  // Header: Reconnect — tears down WS and opens a fresh connection
+  // Header: Reconnect — Task 10 routes through REQUEST_RECONNECT so the
+  // ConnectionAuthority gets first crack at recovery (Task 11 will give it
+  // teeth). The SW handler falls back to the existing FORCE_RECONNECT
+  // semantics when the authority is unavailable, so behaviour is unchanged
+  // from a user perspective during the skeleton-mode interim.
+  //
+  // Decision: KEEP the header reconnect button alongside the new banner
+  // (Option A in the task plan). The header button is always-visible
+  // feedback (a one-click "kick the connection" affordance the user knows
+  // from prior versions); the banner is loud-when-disconnected. They wire
+  // to the same SW handler so behaviour is consistent.
   document.getElementById('btn-reconnect')?.addEventListener('click', async () => {
     const dot = document.getElementById('relay-status-dot');
     if (dot) dot.classList.add('disconnected');
     try {
-      await chrome.runtime.sendMessage({ type: 'FORCE_RECONNECT' });
+      await chrome.runtime.sendMessage({ type: 'REQUEST_RECONNECT' });
       if (dot) dot.classList.remove('disconnected');
       await loadDevices();
       // Give the server a moment to fire peer-online
       setTimeout(loadDevices, 2000);
+      // And re-prime from the authority — the broadcast will overwrite isOnline.
+      fetchConnectionStateSnapshot();
     } catch {
       if (dot) dot.classList.remove('disconnected');
+    }
+  });
+
+  // Connection-authority banner button — same handler as the header button,
+  // minus the header dot animation. The banner already provides loud visual
+  // feedback that recovery is in flight via the warn-coloured surface.
+  document.getElementById('connection-banner-button')?.addEventListener('click', async () => {
+    try {
+      await chrome.runtime.sendMessage({ type: 'REQUEST_RECONNECT' });
+      await loadDevices();
+      setTimeout(loadDevices, 2000);
+      fetchConnectionStateSnapshot();
+    } catch {
+      // SW unavailable — banner will stay up; the user can retry.
     }
   });
 
@@ -1366,6 +1626,17 @@ function handleMessage(msg) {
       }
       break;
     }
+
+    // ── Connection authority broadcast (Task 10) ───────────────────────────
+    // Authoritative source for selfState + peerHealth. Overrides the legacy
+    // DEVICE_PRESENCE_CHANGED path's isOnline value when both fire — the
+    // authority is the single source of truth post-Task 10. The legacy event
+    // is kept around for two reasons: (1) the relay-error banner relies on
+    // its `reset:true` payload as a "WS just closed, dim everything" signal,
+    // (2) backward compat with anything still listening.
+    case 'CONNECTION_STATE_CHANGED':
+      if (msg.payload) applyConnectionState(msg.payload);
+      break;
 
     // ── Presence ─────────────────────────────────────────────────────────────
     case MSG.DEVICE_PRESENCE_CHANGED:

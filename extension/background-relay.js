@@ -26,6 +26,7 @@ import { ensureTransport } from './crypto/beam-v2-wiring.js';
 import {
   ensureConnectionAuthority,
   getConnectionAuthority,
+  installPopupBroadcaster,
 } from './connection/connection-authority-wiring.js';
 
 /**
@@ -240,6 +241,10 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
     sendJson: (msg) => sendPairingMessage(msg),
     ownDeviceId: deviceId,
   });
+  // Task 10: broadcast every selfState / peerHealth change to the popup.
+  // Idempotent — the wiring module guards against double-subscription, so
+  // re-entering _doConnect (e.g. after a Rung 2 reconnect) is safe.
+  installPopupBroadcaster();
   authority.notifyWsOpening();
 
   return new Promise((resolve, reject) => {

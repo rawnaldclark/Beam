@@ -32,6 +32,7 @@ import { MSG }                  from './shared/message-types.js';
 import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
 import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted } from './background-relay.js';
 import { beamErrorMessage } from './crypto/beam-errors.js';
+import { getConnectionAuthority } from './connection/connection-authority-wiring.js';
 
 // ---------------------------------------------------------------------------
 // Badge state — tracks a pending "failure" clear so we can dismiss it on the
@@ -219,6 +220,74 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       autoStartRelayIfPaired()
         .then(() => sendResponse({ ok: true }))
         .catch((err) => sendResponse({ ok: false, error: err.message }));
+      return true; // async
+    }
+
+    // ── Connection authority snapshot: popup-on-open primer ──────────────────
+    // The popup subscribes to push events via CONNECTION_STATE_CHANGED, but
+    // those events fire only on *changes*. On first popup open (or after the
+    // SW was suspended), we hand back a fresh snapshot so the UI can render
+    // immediately without waiting for the next state transition.
+    //
+    // peerHealth is serialised as a plain object (not a Map) — Maps don't
+    // survive the chrome.runtime.sendMessage boundary in MV3.
+    case 'GET_CONNECTION_STATE': {
+      const auth = getConnectionAuthority();
+      if (!auth) {
+        // Authority not yet constructed (e.g. SW just started, no pairing).
+        sendResponse({
+          ok: true,
+          payload: { selfState: 'OFFLINE', peerHealth: {} },
+        });
+        return false;
+      }
+      const peerHealthObj = {};
+      for (const [peerId, health] of auth.peerHealth.value.entries()) {
+        peerHealthObj[peerId] = health;
+      }
+      sendResponse({
+        ok: true,
+        payload: {
+          selfState: auth.selfState.value,
+          peerHealth: peerHealthObj,
+        },
+      });
+      return false;
+    }
+
+    // ── Manual reconnect request from the popup banner / header button ──────
+    // First tries the authority's structured `requestReconnect()` path (Task 11
+    // will land Rung 3 + manual-reconnect semantics). If the authority is
+    // missing (skeleton / pre-pairing) or `requestReconnect` throws / returns
+    // null, we fall back to the existing FORCE_RECONNECT semantics
+    // (stopPairingListener + autoStartRelayIfPaired). The fallback is the
+    // same heavy hammer the header button already uses, so users always get
+    // *some* reconnect attempt even before Task 11 lands.
+    case 'REQUEST_RECONNECT': {
+      console.log('[Beam SW] REQUEST_RECONNECT requested');
+      const auth = getConnectionAuthority();
+      const tryAuthority = async () => {
+        if (!auth || typeof auth.requestReconnect !== 'function') {
+          throw new Error('authority unavailable');
+        }
+        const result = await auth.requestReconnect();
+        // Task 5/11: requestReconnect is currently a stub that returns
+        // undefined. Treat any non-truthy structured result as "fall through
+        // to the WS bounce" so the user-visible behaviour is reconnect, not
+        // a silent no-op.
+        if (!result || result.ok === false) {
+          throw new Error('authority requestReconnect did not complete');
+        }
+      };
+      tryAuthority()
+        .then(() => sendResponse({ ok: true, via: 'authority' }))
+        .catch(() => {
+          // Fallback: bounce the WS the same way FORCE_RECONNECT does.
+          stopPairingListener();
+          autoStartRelayIfPaired()
+            .then(() => sendResponse({ ok: true, via: 'fallback' }))
+            .catch((err) => sendResponse({ ok: false, error: err.message }));
+        });
       return true; // async
     }
 

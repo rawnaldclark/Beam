@@ -1697,3 +1697,119 @@ button:focus-visible,
    footer chips, trailing labels). If any text/lo is ever used for critical
    information, revisit contrast.
    -------------------------------------------------------------------------- */
+
+/* ==========================================================================
+   Task 10 — ConnectionAuthority health states & reconnect banner
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   Health-state dots beyond binary online/offline.
+   .dot-stale  : peer was healthy, missed a single ping — still treated as
+                 online by isOnline (HEALTHY/STALE → online), but the gentle
+                 pulse signals "we're double-checking."
+   .dot-failed : send-path is currently blocked. Yellow/warn colour, paired
+                 with the "Reconnecting…" subtext below the row.
+   The plain .dot-online / .dot-offline classes (declared earlier in the file)
+   keep the binary fallback used when no peerHealth signal is available.
+   -------------------------------------------------------------------------- */
+.device-row .row-dot.dot-stale {
+  background: var(--beam-online, var(--success));
+  animation: dot-pulse 1.6s var(--beam-ease-out, ease) infinite;
+}
+
+.device-row .row-dot.dot-failed {
+  background: var(--beam-warning, var(--warn));
+}
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.85); }
+}
+
+/* Subtle "Reconnecting…" subtext rendered as a sibling of the device row
+   (popup.js inserts a .device-row-subtext div directly after a row when its
+   peerHealth === FAILED). Matches the .row-trailing typography for visual
+   continuity but indents to align with the row's name column. */
+.device-row-subtext {
+  display:        flex;
+  align-items:    center;
+  padding:        0 12px 4px 36px;
+  font-size:      var(--beam-size-xs, 11px);
+  color:          var(--beam-warning, var(--warn));
+  font-family:    var(--beam-font-sans);
+  line-height:    1;
+  letter-spacing: 0.01em;
+}
+
+/* --------------------------------------------------------------------------
+   Connection-authority banner — shown when selfState != ONLINE.
+   Differentiated from .error-banner (relay-unreachable) by:
+     - warning colour (yellow/orange) instead of danger red
+     - explicit Reconnect button (the relay banner countdown auto-retries)
+   The message text and visibility are toggled imperatively from popup.js.
+   -------------------------------------------------------------------------- */
+.connection-banner {
+  display:       flex;
+  align-items:   center;
+  gap:           8px;
+  padding:       8px 12px;
+  background:    var(--beam-warning-12, rgba(212, 165, 95, 0.14));
+  border-bottom: 1px solid var(--beam-warning, var(--warn));
+  font-size:     13px;
+  color:         var(--beam-text-hi, var(--text-hi));
+  animation:     connection-banner-slide-in var(--beam-dur-base, 180ms)
+                 var(--beam-ease-out, ease) both;
+}
+
+.connection-banner.hidden {
+  display: none;
+}
+
+@keyframes connection-banner-slide-in {
+  0%   { opacity: 0; transform: translateY(-100%); }
+  100% { opacity: 1; transform: translateY(0); }
+}
+
+.connection-banner-icon {
+  color:       var(--beam-warning, var(--warn));
+  flex-shrink: 0;
+  display:     flex;
+  align-items: center;
+}
+
+.connection-banner-icon svg {
+  width:  14px;
+  height: 14px;
+}
+
+.connection-banner-message {
+  flex:      1;
+  font-size: 13px;
+  color:     var(--beam-text-hi, var(--text-hi));
+}
+
+.connection-banner-button {
+  flex-shrink:    0;
+  background:     transparent;
+  border:         1px solid var(--beam-warning, var(--warn));
+  color:          var(--beam-warning, var(--warn));
+  font-family:    var(--beam-font-sans);
+  font-size:      11px;
+  font-weight:    600;
+  padding:        4px 10px;
+  border-radius:  var(--radius-sm, 6px);
+  cursor:         pointer;
+  text-transform: lowercase;
+  letter-spacing: 0.02em;
+  transition:     background var(--transition), color var(--transition);
+}
+
+.connection-banner-button:hover {
+  background: var(--beam-warning, var(--warn));
+  color:      var(--beam-bg-0, var(--bg));
+}
+
+.connection-banner-button:focus-visible {
+  outline:        1px solid var(--beam-warning, var(--warn));
+  outline-offset: 2px;
+}
