@@ -53,6 +53,9 @@ const SIGNALING_TYPES = new Set([
   MSG.BEAM_V2_ROTATE_INIT,
   MSG.BEAM_V2_ROTATE_ACK,
   MSG.BEAM_V2_ROTATE_COMMIT,
+  // ConnectionAuthority liveness probes — relay is a passthrough.
+  MSG.PEER_PING,
+  MSG.PEER_PONG,
 ]);
 
 // ---------------------------------------------------------------------------

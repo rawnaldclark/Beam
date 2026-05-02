@@ -392,4 +392,70 @@ describe('Signaling', () => {
     assert.equal(gateway.sentTo.length, 1, 'error sent back to sender');
     assert.equal(gateway.sentTo[0].msg.type, 'error');
   });
+
+  // -------------------------------------------------------------------------
+  // Tests for peer-ping / peer-pong (ConnectionAuthority liveness probes)
+  // -------------------------------------------------------------------------
+
+  it('relays peer-ping from A to B byte-identical (minus targetDeviceId, plus fromDeviceId)', () => {
+    // Both A and B are registered to the same rendezvous (B's device ID).
+    presence._setRendezvous('device-B', ['device-A', 'device-B']);
+
+    const msg = {
+      type: 'peer-ping',
+      nonce: 'abc',
+      targetDeviceId: 'device-B',
+      rendezvousId: 'device-B',
+    };
+
+    const MOCK_WS_A = { id: 'ws-device-A' };
+    const handled = signaling.handleMessage('device-A', msg, MOCK_WS_A);
+
+    assert.equal(handled, true, 'handleMessage should return true for peer-ping');
+
+    const toB = gateway.sent.filter((e) => e.deviceId === 'device-B');
+    assert.equal(toB.length, 1, 'device-B should receive exactly one message');
+
+    const relayed = toB[0].msg;
+    assert.equal(relayed.type, 'peer-ping', 'relayed type must be peer-ping');
+    assert.equal(relayed.nonce, 'abc', 'nonce must be preserved');
+    assert.equal(relayed.fromDeviceId, 'device-A', 'fromDeviceId must be injected');
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(relayed, 'targetDeviceId'),
+      'targetDeviceId must be stripped from the relayed message',
+    );
+    // No errors should have been sent
+    assert.equal(gateway.sentTo.length, 0, 'no errors should be generated');
+  });
+
+  it('relays peer-pong from B back to A byte-identical (minus targetDeviceId, plus fromDeviceId)', () => {
+    // A's device ID is used as the rendezvous for the pong reply.
+    presence._setRendezvous('device-A', ['device-A', 'device-B']);
+
+    const msg = {
+      type: 'peer-pong',
+      nonce: 'abc',
+      targetDeviceId: 'device-A',
+      rendezvousId: 'device-A',
+    };
+
+    const MOCK_WS_B = { id: 'ws-device-B' };
+    const handled = signaling.handleMessage('device-B', msg, MOCK_WS_B);
+
+    assert.equal(handled, true, 'handleMessage should return true for peer-pong');
+
+    const toA = gateway.sent.filter((e) => e.deviceId === 'device-A');
+    assert.equal(toA.length, 1, 'device-A should receive exactly one message');
+
+    const relayed = toA[0].msg;
+    assert.equal(relayed.type, 'peer-pong', 'relayed type must be peer-pong');
+    assert.equal(relayed.nonce, 'abc', 'nonce must be preserved');
+    assert.equal(relayed.fromDeviceId, 'device-B', 'fromDeviceId must be injected');
+    assert.ok(
+      !Object.prototype.hasOwnProperty.call(relayed, 'targetDeviceId'),
+      'targetDeviceId must be stripped from the relayed message',
+    );
+    // No errors should have been sent
+    assert.equal(gateway.sentTo.length, 0, 'no errors should be generated');
+  });
 });

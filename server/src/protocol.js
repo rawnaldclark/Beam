@@ -74,6 +74,12 @@ export const MSG = Object.freeze({
   TRANSFER_ACCEPT:    'transfer-accept',
   TRANSFER_REJECT:    'transfer-reject',
 
+  // Peer-level liveness probes (ConnectionAuthority — relay is a passthrough).
+  // peer-ping is sent by either side; peer-pong is the reply. Both carry a
+  // nonce so the sender can correlate responses.
+  PEER_PING:             'peer-ping',
+  PEER_PONG:             'peer-pong',
+
   // Beam v2: stateless E2E transport. The relay is again a passthrough —
   // these JSON messages carry resend requests and key-rotation handshake
   // signals between paired peers. See docs/superpowers/specs/2026-04-30.
@@ -270,6 +276,24 @@ const FIELD_RULES = new Map([
   }],
 
   [MSG.RECONNECT, authRule],
+
+  // ── Peer-level liveness probes ─────────────────────────────────────────
+  // Both ping and pong carry the standard rendezvous routing pair so the
+  // relay can forward them like any other signaling message. The nonce ties
+  // each pong back to the corresponding ping without server-side state.
+
+  [MSG.PEER_PING, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (!isNonEmptyString(msg.nonce))          return 'Missing or invalid field: nonce';
+    return null;
+  }],
+  [MSG.PEER_PONG, (msg) => {
+    if (!isNonEmptyString(msg.targetDeviceId)) return 'Missing or invalid field: targetDeviceId';
+    if (!isNonEmptyString(msg.rendezvousId))   return 'Missing or invalid field: rendezvousId';
+    if (!isNonEmptyString(msg.nonce))          return 'Missing or invalid field: nonce';
+    return null;
+  }],
 
   // ── Beam v2 ────────────────────────────────────────────────────────────
   // Each v2 message carries the standard relay routing pair plus a few
