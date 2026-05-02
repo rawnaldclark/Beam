@@ -15,6 +15,9 @@ const MESSAGES = Object.freeze({
   SIZE_MISMATCH:  'File size mismatch — transfer aborted to protect the file.',
   TOO_BIG:        'File is too large (limit: 500 MB).',
   TOO_MANY_CHUNKS: 'File has too many chunks for a single transfer.',
+  // Connection Authority pre-flight (Task 9)
+  PEER_UNREACHABLE: "That device isn't responding right now. Tap Reconnect.",
+  SELF_OFFLINE:     'Not connected to the relay.',
   // Receiver / completion
   PARTIAL:        "The peer didn't deliver every chunk. Ask them to retry.",
   PEER_FAILED:    'The peer reported a transfer failure.',

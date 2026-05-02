@@ -701,6 +701,20 @@ export async function deliverIncomingClipboard(content, fromDeviceId) {
  * @returns {Promise<{transferIdHex: string}>}
  */
 export async function sendClipboardEncrypted(targetDeviceId, _rendezvousId, content) {
+  // Task 9: pre-flight gate. When the authority is wired (production), bail
+  // early on a known-bad send path so we don't encode frames into a closed
+  // channel. The authority is null in tests that bypass `_doConnect` — there
+  // we skip the gate so transport-level coverage stays unaffected.
+  const auth = getConnectionAuthority();
+  if (auth) {
+    const gate = await auth.ensureSendable(targetDeviceId);
+    if (!gate.ok) {
+      const err = new Error(`pre-flight ${gate.reason}`);
+      err.code = gate.reason;
+      throw err;
+    }
+  }
+
   const transferIdHex = await getBeamV2Transport().sendClipboard(targetDeviceId, content);
   // End-to-end success is strong proof of life — promote the peer to HEALTHY.
   // No-op if the authority is null (e.g. tests that bypass _doConnect).
@@ -728,6 +742,18 @@ export async function sendClipboardEncrypted(targetDeviceId, _rendezvousId, cont
  */
 export async function sendFileEncrypted(payload) {
   const { fileName, fileSize, mimeType, data, targetDeviceId } = payload;
+
+  // Task 9: pre-flight gate (see sendClipboardEncrypted for rationale).
+  const auth = getConnectionAuthority();
+  if (auth) {
+    const gate = await auth.ensureSendable(targetDeviceId);
+    if (!gate.ok) {
+      const err = new Error(`pre-flight ${gate.reason}`);
+      err.code = gate.reason;
+      throw err;
+    }
+  }
+
   const binStr = atob(data);
   const bytes = new Uint8Array(binStr.length);
   for (let i = 0; i < binStr.length; i += 1) bytes[i] = binStr.charCodeAt(i);

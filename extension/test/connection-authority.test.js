@@ -33,7 +33,11 @@ import assert from 'node:assert/strict';
 import { ConnectionAuthority } from '../connection/connection-authority.js';
 import { SelfState } from '../connection/self-state.js';
 import { PeerHealth } from '../connection/peer-health.js';
-import { BG_PING_INTERVAL_MS, PING_TIMEOUT_MS } from '../connection/constants.js';
+import {
+  BG_PING_INTERVAL_MS,
+  PING_TIMEOUT_MS,
+  RECENT_TRAFFIC_WINDOW_MS,
+} from '../connection/constants.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -165,13 +169,45 @@ describe('ConnectionAuthority: peerHealth transitions', () => {
   });
 });
 
-// ─── ensureSendable stub ─────────────────────────────────────────────────────
+// ─── ensureSendable: skeleton-mode and self-offline early-outs ───────────────
 
-describe('ConnectionAuthority: ensureSendable (stub)', () => {
-  it('always returns {ok: true} in skeleton mode', async () => {
+describe('ConnectionAuthority: ensureSendable (skeleton-mode early-outs)', () => {
+  it('returns SELF_OFFLINE when selfState is OFFLINE (no probe attempted)', async () => {
     const auth = new ConnectionAuthority({ signalingHooks: makeHooks() });
+    // Default state is OFFLINE — selfState gate fires before any peer logic.
     const result = await auth.ensureSendable('any-peer-id');
-    assert.deepEqual(result, { ok: true });
+    assert.deepEqual(result, { ok: false, reason: 'SELF_OFFLINE' });
+  });
+
+  it('returns PEER_UNREACHABLE when selfState is ONLINE but no _pingTracker exists', async () => {
+    // Skeleton-mode (no ownDeviceId) means we can't issue a peer-ping; the
+    // safe answer is "not sendable" rather than waving the send through.
+    // We inject a FakeClock so the ladder's real-time budget timers don't
+    // dominate the test runtime — once the probe fails synchronously, the
+    // pre-flight-failed dispatch kicks a ladder whose Rungs 1+2+3 we drive
+    // with virtual time.
+    const clock = new FakeClock(0);
+    const auth = new ConnectionAuthority({
+      signalingHooks: makeHooks(),
+      options: { timerImpl: clock },
+    });
+    auth.notifyWsOpening();
+    auth.notifyAuthComplete();
+    assert.equal(auth.selfState.value, SelfState.ONLINE);
+
+    const promise = auth.ensureSendable('any-peer-id');
+    // Yield so _runEnsureSendable progresses past the synchronous skeleton-
+    // mode probe, dispatches pre-flight-failed, and arms Rung 1's budget timer.
+    await new Promise((r) => setImmediate(r));
+    // Burn ladder budget. Rung 1 = 5s; Rung 2 has no forceWsReconnect →
+    // surrenders immediately; Rung 3 throws "TODO Rung 3" → exhausted.
+    clock.tick(5_000);
+    for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
+
+    const result = await promise;
+    assert.deepEqual(result, { ok: false, reason: 'PEER_UNREACHABLE' });
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
   });
 });
 
@@ -727,5 +763,229 @@ describe('ConnectionAuthority: recovery ladder wiring', () => {
     // ladder's cancel-driven cleanup releases its budget timer + observer.
     assert.equal(clock.pending, 0, 'no leaked timers after shutdown');
     assert.equal(auth._currentLadder, null);
+  });
+});
+
+// ─── Task 9: ensureSendable full pre-flight algorithm ────────────────────────
+
+/**
+ * Build an ensureSendable-ready authority. Mirrors `makeLadderAuthority` but
+ * additionally lifts selfState to ONLINE (the step-1 gate) so each test can
+ * focus on the per-peer logic without re-priming.
+ */
+function makePreFlightAuthority({ withForceWsReconnect = false } = {}) {
+  const clock = new FakeClock(0);
+  const sent = [];
+  const calls = { forceWsReconnect: 0 };
+  const hooks = {
+    sendJson: (m) => sent.push(m),
+    ownDeviceId: 'self-device-id',
+  };
+  if (withForceWsReconnect) {
+    hooks.forceWsReconnect = () => { calls.forceWsReconnect += 1; };
+  }
+  const auth = new ConnectionAuthority({
+    signalingHooks: hooks,
+    options: { timerImpl: clock },
+  });
+  auth.notifyWsOpening();
+  auth.notifyAuthComplete();
+  return { auth, clock, sent, calls };
+}
+
+/**
+ * Helper: count outbound peer-pings recorded in `sent`. Useful for the
+ * "no ping was fired" assertions in the skip-path tests.
+ */
+function countPings(sent) {
+  return sent.filter((m) => m.type === 'peer-ping').length;
+}
+
+describe('ConnectionAuthority: ensureSendable (Task 9 pre-flight)', () => {
+  it('returns SELF_OFFLINE without probing when selfState != ONLINE', async () => {
+    const { auth, sent } = makePreFlightAuthority();
+    // Drop selfState back to RECONNECTING.
+    auth.notifyWsClosed();
+    assert.equal(auth.selfState.value, SelfState.RECONNECTING);
+
+    const before = countPings(sent);
+    const result = await auth.ensureSendable('X');
+    assert.deepEqual(result, { ok: false, reason: 'SELF_OFFLINE' });
+    assert.equal(countPings(sent), before, 'no peer-ping fired on self-offline gate');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('returns ok immediately when peer is HEALTHY with traffic in last 30s', async () => {
+    const { auth, clock, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X');
+    // Real frame at t=0 promotes X to HEALTHY AND records lastTrafficAt.
+    auth.notifyFrameReceived('X');
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.HEALTHY);
+
+    // 5s later (well within the 30s window) → skip the probe.
+    clock.tick(5_000);
+    const beforePings = countPings(sent);
+    const result = await auth.ensureSendable('X');
+    assert.deepEqual(result, { ok: true });
+    assert.equal(countPings(sent), beforePings, 'no peer-ping fired when within 30s of fresh traffic');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('issues a peer-ping when HEALTHY but traffic is older than 30s; ok on pong', async () => {
+    const { auth, clock, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X');
+    auth.notifyFrameReceived('X');
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.HEALTHY);
+
+    // Advance past the 30s window so the skip is invalidated. (Cadence
+    // would fire its own ping at t=120s, but we stop at t=31s.)
+    clock.tick(RECENT_TRAFFIC_WINDOW_MS + 1_000);
+    const beforePings = countPings(sent);
+
+    const promise = auth.ensureSendable('X');
+    // Microtask flush so the probe-ping has been issued via sendJson.
+    await new Promise((r) => setImmediate(r));
+    assert.equal(countPings(sent), beforePings + 1, 'pre-flight peer-ping issued');
+
+    // The most recent peer-ping is ours. Pong it.
+    const ping = sent.filter((m) => m.type === 'peer-ping').slice(-1)[0];
+    auth.notifyPongReceived(ping.nonce);
+
+    const result = await promise;
+    assert.deepEqual(result, { ok: true });
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('issues a peer-ping when peer is UNKNOWN regardless of lastTrafficAt; ok on pong', async () => {
+    const { auth, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X'); // UNKNOWN, no traffic recorded.
+    const beforePings = countPings(sent);
+
+    const promise = auth.ensureSendable('X');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(countPings(sent), beforePings + 1, 'UNKNOWN peer triggers a probe');
+
+    const ping = sent.filter((m) => m.type === 'peer-ping').slice(-1)[0];
+    auth.notifyPongReceived(ping.nonce);
+
+    const result = await promise;
+    assert.deepEqual(result, { ok: true });
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('coalesces concurrent ensureSendable calls for the same peer into one probe', async () => {
+    const { auth, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X');
+    const beforePings = countPings(sent);
+
+    const a = auth.ensureSendable('X');
+    const b = auth.ensureSendable('X');
+    const c = auth.ensureSendable('X');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(countPings(sent), beforePings + 1, 'one probe shared across concurrent callers');
+
+    const ping = sent.filter((m) => m.type === 'peer-ping').slice(-1)[0];
+    auth.notifyPongReceived(ping.nonce);
+
+    const [ra, rb, rc] = await Promise.all([a, b, c]);
+    assert.deepEqual(ra, { ok: true });
+    assert.deepEqual(rb, { ok: true });
+    assert.deepEqual(rc, { ok: true });
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('on 5s ping timeout, kicks ladder; if ladder succeeds, re-pings and returns ok', async () => {
+    const { auth, clock, sent } = makePreFlightAuthority({ withForceWsReconnect: true });
+    auth.notifyPeerOnline('X');
+    const beforePings = countPings(sent);
+
+    const promise = auth.ensureSendable('X');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(countPings(sent), beforePings + 1, 'first probe-ping issued');
+
+    // Advance past the 5s pre-flight timeout so the probe surrenders. Note:
+    // the cadence-tracker's own 10s timeout has not yet fired — our 5s racer
+    // is what produces the timeout result.
+    clock.tick(5_000);
+    await new Promise((r) => setImmediate(r));
+
+    // Ladder is now running (kicked from pre-flight-failed → FAILED).
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.FAILED);
+    assert.ok(auth._currentLadder, 'ladder kicked after pre-flight timeout');
+
+    // Drive Rung 1 to success: a frame arrives from X within Rung 1's 5s.
+    auth.notifyFrameReceived('X');
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.equal(auth._currentLadder, null, 'ladder released after Rung 1 success');
+
+    // The post-success retry probe must have been issued — pong it.
+    // We expect: probe1 (timed out) + probe2 (retry). So total +2 pings.
+    assert.equal(countPings(sent), beforePings + 2, 'retry probe issued after ladder success');
+    const retryPing = sent.filter((m) => m.type === 'peer-ping').slice(-1)[0];
+    auth.notifyPongReceived(retryPing.nonce);
+
+    const result = await promise;
+    assert.deepEqual(result, { ok: true });
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('on 5s ping timeout with ladder failure, returns PEER_UNREACHABLE', async () => {
+    // No `forceWsReconnect` hook: Rung 2 surrenders synchronously. Rung 3
+    // throws "TODO Rung 3" so the ladder reports `exhausted: true`.
+    const { auth, clock, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X');
+    const beforePings = countPings(sent);
+
+    const promise = auth.ensureSendable('X');
+    await new Promise((r) => setImmediate(r));
+    assert.equal(countPings(sent), beforePings + 1, 'probe issued');
+
+    // 5s → pre-flight timeout → FAILED → ladder kicks.
+    clock.tick(5_000);
+    await new Promise((r) => setImmediate(r));
+    assert.ok(auth._currentLadder, 'ladder kicked');
+
+    // Burn Rung 1's 5s budget; Rung 2 surrenders immediately (no
+    // forceWsReconnect); Rung 3 throws → exhausted.
+    clock.tick(5_000);
+    // Flush the microtask chain: Rung 1 timeout → Rung 2 surrender →
+    // Rung 3 throw → ladder settles → ensureSendable continues.
+    for (let i = 0; i < 5; i += 1) await new Promise((r) => setImmediate(r));
+
+    const result = await promise;
+    assert.deepEqual(result, { ok: false, reason: 'PEER_UNREACHABLE' });
+    assert.equal(auth._currentLadder, null, 'ladder released after exhaustion');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+
+  it('lastTrafficAt is updated by send-completed (not just frame-received)', async () => {
+    const { auth, clock, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X');
+    auth.notifySendCompleted('X'); // promotes to HEALTHY + records traffic
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.HEALTHY);
+
+    clock.tick(5_000);
+    const beforePings = countPings(sent);
+    const result = await auth.ensureSendable('X');
+    assert.deepEqual(result, { ok: true });
+    assert.equal(countPings(sent), beforePings, 'no probe — send-completed counted as recent traffic');
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
   });
 });

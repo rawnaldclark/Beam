@@ -29,8 +29,15 @@
  *   - Rungs 1 + 2 are wired here; Rung 3 is a stub that throws "TODO Rung 3"
  *     until Task 11.
  *
+ * As of Task 9 the authority implements the full **send-time pre-flight**:
+ *   - `ensureSendable(peerId)` returns the per-spec `{ok}` shape gating every
+ *     `sendClipboardEncrypted` / `sendFileEncrypted` call.
+ *   - Self-offline short-circuits to `SELF_OFFLINE`.
+ *   - HEALTHY peers with traffic in the last 30s skip the probe.
+ *   - Otherwise we issue a 5s peer-ping; on timeout we mark FAILED, kick the
+ *     recovery ladder, await its result, and retry one ping on success.
+ *
  * Subsequent tasks layer on:
- *   - Task 9: real ensureSendable pre-flight (channel-open, presence, peer-ping probe).
  *   - Task 11: Rung 3 (full session reset), Rung 4 backoff + surrender.
  *
  * Spec: docs/superpowers/specs/2026-05-02-connection-authority-design.md
@@ -44,10 +51,20 @@ import { RecoveryLadder, awaitObservableOrTimeout } from './recovery-ladder.js';
 import {
   BG_PING_INTERVAL_MS,
   PING_TIMEOUT_MS,
+  RECENT_TRAFFIC_WINDOW_MS,
   RUNG_1_BUDGET_MS,
   RUNG_2_BUDGET_MS,
   RUNG_3_BUDGET_MS,
 } from './constants.js';
+
+/**
+ * Per-ping deadline for the send-time pre-flight peer-ping. Distinct from the
+ * background cadence's {@link PING_TIMEOUT_MS} (10s) — pre-flight is on the
+ * hot path of a user-initiated send, so we surface "peer unreachable" faster
+ * by racing the tracker promise against this 5s timer rather than waiting on
+ * the tracker's own timeout.
+ */
+const PRE_FLIGHT_PING_TIMEOUT_MS = 5_000;
 
 /**
  * The authoritative coordinator for connection + peer-health state.
@@ -196,6 +213,34 @@ export class ConnectionAuthority {
      */
     this._currentLadder = null;
 
+    /**
+     * "Recent traffic" timestamps consumed by {@link ensureSendable} to skip
+     * the pre-flight peer-ping when proof-of-life is fresh. Updated on
+     * `notifyFrameReceived` and `notifySendCompleted` only — pong arrivals
+     * from the cadence loop are NOT recorded here (they are already
+     * indirectly reflected in `peerHealth === HEALTHY`, but the spec's
+     * "recent traffic" is real frame I/O, not a synthetic liveness probe).
+     *
+     * Maintained separately from `_peerCadence[id].lastActivityAt` because
+     * cadence entries are torn down on `notifyPeerOffline` / `_stopCadence`,
+     * which would lose the freshness signal between an OFFLINE flicker and
+     * the very next send. The pre-flight algorithm wants to consult fresh
+     * traffic regardless of cadence-engine bookkeeping.
+     *
+     * @type {Map<string, number>}
+     */
+    this._lastTrafficAt = new Map();
+
+    /**
+     * Per-peer in-flight `ensureSendable` promises. Concurrent calls for the
+     * same peer share one promise so a clipboard burst (Task 10's "drag 5
+     * files" scenario) doesn't fire five back-to-back peer-pings to the same
+     * device. Cleared synchronously when the underlying promise settles.
+     *
+     * @type {Map<string, Promise<{ok:true} | {ok:false, reason:string}>>}
+     */
+    this._inflightPreflight = new Map();
+
     this._shutdown = false;
   }
 
@@ -240,11 +285,13 @@ export class ConnectionAuthority {
   notifyFrameReceived(peerId) {
     this._dispatchPeer(peerId, { type: 'frame-received' });
     this._noteActivity(peerId);
+    this._lastTrafficAt.set(peerId, this._now());
   }
   /** A frame send to `peerId` succeeded end-to-end — strong proof of life. */
   notifySendCompleted(peerId) {
     this._dispatchPeer(peerId, { type: 'send-completed' });
     this._noteActivity(peerId);
+    this._lastTrafficAt.set(peerId, this._now());
   }
 
   /**
@@ -293,15 +340,213 @@ export class ConnectionAuthority {
   // ── Public surface (stubs for Task 5; real impl in Tasks 7+9) ──────────
 
   /**
-   * Pre-flight check before sending to `peerId`. Returns whether the send
-   * path is currently usable. Skeleton always returns ok; Task 9 swaps in
-   * real channel-open / presence / peer-ping checks.
+   * Pre-flight check before sending to `peerId`. Implements the full algorithm
+   * from spec §"Send-time pre-flight":
    *
-   * @param {string} _peerId
+   *   1. selfState != ONLINE                          → FAIL_SELF_OFFLINE
+   *   2. peerHealth = HEALTHY AND lastTrafficAt < 30s → OK (skip ping)
+   *   3. send peer-ping (5s timeout)
+   *        pong               → mark HEALTHY, OK
+   *        timeout            → mark FAILED, kick ladder, await up to 50s
+   *           ladder ok       → retry one ping; pong → OK
+   *           ladder failure  → FAIL_PEER_UNREACHABLE
+   *
+   * Concurrent calls for the same peer are coalesced via
+   * {@link _inflightPreflight} so a clipboard burst doesn't fire N back-to-back
+   * peer-pings to the same device. Calls for different peers run in parallel
+   * (no global lock).
+   *
+   * Skeleton-mode (no `_pingTracker` because no `ownDeviceId` was provided at
+   * construction): returns `{ok:false, reason:"PEER_UNREACHABLE"}` — without
+   * an identity we cannot probe the peer, so the safest signal is "not
+   * sendable" rather than a false positive.
+   *
+   * @param {string} peerId
    * @returns {Promise<{ok: true} | {ok: false, reason: string}>}
    */
-  // eslint-disable-next-line no-unused-vars
-  async ensureSendable(_peerId) { return { ok: true }; }
+  async ensureSendable(peerId) {
+    // Step 1: self-online gate. Cheap, synchronous, applies before any
+    // per-peer coalescing — a self-offline check is the same answer for every
+    // peer, no benefit to sharing the inflight slot.
+    if (this._selfState.value !== SelfState.ONLINE) {
+      return { ok: false, reason: 'SELF_OFFLINE' };
+    }
+
+    // Coalesce concurrent calls for the same peer. The first caller drives
+    // the probe; the rest await the same outcome.
+    const existing = this._inflightPreflight.get(peerId);
+    if (existing) return existing;
+
+    const promise = this._runEnsureSendable(peerId).finally(() => {
+      // Clear only if the entry is still ours — defensive; in practice we
+      // never replace it mid-flight.
+      if (this._inflightPreflight.get(peerId) === promise) {
+        this._inflightPreflight.delete(peerId);
+      }
+    });
+    this._inflightPreflight.set(peerId, promise);
+    return promise;
+  }
+
+  /**
+   * Inner pre-flight body — separated so {@link ensureSendable} can wrap it
+   * with the per-peer coalescing Map without nesting the algorithm.
+   *
+   * @param {string} peerId
+   * @returns {Promise<{ok: true} | {ok: false, reason: string}>}
+   * @private
+   */
+  async _runEnsureSendable(peerId) {
+    // Step 2: HEALTHY + recent traffic skip.
+    if (this._isHealthyWithRecentTraffic(peerId)) {
+      return { ok: true };
+    }
+
+    // Step 3a: probe with a 5s peer-ping. Skeleton-mode (no tracker) cannot
+    // probe; treat as unreachable rather than waving the send through.
+    const firstProbe = await this._preFlightProbe(peerId);
+    if (firstProbe.ok) return { ok: true };
+
+    // Step 3b: probe failed. Mark FAILED (idempotent if already FAILED) and
+    // ensure a recovery ladder is running. The reducer's `pre-flight-failed`
+    // event drives any non-OFFLINE state directly to FAILED. The
+    // `_dispatchPeer` post-hook kicks `_kickLadder` only on the OLD→FAILED
+    // transition; if the peer was already FAILED we still need a ladder so
+    // we explicitly call `_kickLadder` after the dispatch (idempotent: a
+    // running ladder is reused).
+    this._dispatchPeer(peerId, { type: 'pre-flight-failed' });
+    this._kickLadder({ triggerPeerId: peerId, reason: 'pre-flight-failed' });
+
+    // Step 3c: await the in-flight ladder. Spec budgets up to 50s
+    // (Rung 1 = 5s + Rung 2 = 15s + Rung 3 = 30s). We don't impose a separate
+    // timeout here — the ladder owns its own budget timers and resolves with
+    // `ok:false` on exhaustion / cancellation. No ladder running (e.g.
+    // skeleton-mode where _kickLadder bails because shutdown started)
+    // is treated as a synchronous failure.
+    const ladderResult = await this._awaitLadderResolved();
+    if (!ladderResult.ok) {
+      return { ok: false, reason: 'PEER_UNREACHABLE' };
+    }
+
+    // Step 3d: ladder succeeded. Re-probe one more time. The ladder's
+    // success path already dispatched `recovery-succeeded` which dropped the
+    // peer to UNKNOWN, so the HEALTHY-skip branch won't short-circuit;
+    // we issue a fresh peer-ping to confirm the send path before the caller
+    // commits to encoding frames.
+    const retryProbe = await this._preFlightProbe(peerId);
+    if (retryProbe.ok) return { ok: true };
+    return { ok: false, reason: 'PEER_UNREACHABLE' };
+  }
+
+  /**
+   * Step-2 helper: returns true iff the peer is HEALTHY AND a recent traffic
+   * timestamp falls within {@link RECENT_TRAFFIC_WINDOW_MS}.
+   *
+   * @param {string} peerId
+   * @returns {boolean}
+   * @private
+   */
+  _isHealthyWithRecentTraffic(peerId) {
+    if (this._peerHealth.value.get(peerId) !== PeerHealth.HEALTHY) return false;
+    const last = this._lastTrafficAt.get(peerId);
+    if (last == null) return false;
+    return (this._now() - last) < RECENT_TRAFFIC_WINDOW_MS;
+  }
+
+  /**
+   * Issue a single peer-ping racing the tracker's resolve against a 5s timer.
+   *
+   * Implementation note: the cadence-loop {@link _pingTracker} has its own
+   * 10s `timeoutMs`. Reusing it for pre-flight is fine — we ignore the
+   * tracker's longer timeout by resolving on whichever lands first
+   * (pong, abort, or our 5s timer). A late pong after our timer fires is
+   * still safe: the tracker cleans up its own pending entry on
+   * `recordPong` / `sweepExpired`, and a subsequent stray
+   * `notifyPongReceived` no-ops because the cadence-side `_nonceToPeer`
+   * never recorded this nonce. (We deliberately do NOT register the
+   * pre-flight nonce in `_nonceToPeer` — pre-flight liveness should not
+   * accidentally promote peerHealth via the cadence pong path, which is
+   * what the Task 7 test "does NOT promote peer health when nonce came
+   * from outside the cadence engine" already guarantees.)
+   *
+   * Resource discipline: every code path clears the timer and, in shutdown
+   * scenarios, leaves no dangling promise references — the tracker's own
+   * cleanup handles the late-pong / late-sweep cases.
+   *
+   * @param {string} peerId
+   * @returns {Promise<{ok: true} | {ok: false, reason: string}>}
+   * @private
+   */
+  _preFlightProbe(peerId) {
+    if (!this._pingTracker) {
+      // Skeleton-mode — cannot probe; report unreachable.
+      return Promise.resolve({ ok: false, reason: 'PEER_UNREACHABLE' });
+    }
+    if (this._shutdown) {
+      return Promise.resolve({ ok: false, reason: 'PEER_UNREACHABLE' });
+    }
+
+    const { promise: pingPromise } = this._pingTracker.sendPing(peerId, this._now());
+
+    return new Promise((resolve) => {
+      let settled = false;
+      let timerId = null;
+
+      const cleanup = () => {
+        if (timerId != null) {
+          try { this._clearTimeout(timerId); } catch { /* swallow */ }
+          timerId = null;
+        }
+      };
+      const settle = (value) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(value);
+      };
+
+      timerId = this._setTimeout(
+        () => settle({ ok: false, reason: 'timeout' }),
+        PRE_FLIGHT_PING_TIMEOUT_MS,
+      );
+      // Unref-when-available so a test that doesn't drive the FakeClock
+      // (real-clock fallback) can still exit cleanly. FakeClock returns a
+      // plain number — the typeof guard makes this a no-op there.
+      if (timerId && typeof timerId.unref === 'function') timerId.unref();
+
+      pingPromise.then(
+        () => settle({ ok: true }),
+        // The tracker rejects with `{ok:false, reason:'timeout'}` when its
+        // own (10s) sweep finds the entry expired. We may resolve via our
+        // 5s timer first; if not, this rejection short-circuits us.
+        () => settle({ ok: false, reason: 'timeout' }),
+      );
+    });
+  }
+
+  /**
+   * Returns a promise that resolves when {@link _currentLadder} settles, or
+   * resolves immediately if no ladder is running. Used by `ensureSendable` to
+   * await a ladder kicked by a `pre-flight-failed` dispatch.
+   *
+   * The {@link RecoveryLadder#run} method memoizes — calling `.run()` after
+   * the ladder has already started returns the same promise, so observing it
+   * post-kick is safe and side-effect-free.
+   *
+   * @returns {Promise<{ok: boolean}>}
+   * @private
+   */
+  async _awaitLadderResolved() {
+    const ladder = this._currentLadder;
+    if (!ladder) return { ok: false };
+    try {
+      const result = await ladder.run();
+      return { ok: !!(result && result.ok) };
+    } catch {
+      // _runInternal should not reject, but defend against it anyway.
+      return { ok: false };
+    }
+  }
 
   /**
    * Manual reconnect entry point (popup "Reconnect now" button). Stub for
