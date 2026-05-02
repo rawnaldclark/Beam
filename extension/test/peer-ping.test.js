@@ -26,6 +26,85 @@ async function settleSoon(p) {
   return Promise.race([p, Promise.resolve(PENDING)]);
 }
 
+// ─── constructor guards ──────────────────────────────────────────────────────
+
+describe('PeerPingTracker constructor guards', () => {
+  const validOpts = {
+    sendJson: () => {},
+    timeoutMs: 5000,
+    ownDeviceId: 'device-self',
+  };
+
+  it('throws TypeError when ownDeviceId is missing/empty/wrong-type', () => {
+    // missing
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, ownDeviceId: undefined }),
+      (err) => err instanceof TypeError && /ownDeviceId/.test(err.message),
+      'missing ownDeviceId must throw TypeError mentioning ownDeviceId',
+    );
+    // empty string
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, ownDeviceId: '' }),
+      (err) => err instanceof TypeError && /ownDeviceId/.test(err.message),
+      'empty ownDeviceId must throw TypeError mentioning ownDeviceId',
+    );
+    // wrong type (number)
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, ownDeviceId: 12345 }),
+      (err) => err instanceof TypeError && /ownDeviceId/.test(err.message),
+      'non-string ownDeviceId must throw TypeError mentioning ownDeviceId',
+    );
+  });
+
+  it('throws TypeError when sendJson is missing/non-function', () => {
+    // missing
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, sendJson: undefined }),
+      (err) => err instanceof TypeError && /sendJson/.test(err.message),
+      'missing sendJson must throw TypeError mentioning sendJson',
+    );
+    // wrong type (object)
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, sendJson: {} }),
+      (err) => err instanceof TypeError && /sendJson/.test(err.message),
+      'non-function sendJson must throw TypeError mentioning sendJson',
+    );
+    // wrong type (string)
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, sendJson: 'not a function' }),
+      (err) => err instanceof TypeError && /sendJson/.test(err.message),
+      'string sendJson must throw TypeError mentioning sendJson',
+    );
+  });
+
+  it('throws TypeError when timeoutMs is missing/NaN/<=0', () => {
+    // missing
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, timeoutMs: undefined }),
+      (err) => err instanceof TypeError && /timeoutMs/.test(err.message),
+      'missing timeoutMs must throw TypeError mentioning timeoutMs',
+    );
+    // NaN
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, timeoutMs: NaN }),
+      (err) => err instanceof TypeError && /timeoutMs/.test(err.message),
+      'NaN timeoutMs must throw TypeError mentioning timeoutMs',
+    );
+    // zero
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, timeoutMs: 0 }),
+      (err) => err instanceof TypeError && /timeoutMs/.test(err.message),
+      'zero timeoutMs must throw TypeError mentioning timeoutMs',
+    );
+    // negative
+    assert.throws(
+      () => new PeerPingTracker({ ...validOpts, timeoutMs: -100 }),
+      (err) => err instanceof TypeError && /timeoutMs/.test(err.message),
+      'negative timeoutMs must throw TypeError mentioning timeoutMs',
+    );
+  });
+});
+
 // ─── sendPing ─────────────────────────────────────────────────────────────────
 
 describe('PeerPingTracker.sendPing', () => {

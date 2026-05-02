@@ -50,7 +50,7 @@ function generateNonce() {
  * when pongs arrive or deadlines pass.
  *
  * @example
- * const tracker = new PeerPingTracker({ sendJson, timeoutMs: 5000 });
+ * const tracker = new PeerPingTracker({ sendJson, timeoutMs: 5000, ownDeviceId: 'my-device-id' });
  * const { nonce, promise } = tracker.sendPing(peerId);
  * // ... later, on pong message:
  * tracker.recordPong(nonce);
@@ -67,8 +67,21 @@ export class PeerPingTracker {
    *                                                   frames so the relay's rendezvous-membership
    *                                                   check resolves to the Chrome-owned set
    *                                                   that both peers share.
+   * @throws {TypeError} If any required option is missing or invalid. Fail-loud
+   *                     guards prevent the silent-routing-bug class where an
+   *                     undefined `ownDeviceId` would produce `rendezvousId: undefined`
+   *                     wire frames the relay rejects.
    */
   constructor({ sendJson, timeoutMs, ownDeviceId }) {
+    if (typeof ownDeviceId !== 'string' || ownDeviceId.length === 0) {
+      throw new TypeError('PeerPingTracker: ownDeviceId is required (non-empty string)');
+    }
+    if (typeof sendJson !== 'function') {
+      throw new TypeError('PeerPingTracker: sendJson is required (function)');
+    }
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) {
+      throw new TypeError('PeerPingTracker: timeoutMs must be a positive number');
+    }
     this._sendJson = sendJson;
     this._timeoutMs = timeoutMs;
     this._ownDeviceId = ownDeviceId;
