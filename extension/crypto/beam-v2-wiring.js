@@ -11,6 +11,7 @@
 
 import { BeamV2Transport } from './beam-v2-transport.js';
 import { pkcs8X25519SkToRaw } from './beam-crypto.js';
+import { getConnectionAuthority } from '../connection/connection-authority-wiring.js';
 
 /**
  * Coerce whatever shape the popup stored as `deviceKeys.x25519.sk` into a
@@ -60,8 +61,19 @@ export function ensureTransport(args) {
       getPeer:      (id) => loadPeer(id),
       listPeers:    () => loadAllPeers(),
       storeKABRing: (id, ring) => storeKABRing(id, ring),
-      onClipboardReceived: args.onClipboardReceived,
-      onFileReceived:      args.onFileReceived,
+      // Wrap the user-supplied delivery callbacks so the ConnectionAuthority
+      // observes a successful v2 frame decode (strong proof of peer life)
+      // alongside the existing UX delivery. Authority is null until the
+      // wiring layer constructs it inside `_doConnect` — `?.` makes the
+      // hooks safe to call from tests that bypass the SW startup path.
+      onClipboardReceived: async (content, fromDeviceId) => {
+        getConnectionAuthority()?.notifyFrameReceived(fromDeviceId);
+        await args.onClipboardReceived(content, fromDeviceId);
+      },
+      onFileReceived: async (a) => {
+        getConnectionAuthority()?.notifyFrameReceived(a.fromDeviceId);
+        await args.onFileReceived(a);
+      },
     },
   });
   return _transport;

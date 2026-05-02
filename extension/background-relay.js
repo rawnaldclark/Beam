@@ -23,6 +23,10 @@
  */
 
 import { ensureTransport } from './crypto/beam-v2-wiring.js';
+import {
+  ensureConnectionAuthority,
+  getConnectionAuthority,
+} from './connection/connection-authority-wiring.js';
 
 /**
  * Lazy accessor for the Beam v2 transport singleton. The hooks intentionally
@@ -224,6 +228,20 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
     throw new Error('importKey failed: ' + (err?.message || String(err)));
   }
 
+  // Construct the ConnectionAuthority singleton if not already created, and
+  // notify it that we are about to open the WebSocket. Wrap sendJson in a
+  // lambda so the authority closes over the *eventual* binding of
+  // sendPairingMessage (which is hoisted as a function declaration but the
+  // lambda is the only safe form if we ever swap to a const/let binding).
+  // The notifyWsOpening call must precede `new WebSocket(...)` so the
+  // authority's selfState transitions OFFLINE -> CONNECTING before any
+  // ws.onopen / onclose can fire.
+  const authority = ensureConnectionAuthority({
+    sendJson: (msg) => sendPairingMessage(msg),
+    ownDeviceId: deviceId,
+  });
+  authority.notifyWsOpening();
+
   return new Promise((resolve, reject) => {
     let ws;
     try {
@@ -300,6 +318,8 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
         console.log('[Beam SW] Registered rendezvous:', deviceId);
         // Start heartbeat to keep connection alive while user switches to phone
         _startHeartbeat();
+        // Authority now sees us as ONLINE (CONNECTING -> ONLINE).
+        getConnectionAuthority()?.notifyAuthComplete();
         resolve();
       }
       else if (msg.type === 'auth-fail') {
@@ -333,6 +353,13 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
         const isOnline = msg.type === 'peer-online';
         console.log('[Beam SW] Presence update:', peerId, isOnline ? 'online' : 'offline');
 
+        // Authority observes relay-reported presence (weaker-than-pong evidence).
+        if (isOnline) {
+          getConnectionAuthority()?.notifyPeerOnline(peerId);
+        } else {
+          getConnectionAuthority()?.notifyPeerOffline(peerId);
+        }
+
         // Update session storage so the popup can read it on open.
         const stored = await chrome.storage.session.get('devicePresence');
         const presence = stored.devicePresence || {};
@@ -348,6 +375,27 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
         } catch {
           // Popup closed — it will read from storage when next opened.
         }
+      }
+      else if (msg.type === 'peer-ping') {
+        // A peer is probing our liveness. Echo the nonce back as peer-pong.
+        // Routing rules (mirrors Task 2's outbound peer-ping shape):
+        //   - targetDeviceId: the peer that pinged us (msg.fromDeviceId).
+        //   - rendezvousId  : OUR own deviceId — both clients registered to
+        //                     the Chrome-owned rendezvous, and the relay's
+        //                     membership check requires both sender and
+        //                     target to be in the named rendezvous.
+        sendPairingMessage({
+          type: 'peer-pong',
+          nonce: msg.nonce,
+          targetDeviceId: msg.fromDeviceId,
+          rendezvousId: deviceId,
+        });
+      }
+      else if (msg.type === 'peer-pong') {
+        // Forward the nonce to the authority's ping tracker so the matching
+        // sendPing promise resolves. No-op if the authority hasn't been
+        // constructed yet (e.g. a stray message before _doConnect ran).
+        getConnectionAuthority()?.notifyPongReceived(msg.nonce);
       }
       else {
         // Try the v2 transport first (resend / fail / rotate-init/ack/commit).
@@ -382,6 +430,8 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
       console.warn('[Beam SW] Pairing relay WebSocket closed. Code:', e.code, 'Reason:', e.reason);
       if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
       pairingWs = null;
+      // Authority transitions ONLINE/CONNECTING -> RECONNECTING (or OFFLINE).
+      getConnectionAuthority()?.notifyWsClosed();
 
       // Clear cached presence — we don't know the current state after a reconnect.
       // The relay will re-send peer-online events for any online peers when we
@@ -652,6 +702,9 @@ export async function deliverIncomingClipboard(content, fromDeviceId) {
  */
 export async function sendClipboardEncrypted(targetDeviceId, _rendezvousId, content) {
   const transferIdHex = await getBeamV2Transport().sendClipboard(targetDeviceId, content);
+  // End-to-end success is strong proof of life — promote the peer to HEALTHY.
+  // No-op if the authority is null (e.g. tests that bypass _doConnect).
+  getConnectionAuthority()?.notifySendCompleted(targetDeviceId);
   return { transferIdHex };
 }
 
@@ -681,6 +734,9 @@ export async function sendFileEncrypted(payload) {
   const result = await getBeamV2Transport().sendFile(targetDeviceId, {
     fileName, fileSize, mimeType, bytes,
   });
+  // End-to-end success is strong proof of life — promote the peer to HEALTHY.
+  // No-op if the authority is null (e.g. tests that bypass _doConnect).
+  getConnectionAuthority()?.notifySendCompleted(targetDeviceId);
   // The current callers don't read totalChunks, but preserve the v1 shape.
   return { transferIdHex: result.transferIdHex, totalChunks: result.totalChunks };
 }
