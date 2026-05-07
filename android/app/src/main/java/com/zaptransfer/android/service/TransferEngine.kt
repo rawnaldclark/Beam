@@ -6,6 +6,7 @@ import android.net.Uri
 import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
+import com.zaptransfer.android.connection.ConnectionAuthority
 import com.zaptransfer.android.crypto.BeamV2Transport
 import com.zaptransfer.android.crypto.BeamV2Wiring
 import com.zaptransfer.android.crypto.KeyManager
@@ -72,6 +73,7 @@ class TransferEngine @Inject constructor(
     private val transferHistoryDao: TransferHistoryDao,
     @Suppress("unused") private val chunkProgressDao: ChunkProgressDao,
     private val beamV2Wiring: BeamV2Wiring,
+    private val connectionAuthority: ConnectionAuthority,
 ) {
 
     /** Coroutine scope backed by a SupervisorJob so one failed send doesn't cancel others. */
@@ -148,6 +150,11 @@ class TransferEngine @Inject constructor(
                         completedAt   = System.currentTimeMillis(),
                     )
                 )
+                // Successful sendFile + history persist is strong proof of life —
+                // promote the peer to HEALTHY. Ordered AFTER the DAO insert so
+                // a Room I/O failure can't leave the authority claiming healthy
+                // while the history row is missing.
+                connectionAuthority.notifySendCompleted(targetDeviceId)
                 Log.i(TAG, "Beam v2 file sent: id=$transferIdHex name=$fileName size=$fileSize")
             } catch (e: Exception) {
                 Log.e(TAG, "sendFile failed: ${e.message}", e)
@@ -167,6 +174,10 @@ class TransferEngine @Inject constructor(
             try {
                 val transferIdHex = beamV2Wiring.transport.sendClipboard(targetDeviceId, text)
                 Log.i(TAG, "Beam v2 clipboard sent: id=$transferIdHex target=$targetDeviceId (${text.length} chars)")
+                // Successful sendClipboard is strong proof of life — promote
+                // the peer to HEALTHY. Clipboard has no DAO write, so ordering
+                // is purely "after the side-effects this method owns."
+                connectionAuthority.notifySendCompleted(targetDeviceId)
             } catch (e: Exception) {
                 Log.e(TAG, "sendClipboard failed: ${e.message}", e)
             }

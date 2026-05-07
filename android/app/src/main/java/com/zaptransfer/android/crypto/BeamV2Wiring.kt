@@ -2,6 +2,7 @@ package com.zaptransfer.android.crypto
 
 import android.util.Base64
 import android.util.Log
+import com.zaptransfer.android.connection.ConnectionAuthority
 import com.zaptransfer.android.data.repository.DeviceRepository
 import com.zaptransfer.android.webrtc.RelayMessage
 import com.zaptransfer.android.webrtc.SignalingClient
@@ -32,6 +33,7 @@ class BeamV2Wiring @Inject constructor(
     private val signalingClient: SignalingClient,
     private val deviceRepo: DeviceRepository,
     private val keyManager: KeyManager,
+    private val connectionAuthority: ConnectionAuthority,
 ) {
 
     interface Delivery {
@@ -115,10 +117,16 @@ class BeamV2Wiring @Inject constructor(
                     deviceRepo.updateKABRing(deviceId, json)
                 }
                 override suspend fun onClipboardReceived(content: String, fromDeviceId: String) {
+                    // A successful inbound v2 clipboard frame is strong proof
+                    // of life — promote the peer to HEALTHY in the authority.
+                    connectionAuthority.notifyFrameReceived(fromDeviceId)
                     delivery?.onClipboardReceived(content, fromDeviceId)
                         ?: Log.w(TAG, "onClipboardReceived: no delivery wired")
                 }
                 override suspend fun onFileReceived(args: BeamV2Transport.FileDelivery) {
+                    // A successful inbound v2 file frame is strong proof of
+                    // life — promote the peer to HEALTHY in the authority.
+                    connectionAuthority.notifyFrameReceived(args.fromDeviceId)
                     delivery?.onFileReceived(args)
                         ?: Log.w(TAG, "onFileReceived: no delivery wired")
                 }
