@@ -1813,3 +1813,28 @@ button:focus-visible,
   outline:        1px solid var(--beam-warning, var(--warn));
   outline-offset: 2px;
 }
+
+/* --------------------------------------------------------------------------
+   Surrendered variant — shown when the recovery ladder gave up (Task 11
+   spec §"Rung 4 — Surface to user"). Repaints the yellow "Reconnecting…"
+   banner red so the user immediately sees this is "connection failed,
+   action required" rather than "we're working on it."
+   -------------------------------------------------------------------------- */
+.connection-banner.connection-banner-surrendered {
+  background:    var(--beam-danger-12, rgba(244, 102, 102, 0.14));
+  border-bottom: 1px solid var(--beam-danger, var(--danger));
+}
+.connection-banner.connection-banner-surrendered .connection-banner-icon {
+  color: var(--beam-danger, var(--danger));
+}
+.connection-banner.connection-banner-surrendered .connection-banner-button {
+  border-color: var(--beam-danger, var(--danger));
+  color:        var(--beam-danger, var(--danger));
+}
+.connection-banner.connection-banner-surrendered .connection-banner-button:hover {
+  background: var(--beam-danger, var(--danger));
+  color:      var(--beam-bg-0, var(--bg));
+}
+.connection-banner.connection-banner-surrendered .connection-banner-button:focus-visible {
+  outline: 1px solid var(--beam-danger, var(--danger));
+}

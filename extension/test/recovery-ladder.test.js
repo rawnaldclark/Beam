@@ -17,51 +17,9 @@ import assert from 'node:assert/strict';
 
 import { RecoveryLadder, awaitObservableOrTimeout } from '../connection/recovery-ladder.js';
 import { Observable } from '../connection/observable.js';
+import { FakeClock } from './helpers/fake-clock.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
-
-/**
- * Manual-tick fake clock. Mirrors the one in connection-authority.test.js but
- * stays inline here per Task 8 review note: "extraction would balloon scope."
- */
-class FakeClock {
-  constructor(startMs = 0) {
-    this._now = startMs;
-    this._nextId = 1;
-    /** @type {Map<number, {dueAt:number, fn:() => void}>} */
-    this._timers = new Map();
-  }
-  now() { return this._now; }
-  setTimeout(fn, delay) {
-    const id = this._nextId++;
-    this._timers.set(id, { dueAt: this._now + Math.max(0, delay), fn });
-    return id;
-  }
-  clearTimeout(id) {
-    if (id == null) return;
-    this._timers.delete(id);
-  }
-  tick(ms) {
-    const target = this._now + ms;
-    while (true) {
-      let nextId = null;
-      let nextDue = Infinity;
-      for (const [id, t] of this._timers) {
-        if (t.dueAt <= target && t.dueAt < nextDue) {
-          nextDue = t.dueAt;
-          nextId = id;
-        }
-      }
-      if (nextId == null) break;
-      const t = this._timers.get(nextId);
-      this._timers.delete(nextId);
-      this._now = t.dueAt;
-      t.fn();
-    }
-    this._now = target;
-  }
-  get pending() { return this._timers.size; }
-}
 
 /**
  * Build a controllable rung. The returned object has:
@@ -227,6 +185,75 @@ describe('RecoveryLadder: sequential rung execution', () => {
     assert.equal(result.ok, false);
     assert.equal(result.exhausted, true);
     assert.equal(result.lastError.message, 'TODO Rung 3');
+  });
+
+  // ─── Task 11 Rung 3 specific scenarios ─────────────────────────────────────
+  // These cover the new Rung 3 action contract: it calls `forceFullReset`,
+  // then awaits selfState=ONLINE within RUNG_3_BUDGET_MS. The ladder layer
+  // sees only a boolean — the awaiting logic is in connection-authority.js
+  // — but the sequencing/timeout/cancellation behavior we lock in here.
+
+  it('Task 11: rung1 + rung2 fail, rung3 succeeds → result.rung is "rung3"', async () => {
+    // Mirror the production shape: ladder advances rung1 → rung2 → rung3,
+    // and rung3's success indicator (selfState=ONLINE within 30s) flips.
+    const r1 = makeControllableRung('rung1', 5_000);
+    const r2 = makeControllableRung('rung2', 15_000);
+    const r3 = makeControllableRung('rung3', 30_000);
+    const ladder = new RecoveryLadder({ rungs: [r1.rung, r2.rung, r3.rung] });
+    const runPromise = ladder.run();
+
+    await flushMicrotasks(); r1.timeout();
+    await flushMicrotasks(); r2.timeout();
+    await flushMicrotasks();
+    assert.equal(r3.calls, 1, 'rung3 invoked after rung1+2 failed');
+    r3.succeed();
+
+    const result = await runPromise;
+    assert.deepEqual(result, { ok: true, rung: 'rung3' });
+  });
+
+  it('Task 11: rung3-only single-rung ladder (the requestReconnect shape)', async () => {
+    // requestReconnect builds a ladder with ONLY rung3 — manual tap skips
+    // rung1+2. The ladder must run rung3 immediately and report success.
+    const r3 = makeControllableRung('rung3', 30_000);
+    const ladder = new RecoveryLadder({ rungs: [r3.rung] });
+    const runPromise = ladder.run();
+    await flushMicrotasks();
+    assert.equal(r3.calls, 1, 'single-rung ladder runs rung3 first');
+    r3.succeed();
+    const result = await runPromise;
+    assert.deepEqual(result, { ok: true, rung: 'rung3' });
+  });
+
+  it('Task 11: rung3-only ladder reports exhausted on timeout', async () => {
+    // The thrash-guard "skip 1+2 → straight to surrender" path uses a
+    // synthetic single-rung ladder that returns false. The ladder must
+    // report exhausted + ok:false (no lastError because no throw).
+    const r3 = makeControllableRung('rung3', 30_000);
+    const ladder = new RecoveryLadder({ rungs: [r3.rung] });
+    const runPromise = ladder.run();
+    await flushMicrotasks();
+    r3.timeout();
+    const result = await runPromise;
+    assert.equal(result.ok, false);
+    assert.equal(result.exhausted, true);
+    assert.equal(result.cancelled, undefined);
+  });
+
+  it('Task 11: rung3 mid-action cancel → cancelled (not advancing past rung3)', async () => {
+    // requestReconnect mid-ladder semantics: the new ladder's cancel must
+    // drop the in-flight rung's outcome on the floor. This was implicitly
+    // covered by the cancellation suite, but the Rung-3 wiring deserves
+    // an explicit assertion since it's the manual-reconnect path.
+    const r3 = makeControllableRung('rung3', 30_000);
+    const ladder = new RecoveryLadder({ rungs: [r3.rung] });
+    const runPromise = ladder.run();
+    await flushMicrotasks();
+    ladder.cancel();
+    assert.equal(r3.signalSeen.aborted, true);
+    r3.timeout();
+    const result = await runPromise;
+    assert.deepEqual(result, { ok: false, cancelled: true });
   });
 });
 

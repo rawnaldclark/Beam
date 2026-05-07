@@ -37,8 +37,21 @@
  *   - Otherwise we issue a 5s peer-ping; on timeout we mark FAILED, kick the
  *     recovery ladder, await its result, and retry one ping on success.
  *
- * Subsequent tasks layer on:
- *   - Task 11: Rung 3 (full session reset), Rung 4 backoff + surrender.
+ * As of Task 11 the authority owns the **full recovery ladder**:
+ *   - **Rung 3** ("full session reset"): calls `signalingHooks.forceFullReset`
+ *     to tear down the WS, the v2 transport singleton, and inflight-connect
+ *     bookkeeping, then waits up to {@link RUNG_3_BUDGET_MS} for selfState to
+ *     return to ONLINE. Failure (timeout or hook missing) advances to Rung 4.
+ *   - **Rung 4** ("surrender to user"): sets the `surrenderedToUser` flag
+ *     so the popup banner shows "Connection failed — tap to reconnect" with
+ *     no auto-retry text, dispatches `recovery-given-up`, and schedules an
+ *     auto-retry via {@link BACKOFF_SCHEDULE_MS} (30s → 2m → 10m → 30m cap).
+ *   - **Thrash guard**: two full Rung-3 failures within
+ *     {@link RUNG_3_THRASH_WINDOW_MS} skip Rungs 1+2 and Rung 3 itself, going
+ *     straight to Rung 4.
+ *   - **`requestReconnect()`** (popup tap): cancels any in-flight ladder,
+ *     clears the backoff timer + surrender flag, and kicks a fresh ladder
+ *     that starts at Rung 3.
  *
  * Spec: docs/superpowers/specs/2026-05-02-connection-authority-design.md
  */
@@ -55,7 +68,18 @@ import {
   RUNG_1_BUDGET_MS,
   RUNG_2_BUDGET_MS,
   RUNG_3_BUDGET_MS,
+  BACKOFF_SCHEDULE_MS,
 } from './constants.js';
+
+/**
+ * Window over which Rung-3 attempts are counted toward the thrash guard.
+ * Per spec §"Discipline rules": "Two full Rung-3 failures within 5 min →
+ * promote to Rung 4 immediately." A "full Rung-3 failure" means the ladder
+ * reached Rung 3, ran its 30s budget, and `selfState` did not become ONLINE.
+ */
+const RUNG_3_THRASH_WINDOW_MS = 5 * 60 * 1_000;
+/** Failure-count threshold within {@link RUNG_3_THRASH_WINDOW_MS}. */
+const RUNG_3_THRASH_THRESHOLD = 2;
 
 /**
  * Per-ping deadline for the send-time pre-flight peer-ping. Distinct from the
@@ -140,6 +164,18 @@ export class ConnectionAuthority {
     /** @type {Observable<Map<string, string>>} */
     this._peerHealth = new Observable(new Map());
 
+    /**
+     * "We have given up; user action required" flag (Task 11 / spec §Rung 4).
+     * Lifted via {@link Observable} so the popup broadcaster can re-render
+     * the banner on every change. Lives on the authority (not in the
+     * selfState reducer) per the existing reducer comment at
+     * `self-state.js:120-122` — `recovery-given-up` keeps selfState in
+     * RECONNECTING and the surrender flag is observable independently.
+     *
+     * @type {Observable<boolean>}
+     */
+    this._surrenderedToUser = new Observable(false);
+
     this._pingTimeoutMs = options.pingTimeoutMs ?? PING_TIMEOUT_MS;
     this._bgPingIntervalMs = options.bgPingIntervalMs ?? BG_PING_INTERVAL_MS;
 
@@ -214,6 +250,36 @@ export class ConnectionAuthority {
     this._currentLadder = null;
 
     /**
+     * Timestamps (virtual or real, depending on `_now()`) of recent Rung-3
+     * failures. A "full Rung-3 failure" is recorded by {@link _kickLadder}
+     * exactly when the ladder reached Rung 3, ran its full budget, and
+     * `selfState` did not become ONLINE. Entries older than
+     * {@link RUNG_3_THRASH_WINDOW_MS} are pruned at the next read.
+     *
+     * @type {number[]}
+     */
+    this._rung3FailureLog = [];
+
+    /**
+     * Auto-retry attempt counter for Rung 4 backoff. Indexes into
+     * {@link BACKOFF_SCHEDULE_MS}. Reset to 0 every time recovery succeeds
+     * (or `requestReconnect` succeeds). Capped at the last index (the spec's
+     * 30m "stays at cap" rule).
+     *
+     * @type {number}
+     */
+    this._backoffAttempt = 0;
+
+    /**
+     * Pending Rung-4 auto-retry timer id. Set when {@link _scheduleBackoffRetry}
+     * arms a timer; cleared when the timer fires, when `requestReconnect` is
+     * called (manual tap always bypasses backoff), or on shutdown.
+     *
+     * @type {ReturnType<typeof setTimeout> | null}
+     */
+    this._backoffTimer = null;
+
+    /**
      * "Recent traffic" timestamps consumed by {@link ensureSendable} to skip
      * the pre-flight peer-ping when proof-of-life is fresh. Updated on
      * `notifyFrameReceived` and `notifySendCompleted` only — pong arrivals
@@ -252,6 +318,16 @@ export class ConnectionAuthority {
   /** Subscribable Map<DeviceId, PeerHealth> snapshot. Map is replaced on each
    *  change; never mutated in place (subscribers can compare references). */
   get peerHealth() { return this._peerHealth; }
+
+  /**
+   * Subscribable boolean: `true` after the recovery ladder has surrendered
+   * to the user (Rung 4 reached without success, OR the thrash guard
+   * promoted us). Cleared when {@link requestReconnect} is invoked or when
+   * the next ladder succeeds. The popup uses this to choose between the
+   * "Reconnecting…" yellow banner and the "Connection failed — tap to
+   * reconnect" red banner.
+   */
+  get surrenderedToUser() { return this._surrenderedToUser; }
 
   // ── Notify methods (called by wiring layer in Task 6) ───────────────────
   // These translate "things that happened on the wire" into reducer events.
@@ -461,13 +537,16 @@ export class ConnectionAuthority {
    * tracker's longer timeout by resolving on whichever lands first
    * (pong, abort, or our 5s timer). A late pong after our timer fires is
    * still safe: the tracker cleans up its own pending entry on
-   * `recordPong` / `sweepExpired`, and a subsequent stray
-   * `notifyPongReceived` no-ops because the cadence-side `_nonceToPeer`
-   * never recorded this nonce. (We deliberately do NOT register the
-   * pre-flight nonce in `_nonceToPeer` — pre-flight liveness should not
-   * accidentally promote peerHealth via the cadence pong path, which is
-   * what the Task 7 test "does NOT promote peer health when nonce came
-   * from outside the cadence engine" already guarantees.)
+   * `recordPong` / `sweepExpired`.
+   *
+   * Per Task 11 follow-up F: a successful pre-flight pong is real proof of
+   * peer life and SHOULD promote peerHealth through the reducer. We
+   * deliberately do NOT register the nonce in `_nonceToPeer` (that map is
+   * the cadence engine's bookkeeping; mixing pre-flight nonces in would
+   * complicate the cadence-engine invariants). Instead, we explicitly
+   * dispatch `pong-received` directly when the tracker promise resolves
+   * inside this function. This keeps the cadence Map clean while still
+   * letting the reducer treat a successful pre-flight as strong evidence.
    *
    * Resource discipline: every code path clears the timer and, in shutdown
    * scenarios, leaves no dangling promise references — the tracker's own
@@ -515,7 +594,15 @@ export class ConnectionAuthority {
       if (timerId && typeof timerId.unref === 'function') timerId.unref();
 
       pingPromise.then(
-        () => settle({ ok: true }),
+        () => {
+          // Pong landed within our 5s window — promote the peer to HEALTHY
+          // through the reducer. Per follow-up F: pre-flight liveness is
+          // strong proof of life and should be reflected in peerHealth so
+          // the popup dot stops being yellow (STALE) when the user has just
+          // proven the peer is responsive.
+          this._dispatchPeer(peerId, { type: 'pong-received' });
+          settle({ ok: true });
+        },
         // The tracker rejects with `{ok:false, reason:'timeout'}` when its
         // own (10s) sweep finds the entry expired. We may resolve via our
         // 5s timer first; if not, this rejection short-circuits us.
@@ -526,8 +613,14 @@ export class ConnectionAuthority {
 
   /**
    * Returns a promise that resolves when {@link _currentLadder} settles, or
-   * resolves immediately if no ladder is running. Used by `ensureSendable` to
-   * await a ladder kicked by a `pre-flight-failed` dispatch.
+   * resolves immediately with `{ok:false}` if no ladder is running.
+   *
+   * MUST be called AFTER `_kickLadder` has had a chance to install the
+   * ladder — otherwise the synchronous `_currentLadder` snapshot is `null`
+   * and the caller short-circuits to PEER_UNREACHABLE without actually
+   * giving the ladder a chance to recover. (`ensureSendable`'s call site is
+   * structured so the kick precedes the await; tests that bypass that
+   * ordering will see `{ok:false}` for the wrong reason.)
    *
    * The {@link RecoveryLadder#run} method memoizes — calling `.run()` after
    * the ladder has already started returns the same promise, so observing it
@@ -549,10 +642,75 @@ export class ConnectionAuthority {
   }
 
   /**
-   * Manual reconnect entry point (popup "Reconnect now" button). Stub for
-   * Task 5 — Task 11 implements the recovery-ladder kickoff.
+   * Manual reconnect entry point (popup "Reconnect now" button). Cancels any
+   * in-flight ladder, clears the Rung-4 backoff timer, drops the
+   * `surrenderedToUser` flag, and dispatches a fresh ladder that starts at
+   * Rung 3 (skipping Rungs 1 + 2 — manual reconnect always implies the
+   * lighter rungs already failed or the user knows they will).
+   *
+   * Per spec §"Discipline rules": "Manual tap always bypasses backoff." The
+   * thrash guard is also reset (the user has manually intervened, so the
+   * "we keep failing back-to-back" signal is no longer the source of truth).
+   *
+   * Resolves with `{ ok: true }` on a successful reconnect (Rung 3 succeeded
+   * within budget) or `{ ok: false }` if Rung 3 failed and we surrendered
+   * to Rung 4 again. The SW message router uses the boolean to pick a
+   * response message for the popup.
+   *
+   * @returns {Promise<{ok: boolean}>}
    */
-  async requestReconnect() { /* stub — Task 11 */ }
+  async requestReconnect() {
+    if (this._shutdown) return { ok: false };
+
+    // 1) Cancel any in-flight ladder. Its run() promise resolves with
+    // {ok:false, cancelled:true} once the in-flight rung settles in response
+    // to the abort signal — which means the post-resolve thrash-counter
+    // bookkeeping in _kickLadder DOES NOT fire (we check `cancelled`).
+    if (this._currentLadder) {
+      const cancelling = this._currentLadder;
+      cancelling.cancel();
+      this._currentLadder = null;
+    }
+
+    // 2) Cancel any pending Rung-4 backoff retry. Manual tap is the user
+    // saying "don't wait, try now."
+    this._cancelBackoffTimer();
+
+    // 3) Clear the surrender flag so the popup shows "Reconnecting…" again
+    // (yellow), not "Connection failed" (red).
+    if (this._surrenderedToUser.value) {
+      this._surrenderedToUser.next(false);
+    }
+
+    // 4) Reset the thrash log — the user has intervened, so "two recent
+    // Rung-3 failures" is no longer the relevant signal.
+    this._rung3FailureLog = [];
+
+    // 5) Build the ladder + latch `_currentLadder` BEFORE dispatching
+    // `recovery-began` (same ordering rationale as `_kickLadder`: the
+    // selfState post-hook re-enters `_kickLadder`, which must hit the
+    // "ladder owns the floor" guard rather than starting a second ladder).
+    const ladder = this._buildRung3OnlyLadder();
+    this._currentLadder = ladder;
+
+    // 6) Ensure selfState is at least RECONNECTING so the popup banner shows
+    // recovery-in-progress while we drive Rung 3.
+    this._dispatchSelf({ type: 'recovery-began' });
+
+    // eslint-disable-next-line no-console
+    console.log('[CA] ladder: kicked reason=manual-reconnect');
+    let result;
+    try {
+      result = await ladder.run();
+    } catch {
+      result = { ok: false };
+    }
+    // Settle the ladder slot and react to the outcome. We do this inline
+    // (rather than via _kickLadder's .then) because the caller awaits us.
+    if (this._currentLadder === ladder) this._currentLadder = null;
+    this._handleLadderSettled(ladder, result, /*triggerPeerId*/ null);
+    return { ok: !!(result && result.ok) };
+  }
 
   // ── Internal dispatch helpers ──────────────────────────────────────────
 
@@ -722,7 +880,16 @@ export class ConnectionAuthority {
 
     if (!this._pingTracker) return;
 
-    const { nonce } = this._pingTracker.sendPing(peerId, this._now());
+    const { nonce, promise: trackerPromise } = this._pingTracker.sendPing(peerId, this._now());
+    // The cadence loop owns its own timeout via `_handlePingTimeout`; the
+    // tracker's internal promise is not awaited by us. Attach a no-op
+    // catch so a tracker `sweepExpired` (e.g. follow-up E's per-kick GC)
+    // doesn't surface as an unhandled rejection. The .then(()=>{}) on the
+    // resolve side is harmless — `notifyPongReceived` already forwards
+    // pongs into the reducer through the cadence's `_nonceToPeer` map.
+    if (trackerPromise && typeof trackerPromise.then === 'function') {
+      trackerPromise.then(() => {}, () => {});
+    }
     entry.pendingNonce = nonce;
     this._nonceToPeer.set(nonce, peerId);
 
@@ -765,9 +932,17 @@ export class ConnectionAuthority {
   /**
    * Tear-down hook. Clears every per-peer ping/timeout timer and forgets all
    * nonce mappings. Also cancels any in-flight recovery ladder so its
-   * pending budget timers / observable subscriptions are released. After
-   * shutdown, further notify calls are still safe but no new cadence cycles
-   * or ladder kicks will run.
+   * pending budget timers / observable subscriptions are released, and the
+   * Rung-4 backoff retry timer if armed. After shutdown, further notify
+   * calls are still safe but no new cadence cycles or ladder kicks will
+   * run.
+   *
+   * Per follow-up H: in-flight `ensureSendable` calls that are awaiting a
+   * ladder result resolve to `{ok:false, reason:'PEER_UNREACHABLE'}` after
+   * shutdown — `_awaitLadderResolved` reads `this._currentLadder` after the
+   * shutdown clears it, returns `{ok:false}`, and the caller surfaces
+   * PEER_UNREACHABLE. The pre-flight probe timer is unref'd so it does not
+   * keep the process alive past shutdown.
    */
   shutdown() {
     this._shutdown = true;
@@ -779,6 +954,7 @@ export class ConnectionAuthority {
       this._currentLadder.cancel();
       this._currentLadder = null;
     }
+    this._cancelBackoffTimer();
   }
 
   // ── Recovery ladder (Task 8) ────────────────────────────────────────────
@@ -800,27 +976,38 @@ export class ConnectionAuthority {
   _kickLadder({ triggerPeerId, reason }) {
     if (this._shutdown) return;
     if (this._currentLadder) return; // ladder owns the floor
-    const ladder = this._buildLadder(triggerPeerId);
+
+    // Follow-up E: opportunistic tracker GC. The pre-flight probe (Task 9)
+    // intentionally does NOT register its nonce in the cadence engine, which
+    // means the tracker's `_pending` map can accumulate entries on a busy
+    // sender. Sweeping at every ladder kick is cheap and bounded — ladder
+    // kicks are the proven "something is wrong" signal that justifies the
+    // sweep without having to add a dedicated periodic timer.
+    if (this._pingTracker && typeof this._pingTracker.sweepExpired === 'function') {
+      try { this._pingTracker.sweepExpired(this._now()); } catch { /* swallow */ }
+    }
+
+    const thrash = this._thrashGuardActive();
+    const ladder = thrash ? this._buildSurrenderLadder() : this._buildLadder(triggerPeerId);
+    // CRITICAL ordering: latch `_currentLadder` BEFORE dispatching
+    // `recovery-began`. The selfState reducer's RECONNECTING transition
+    // post-hook in `_dispatchSelf` re-enters `_kickLadder`; latching first
+    // makes the re-entry hit the "ladder owns the floor" guard cleanly so
+    // we never run two concurrent ladders.
     this._currentLadder = ladder;
+
+    // Per follow-up A (Task 11 review): dispatch `recovery-began` so the
+    // popup banner shows "Reconnecting…" immediately on a peer-FAILED kick,
+    // not just on a self-RECONNECTING ws-closed.
+    this._dispatchSelf({ type: 'recovery-began' });
+
     // eslint-disable-next-line no-console
-    console.log(`[CA] ladder: kicked reason=${reason} triggerPeer=${triggerPeerId ?? 'none'}`);
+    console.log(`[CA] ladder: kicked reason=${reason} triggerPeer=${triggerPeerId ?? 'none'}`
+      + (thrash ? ' thrash=YES' : ''));
     ladder.run().then(
       (result) => {
-        // Only release the slot if this ladder is still the current one.
-        // (`requestReconnect` mid-ladder will swap in a new ladder in
-        // Task 11; here we just unlatch our reference.)
         if (this._currentLadder === ladder) this._currentLadder = null;
-        if (result.ok) {
-          // The reducer is the source of truth for the resulting state — we
-          // dispatch `recovery-succeeded` to drop FAILED peers back to
-          // UNKNOWN and lift selfState from RECONNECTING (where applicable).
-          this._dispatchSelf({ type: 'recovery-succeeded' });
-          if (triggerPeerId) {
-            this._dispatchPeer(triggerPeerId, { type: 'recovery-succeeded' });
-          }
-        }
-        // ok=false: leave reducer state alone. Rung 4 (Task 11) will surface
-        // surrender to the user.
+        this._handleLadderSettled(ladder, result, triggerPeerId);
       },
       (err) => {
         // _runInternal() should never reject — we treat thrown actions as
@@ -828,8 +1015,58 @@ export class ConnectionAuthority {
         if (this._currentLadder === ladder) this._currentLadder = null;
         // eslint-disable-next-line no-console
         console.log(`[CA] ladder: unexpected rejection ${err && err.message}`);
+        this._handleLadderSettled(ladder, { ok: false }, triggerPeerId);
       },
     );
+  }
+
+  /**
+   * Common settlement handler shared by `_kickLadder` (auto-recovery path)
+   * and `requestReconnect` (manual path). Lifts state on success, records
+   * Rung-3 failures toward the thrash counter, and promotes to Rung 4
+   * when the ladder gave up.
+   *
+   * @param {RecoveryLadder} ladder  The ladder whose result we are reacting to.
+   * @param {{ok:boolean, rung?:string, exhausted?:boolean, cancelled?:boolean}} result
+   * @param {string|null} triggerPeerId
+   *   The peer that crossed into FAILED, or `null` for self-RECONNECTING /
+   *   manual-reconnect kicks.
+   * @private
+   */
+  _handleLadderSettled(ladder, result, triggerPeerId) {
+    if (this._shutdown) return;
+    if (result && result.cancelled) {
+      // Cancelled by `requestReconnect` mid-ladder. The new ladder owns the
+      // recovery state machine from here; do nothing — in particular do NOT
+      // promote to Rung 4 on a cancelled run.
+      return;
+    }
+    if (result && result.ok) {
+      // Spec §"Discipline rules": "A rung that succeeds resets the ladder
+      // to idle." Reset the thrash counter and the backoff attempt count.
+      this._rung3FailureLog = [];
+      this._backoffAttempt = 0;
+      // Drop the surrender flag if it was up — we're back online.
+      if (this._surrenderedToUser.value) this._surrenderedToUser.next(false);
+      // Lift selfState (RECONNECTING → ONLINE) and the trigger peer
+      // (FAILED → UNKNOWN). The reducers are no-ops if already there.
+      this._dispatchSelf({ type: 'recovery-succeeded' });
+      if (triggerPeerId) {
+        this._dispatchPeer(triggerPeerId, { type: 'recovery-succeeded' });
+      }
+      return;
+    }
+    // Failure path. Determine whether Rung 3 actually got to run — if yes,
+    // count it toward the thrash guard. The ladder sets `exhausted: true`
+    // only after the for-loop ran every rung; for both the 3-rung and the
+    // Rung-3-only requestReconnect ladder, that's equivalent to "Rung 3
+    // ran and failed." A surrender ladder (thrash guard already promoted
+    // us) is tagged so we don't double-count.
+    const reachedRung3 = !!(result && result.exhausted);
+    if (reachedRung3 && !ladder._isSurrenderLadder) {
+      this._recordRung3Failure();
+    }
+    this._promoteToRung4();
   }
 
   /**
@@ -859,15 +1096,64 @@ export class ConnectionAuthority {
         {
           name: 'rung3',
           budgetMs: RUNG_3_BUDGET_MS,
-          // eslint-disable-next-line no-unused-vars
-          action: async ({ signal: _signal }) => {
-            // Stub — Task 11 implements full session reset.
-            throw new Error('TODO Rung 3');
-          },
+          action: ({ signal }) => this._rung3Action(signal),
         },
       ],
       timerImpl: this._timerImpl,
     });
+  }
+
+  /**
+   * Build a single-rung ladder that runs ONLY Rung 3. Used by
+   * {@link requestReconnect} — manual tap always goes straight to a full
+   * session reset (Rungs 1 + 2 are useful for "keep the existing transport,
+   * just nudge it" scenarios; manual reconnect implies the user has decided
+   * the lighter rungs aren't worth trying).
+   *
+   * @returns {RecoveryLadder}
+   * @private
+   */
+  _buildRung3OnlyLadder() {
+    return new RecoveryLadder({
+      rungs: [
+        {
+          name: 'rung3',
+          budgetMs: RUNG_3_BUDGET_MS,
+          action: ({ signal }) => this._rung3Action(signal),
+        },
+      ],
+      timerImpl: this._timerImpl,
+    });
+  }
+
+  /**
+   * Build a "ladder" that's really a one-rung surrender — used when the
+   * thrash guard fires (≥ {@link RUNG_3_THRASH_THRESHOLD} Rung-3 failures
+   * within {@link RUNG_3_THRASH_WINDOW_MS}). The single rung returns false
+   * synchronously, which sends us straight through `_handleLadderSettled`'s
+   * failure path → {@link _promoteToRung4}.
+   *
+   * The instance is tagged with `_isSurrenderLadder = true` so the settle
+   * handler doesn't double-count it toward the thrash log (the failures
+   * that triggered it are already counted).
+   *
+   * @returns {RecoveryLadder}
+   * @private
+   */
+  _buildSurrenderLadder() {
+    const ladder = new RecoveryLadder({
+      rungs: [
+        {
+          name: 'thrash-surrender',
+          budgetMs: 0,
+          // eslint-disable-next-line no-unused-vars
+          action: async ({ signal: _signal }) => false,
+        },
+      ],
+      timerImpl: this._timerImpl,
+    });
+    ladder._isSurrenderLadder = true;
+    return ladder;
   }
 
   /**
@@ -876,10 +1162,14 @@ export class ConnectionAuthority {
    * Action: dispatch `register-rendezvous` over the existing `sendJson`
    * hook (relay may have GC'd our session). Success indicator: any path to
    * `peerHealth[triggerPeerId] === HEALTHY` (relay-peer-online → frame-
-   * received → pong-received) within {@link RUNG_1_BUDGET_MS}. For self-
-   * RECONNECTING triggers (no specific peer) the criterion degrades to
-   * "any peer in `peerHealth` is HEALTHY" — equivalent to Rung 2's
-   * second clause without the `selfState === ONLINE` precondition.
+   * received → pong-received) within {@link RUNG_1_BUDGET_MS}.
+   *
+   * For self-RECONNECTING triggers (no specific peer) the criterion is
+   * `selfState === ONLINE` AND any peer in `peerHealth` is HEALTHY — that
+   * is, the same composite predicate Rung 2 uses. (Per Task 8 review
+   * follow-up C: a Rung 1 fired by self-RECONNECTING really should require
+   * self-online, not just "some peer eventually became HEALTHY" — the
+   * latter could read as a success while we're still stuck CONNECTING.)
    *
    * @param {string|null} triggerPeerId
    * @param {AbortSignal} signal
@@ -908,20 +1198,63 @@ export class ConnectionAuthority {
       // Intentional swallow — see comment above.
     }
 
-    const predicate = triggerPeerId
-      ? (map) => map.get(triggerPeerId) === PeerHealth.HEALTHY
-      : (map) => {
-        for (const v of map.values()) if (v === PeerHealth.HEALTHY) return true;
-        return false;
+    if (triggerPeerId) {
+      // Peer-specific trigger: success when the failed peer becomes HEALTHY.
+      return awaitObservableOrTimeout(
+        this._peerHealth,
+        (map) => map.get(triggerPeerId) === PeerHealth.HEALTHY,
+        RUNG_1_BUDGET_MS,
+        signal,
+        this._timerImpl,
+      );
+    }
+
+    // Self-trigger: success requires selfState ONLINE AND any peer HEALTHY.
+    // The two observables can't be ANDed atomically with the helper, so we
+    // subscribe directly here (mirrors `_rung2Action`'s composite predicate).
+    return new Promise((resolve) => {
+      if (signal && signal.aborted) { resolve(false); return; }
+
+      let settled = false;
+      let unsubSelf = null;
+      let unsubPeer = null;
+      let timerId = null;
+      let onAbort = null;
+
+      const cleanup = () => {
+        if (unsubSelf) { try { unsubSelf(); } catch { /* swallow */ } unsubSelf = null; }
+        if (unsubPeer) { try { unsubPeer(); } catch { /* swallow */ } unsubPeer = null; }
+        if (timerId != null) { try { this._clearTimeout(timerId); } catch { /* swallow */ } timerId = null; }
+        if (signal && onAbort) { try { signal.removeEventListener('abort', onAbort); } catch { /* swallow */ } onAbort = null; }
+      };
+      const settle = (v) => {
+        if (settled) return;
+        settled = true;
+        cleanup();
+        resolve(v);
       };
 
-    return awaitObservableOrTimeout(
-      this._peerHealth,
-      predicate,
-      RUNG_1_BUDGET_MS,
-      signal,
-      this._timerImpl,
-    );
+      let selfOnline = this._selfState.value === SelfState.ONLINE;
+      let anyPeerHealthy = peerMapHasHealthy(this._peerHealth.value);
+      const tryFire = () => { if (selfOnline && anyPeerHealthy) settle(true); };
+
+      timerId = this._setTimeout(() => settle(false), RUNG_1_BUDGET_MS);
+      if (timerId && typeof timerId.unref === 'function') timerId.unref();
+
+      if (signal) {
+        onAbort = () => settle(false);
+        signal.addEventListener('abort', onAbort, { once: true });
+      }
+
+      unsubSelf = this._selfState.subscribe((s) => {
+        selfOnline = s === SelfState.ONLINE;
+        tryFire();
+      });
+      unsubPeer = this._peerHealth.subscribe((m) => {
+        anyPeerHealthy = peerMapHasHealthy(m);
+        tryFire();
+      });
+    });
   }
 
   /**
@@ -1007,6 +1340,178 @@ export class ConnectionAuthority {
       // tryFire was invoked inside each. If both were already true, settle
       // already fired and cleanup torn everything down. Otherwise we wait.
     });
+  }
+
+  /**
+   * Rung 3: full session reset. Calls `hooks.forceFullReset()` (which tears
+   * down the WS, clears the v2 transport singleton, and re-enters the SW boot
+   * path), then waits up to {@link RUNG_3_BUDGET_MS} for `selfState` to
+   * return to `ONLINE`.
+   *
+   * Spec mapping (Chrome steps 1-5 from §"Rung 3 — Full session reset"):
+   *   1. `stopPairingListener()` — handled inside `forceFullReset`.
+   *   2. Null `pairingWs`, `_inflightConnect`, `_inflightDeviceId` — likewise.
+   *   3. `_resetTransportSingleton()` — likewise.
+   *   4. `autoStartRelayIfPaired()` — invoked via the `restartFn` arg the
+   *      wiring layer supplies to `forceFullReset`.
+   *   5. Wait up to 30s for `selfState=ONLINE` — implemented here.
+   *
+   * If `forceFullReset` is missing from the hook bag (skeleton-mode tests),
+   * the rung surrenders synchronously: there's nothing to reset and the
+   * ladder advances to Rung 4.
+   *
+   * @param {AbortSignal} signal
+   * @returns {Promise<boolean>}
+   * @private
+   */
+  async _rung3Action(signal) {
+    if (signal && signal.aborted) return false;
+    const reset = this._hooks.forceFullReset;
+    if (typeof reset !== 'function') {
+      // No full-reset hook wired — skeleton mode.
+      return false;
+    }
+    try {
+      await reset();
+    } catch {
+      // Reset hook threw — let the budget-timer race observe success-by-other-
+      // path before surrendering. (Production's `forceFullReset` swallows
+      // restart errors internally; this is belt-and-braces.)
+    }
+    if (signal && signal.aborted) return false;
+
+    return awaitObservableOrTimeout(
+      this._selfState,
+      (s) => s === SelfState.ONLINE,
+      RUNG_3_BUDGET_MS,
+      signal,
+      this._timerImpl,
+    );
+  }
+
+  // ── Rung 3 thrash guard + Rung 4 backoff ─────────────────────────────────
+
+  /**
+   * Returns `true` iff the thrash guard should pre-empt the next ladder
+   * kick by going straight to surrender. Prunes entries older than
+   * {@link RUNG_3_THRASH_WINDOW_MS} as a side effect.
+   *
+   * @returns {boolean}
+   * @private
+   */
+  _thrashGuardActive() {
+    const now = this._now();
+    const cutoff = now - RUNG_3_THRASH_WINDOW_MS;
+    if (this._rung3FailureLog.length > 0) {
+      this._rung3FailureLog = this._rung3FailureLog.filter((t) => t >= cutoff);
+    }
+    return this._rung3FailureLog.length >= RUNG_3_THRASH_THRESHOLD;
+  }
+
+  /**
+   * Append the current timestamp to the Rung-3 failure log. Called by
+   * {@link _handleLadderSettled} when a ladder reached Rung 3 and Rung 3 did
+   * not lift selfState to ONLINE within budget.
+   *
+   * @private
+   */
+  _recordRung3Failure() {
+    this._rung3FailureLog.push(this._now());
+    // eslint-disable-next-line no-console
+    console.log(`[CA] ladder: rung3 failure recorded (count=${this._rung3FailureLog.length})`);
+  }
+
+  /**
+   * Rung 4: surrender to the user and schedule the next auto-retry.
+   *
+   * Per spec §"Rung 4 — Surface to user":
+   *   - `selfState` stays in RECONNECTING (the reducer's `recovery-given-up`
+   *     handler is a no-op outside RECONNECTING — so we make sure we're at
+   *     least in RECONNECTING first via `recovery-began`).
+   *   - The `surrenderedToUser` flag flips to `true` so the popup banner
+   *     switches to the red "Connection failed — tap to reconnect" UI.
+   *   - `recovery-given-up` is dispatched into both reducers so any FAILED
+   *     peer state observers can react if they want to (the peerHealth
+   *     reducer's handler is informational; the selfState handler is
+   *     informational too).
+   *   - An exponential-backoff timer is armed for the next auto-attempt.
+   *
+   * @private
+   */
+  _promoteToRung4() {
+    if (this._shutdown) return;
+    // Make sure we're at least in RECONNECTING so the popup banner stays up.
+    // (We could also be in OFFLINE, e.g. if a stop event raced — in which
+    // case the user is no longer paired and the surrender flag is moot.)
+    this._dispatchSelf({ type: 'recovery-began' });
+    this._dispatchSelf({ type: 'recovery-given-up' });
+    if (!this._surrenderedToUser.value) {
+      this._surrenderedToUser.next(true);
+    }
+    // eslint-disable-next-line no-console
+    console.log('[CA] ladder: surrendered to user (Rung 4)');
+    this._scheduleBackoffRetry();
+  }
+
+  /**
+   * Arm the next auto-retry timer per {@link BACKOFF_SCHEDULE_MS}. The
+   * `_backoffAttempt` index advances after each scheduling so the next
+   * retry uses a longer delay (capped at the last entry in the schedule).
+   *
+   * If a backoff timer is already armed, this is a no-op (idempotent —
+   * a second `_promoteToRung4` while we're waiting must not stack timers).
+   *
+   * @private
+   */
+  _scheduleBackoffRetry() {
+    if (this._shutdown) return;
+    if (this._backoffTimer != null) return; // already armed
+    const idx = Math.min(this._backoffAttempt, BACKOFF_SCHEDULE_MS.length - 1);
+    const delay = BACKOFF_SCHEDULE_MS[idx];
+    this._backoffAttempt += 1;
+    // eslint-disable-next-line no-console
+    console.log(`[CA] ladder: backoff retry scheduled in ${delay}ms (attempt #${idx + 1})`);
+    this._backoffTimer = this._setTimeout(() => {
+      this._backoffTimer = null;
+      this._fireBackoffRetry();
+    }, delay);
+    // Unref so a test that doesn't tick the FakeClock isn't held open by
+    // the real-clock fallback. FakeClock returns a number — typeof guard.
+    if (this._backoffTimer && typeof this._backoffTimer.unref === 'function') {
+      this._backoffTimer.unref();
+    }
+  }
+
+  /**
+   * Cancel any pending Rung-4 auto-retry timer. Called by
+   * {@link requestReconnect} (manual tap bypasses backoff) and
+   * {@link shutdown}.
+   *
+   * @private
+   */
+  _cancelBackoffTimer() {
+    if (this._backoffTimer != null) {
+      try { this._clearTimeout(this._backoffTimer); } catch { /* swallow */ }
+      this._backoffTimer = null;
+    }
+  }
+
+  /**
+   * Backoff-timer callback: the auto-retry interval has elapsed. We reset
+   * the surrender flag (we're trying again) and kick a fresh full ladder.
+   * Note we kick a FULL ladder (Rungs 1 + 2 + 3), not just Rung 3 — the
+   * thrash counter is still in scope and will short-circuit to Rung 4 again
+   * if Rungs 1+2 don't quietly recover us.
+   *
+   * @private
+   */
+  _fireBackoffRetry() {
+    if (this._shutdown) return;
+    if (this._currentLadder) return; // a manual reconnect raced us
+    // Drop the surrender flag — we're actively trying again. The popup
+    // banner switches back to the yellow "Reconnecting…" UI.
+    if (this._surrenderedToUser.value) this._surrenderedToUser.next(false);
+    this._kickLadder({ triggerPeerId: null, reason: 'backoff-retry' });
   }
 }
 

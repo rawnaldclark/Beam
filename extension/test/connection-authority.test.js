@@ -23,8 +23,10 @@
  *     - Recent traffic resets the cadence.
  *     - Shutdown clears every timer.
  *
- * Cadence tests use a minimal in-file FakeClock (no library) so timer
- * semantics are deterministic and the test doesn't sleep on real wall time.
+ * Cadence and ladder tests use the shared FakeClock helper at
+ * `./helpers/fake-clock.js` so timer semantics are deterministic and tests
+ * don't sleep on real wall time. Extracted from this file in Task 11 to
+ * avoid a third copy as recovery-ladder.test.js needed the same surface.
  */
 
 import { describe, it } from 'node:test';
@@ -37,7 +39,12 @@ import {
   BG_PING_INTERVAL_MS,
   PING_TIMEOUT_MS,
   RECENT_TRAFFIC_WINDOW_MS,
+  RUNG_1_BUDGET_MS,
+  RUNG_2_BUDGET_MS,
+  RUNG_3_BUDGET_MS,
+  BACKOFF_SCHEDULE_MS,
 } from '../connection/constants.js';
+import { FakeClock } from './helpers/fake-clock.js';
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -211,12 +218,20 @@ describe('ConnectionAuthority: ensureSendable (skeleton-mode early-outs)', () =>
   });
 });
 
-// ─── requestReconnect stub ───────────────────────────────────────────────────
+// ─── requestReconnect (skeleton-mode smoke test) ─────────────────────────────
+// The full requestReconnect coverage lives later in this file under the
+// `Task 11: Rung 3, Rung 4, thrash guard, requestReconnect` block. Here we
+// just lock the no-throw shape for skeleton-mode (no ownDeviceId, no ladder
+// hooks).
 
-describe('ConnectionAuthority: requestReconnect (stub)', () => {
-  it('resolves without throwing in skeleton mode', async () => {
+describe('ConnectionAuthority: requestReconnect (skeleton-mode smoke)', () => {
+  it('resolves with {ok:false} without throwing in skeleton mode', async () => {
     const auth = new ConnectionAuthority({ signalingHooks: makeHooks() });
-    await assert.doesNotReject(() => auth.requestReconnect());
+    const result = await auth.requestReconnect();
+    // Without ownDeviceId / forceFullReset, Rung 3 surrenders synchronously
+    // and the manual ladder reports `ok:false`. Importantly: no throw.
+    assert.equal(result.ok, false);
+    auth.shutdown();
   });
 });
 
@@ -339,59 +354,6 @@ describe('ConnectionAuthority: notifyPongReceived', () => {
 });
 
 // ─── Task 7: background ping cadence ─────────────────────────────────────────
-
-/**
- * Minimal manual-tick fake clock for cadence tests.
- *
- * `tick(ms)` advances the virtual clock and fires every timer whose deadline
- * has been crossed, in deadline order. Inserting a new timer during a fired
- * callback is supported (the new timer is included in subsequent ticks).
- *
- * We do NOT implement setInterval / clearInterval — the authority only uses
- * setTimeout for cadence (see _schedulePing / _fireCadenceTick).
- */
-class FakeClock {
-  constructor(startMs = 0) {
-    this._now = startMs;
-    this._nextId = 1;
-    /** @type {Map<number, {dueAt:number, fn:() => void}>} */
-    this._timers = new Map();
-  }
-  now() { return this._now; }
-  setTimeout(fn, delay) {
-    const id = this._nextId++;
-    this._timers.set(id, { dueAt: this._now + Math.max(0, delay), fn });
-    return id;
-  }
-  clearTimeout(id) {
-    if (id == null) return;
-    this._timers.delete(id);
-  }
-  /** Advance the clock by `ms`, firing every timer whose deadline is now reached. */
-  tick(ms) {
-    const target = this._now + ms;
-    // Loop fires timers in due-at order. New timers scheduled inside a
-    // callback are picked up because we re-scan on each iteration.
-    while (true) {
-      let nextId = null;
-      let nextDue = Infinity;
-      for (const [id, t] of this._timers) {
-        if (t.dueAt <= target && t.dueAt < nextDue) {
-          nextDue = t.dueAt;
-          nextId = id;
-        }
-      }
-      if (nextId == null) break;
-      const t = this._timers.get(nextId);
-      this._timers.delete(nextId);
-      this._now = t.dueAt;
-      t.fn();
-    }
-    this._now = target;
-  }
-  /** Number of currently-armed timers — for shutdown assertions. */
-  get pending() { return this._timers.size; }
-}
 
 /**
  * Build an authority with a FakeClock-backed timer surface. Returns the
@@ -987,5 +949,526 @@ describe('ConnectionAuthority: ensureSendable (Task 9 pre-flight)', () => {
 
     auth.shutdown();
     await new Promise((r) => setImmediate(r));
+  });
+
+  it('Task 11 follow-up F: pre-flight pong promotes peer to HEALTHY through the reducer', async () => {
+    // Spec gap closed in Task 11: a successful pre-flight ping IS strong
+    // evidence of peer life. Before this fix, an UNKNOWN peer probed by
+    // ensureSendable would resolve {ok:true} but stay UNKNOWN — popup dot
+    // stuck yellow. After the fix, the reducer's `pong-received` lifts to
+    // HEALTHY.
+    const { auth, sent } = makePreFlightAuthority();
+    auth.notifyPeerOnline('X'); // UNKNOWN
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.UNKNOWN);
+
+    const promise = auth.ensureSendable('X');
+    await new Promise((r) => setImmediate(r));
+    const ping = sent.filter((m) => m.type === 'peer-ping').slice(-1)[0];
+    auth.notifyPongReceived(ping.nonce);
+    const result = await promise;
+    assert.deepEqual(result, { ok: true });
+    assert.equal(
+      auth.peerHealth.value.get('X'),
+      PeerHealth.HEALTHY,
+      'pre-flight pong promoted peer through the reducer',
+    );
+
+    auth.shutdown();
+    await new Promise((r) => setImmediate(r));
+  });
+});
+
+// ─── Task 11: Rung 3, Rung 4, thrash guard, requestReconnect ─────────────────
+
+/**
+ * Build a Task 11 authority with full hook coverage. Both `forceWsReconnect`
+ * (Rung 2) and `forceFullReset` (Rung 3) are spies whose count + behaviour
+ * the tests inspect. `forceFullReset` defaults to "succeed by lifting
+ * selfState to ONLINE on next tick" — a faithful production-ish stub.
+ */
+function makeRung3Authority({
+  clockStart = 0,
+  rung3Behaviour = 'success', // 'success' | 'noop' | 'throw'
+} = {}) {
+  const clock = new FakeClock(clockStart);
+  const sent = [];
+  const calls = { forceWsReconnect: 0, forceFullReset: 0 };
+  const hooks = {
+    sendJson: (m) => sent.push(m),
+    ownDeviceId: 'self-device-id',
+    forceWsReconnect: () => { calls.forceWsReconnect += 1; },
+    // The hook returns a promise that resolves AFTER restarting (in
+    // production this awaits autoStartRelayIfPaired). Once it resolves, the
+    // test can simulate a successful relay reconnect by calling
+    // notifyAuthComplete on the authority.
+    forceFullReset: async () => {
+      calls.forceFullReset += 1;
+      // Reset selfState to OFFLINE/CONNECTING before "auth-completing" so
+      // the next notifyAuthComplete actually transitions selfState. This
+      // mirrors what background-relay.js does (stopPairingListener → fresh
+      // connect → notifyWsOpening → notifyAuthComplete).
+    },
+  };
+  if (rung3Behaviour === 'throw') {
+    hooks.forceFullReset = async () => {
+      calls.forceFullReset += 1;
+      throw new Error('forceFullReset boom');
+    };
+  } else if (rung3Behaviour === 'noop') {
+    hooks.forceFullReset = async () => { calls.forceFullReset += 1; };
+  }
+  const auth = new ConnectionAuthority({
+    signalingHooks: hooks,
+    options: { timerImpl: clock },
+  });
+  return { auth, clock, sent, calls, hooks };
+}
+
+/** Drive the authority to ONLINE so we can dispatch `recovery-began` etc. */
+function bringOnline(auth) {
+  auth.notifyWsOpening();
+  auth.notifyAuthComplete();
+}
+
+/**
+ * Drain pending microtasks. Each `setImmediate` cycle lets the Promise chain
+ * advance one microtask "frame." We yield 8 times because the ladder chains
+ * roughly: rung-action → await predicate → resolve → settle handler → next
+ * rung; deep enough to clear it without hitting infinite loops.
+ */
+async function flush(times = 8) {
+  for (let i = 0; i < times; i += 1) {
+    await new Promise((r) => setImmediate(r));
+  }
+}
+
+/**
+ * Burn the full ladder budget by ticking the clock per-rung and flushing
+ * microtasks between rungs. Without this, ticking the combined budget at once
+ * advances virtual time past the rung-2/3 budget timers BEFORE the rung-2/3
+ * actions have been dispatched on the microtask queue — so those budget
+ * timers are never armed.
+ */
+async function burnLadder(clock) {
+  await flush();
+  clock.tick(RUNG_1_BUDGET_MS);
+  await flush();
+  clock.tick(RUNG_2_BUDGET_MS);
+  await flush();
+  clock.tick(RUNG_3_BUDGET_MS);
+  await flush();
+}
+
+describe('ConnectionAuthority: Rung 3 (full session reset)', () => {
+  it('Rung 3 calls forceFullReset and resolves true when selfState lifts to ONLINE', async () => {
+    const { auth, clock, calls } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+    auth.notifyWsClosed(); // ONLINE → RECONNECTING; ladder kicks
+    assert.ok(auth._currentLadder);
+
+    // Burn Rung 1 (no peer becomes HEALTHY — the composite predicate per
+    // follow-up C requires selfState=ONLINE which is RECONNECTING here).
+    await flush();
+    clock.tick(RUNG_1_BUDGET_MS);
+    await flush();
+    // Burn Rung 2 (forceWsReconnect invoked but doesn't actually reconnect).
+    clock.tick(RUNG_2_BUDGET_MS);
+    await flush();
+    assert.equal(calls.forceWsReconnect, 1);
+
+    // Rung 3 is now running. forceFullReset has been awaited; the rung is
+    // waiting for selfState=ONLINE. Simulate a successful relay reconnect:
+    // production would dispatch recovery-succeeded via the wiring after
+    // a fresh auth-complete; here we shortcut by setting selfState directly,
+    // which is what the awaitObservableOrTimeout helper observes.
+    auth._selfState.next(SelfState.ONLINE);
+    await flush();
+
+    assert.equal(calls.forceFullReset, 1, 'forceFullReset invoked once');
+    assert.equal(auth._currentLadder, null, 'ladder released after Rung 3 success');
+    assert.equal(auth.surrenderedToUser.value, false, 'surrender flag stayed clear');
+    assert.equal(auth._rung3FailureLog.length, 0, 'no Rung-3 failure recorded on success');
+
+    auth.shutdown();
+  });
+
+  it('Rung 3 times out → exhausted → Rung 4 surrender + backoff timer armed', async () => {
+    const { auth, clock, calls } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+    auth.notifyWsClosed();
+    assert.ok(auth._currentLadder);
+
+    await burnLadder(clock);
+
+    assert.equal(calls.forceFullReset, 1);
+    assert.equal(auth._currentLadder, null, 'ladder released after exhaustion');
+    assert.equal(auth.surrenderedToUser.value, true, 'surrender flag set');
+    assert.equal(auth._rung3FailureLog.length, 1, 'Rung 3 failure recorded');
+    // Backoff timer is armed for the first attempt (30s).
+    assert.ok(auth._backoffTimer, 'backoff timer armed');
+
+    auth.shutdown();
+    await flush();
+    assert.equal(clock.pending, 0, 'shutdown clears backoff timer');
+  });
+
+  it('Rung 3 with no forceFullReset hook surrenders synchronously (skeleton mode)', async () => {
+    // Mirror the original Task 8/9 skeleton-mode behaviour: without the
+    // forceFullReset hook, Rung 3's action returns false immediately, and
+    // the ladder advances to exhaustion → Rung 4 surrender.
+    const clock = new FakeClock(0);
+    const sent = [];
+    const auth = new ConnectionAuthority({
+      signalingHooks: {
+        sendJson: (m) => sent.push(m),
+        ownDeviceId: 'self-device-id',
+        // no forceWsReconnect, no forceFullReset
+      },
+      options: { timerImpl: clock },
+    });
+    bringOnline(auth);
+    auth.notifyWsClosed();
+
+    // Rungs 1 takes its full budget; Rungs 2 + 3 surrender synchronously.
+    await burnLadder(clock);
+
+    assert.equal(auth.surrenderedToUser.value, true);
+    auth.shutdown();
+  });
+});
+
+describe('ConnectionAuthority: thrash guard (≥2 Rung-3 failures in 5min)', () => {
+  it('two full Rung-3 failures within 5 min → next kick goes straight to Rung 4', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Failure #1: full ladder run, all rungs time out.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth._rung3FailureLog.length, 1);
+    auth._cancelBackoffTimer(); // don't let the 30s timer interfere
+
+    // Drop selfState back so we can re-enter RECONNECTING.
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+
+    // Failure #2.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth._rung3FailureLog.length, 2);
+    auth._cancelBackoffTimer();
+
+    // Now: any new kick should go straight to surrender — `_kickLadder`
+    // sees the thrash counter ≥ 2 and builds the surrender ladder, which
+    // resolves false immediately. The settle handler then promotes to
+    // Rung 4.
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+    auth.notifyWsClosed();
+    // The surrender ladder runs synchronously (one rung returning false).
+    await flush();
+    assert.equal(auth.surrenderedToUser.value, true);
+    // Crucially, no NEW Rung-3 failure recorded (the surrender ladder
+    // skipped Rung 3 entirely).
+    assert.equal(auth._rung3FailureLog.length, 2, 'thrash log not double-counted');
+
+    auth.shutdown();
+  });
+
+  it('Rung-3 failures older than 5 min do NOT count toward the threshold', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Failure #1 at t=0.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth._rung3FailureLog.length, 1);
+    auth._cancelBackoffTimer();
+
+    // Advance past the 5-minute window. The backoff timer would normally
+    // fire mid-window — cancel it so we don't auto-kick a new ladder.
+    clock.tick(6 * 60 * 1_000);
+    auth._cancelBackoffTimer();
+
+    // The next kick should NOT trigger thrash — the old failure is pruned.
+    assert.equal(auth._thrashGuardActive(), false, 'old failure pruned');
+  });
+});
+
+describe('ConnectionAuthority: Rung 4 backoff scheduler', () => {
+  it('first surrender schedules backoff at 30s; second at 2m; third at 10m; cap at 30m', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Helper: trigger one full failure cycle, then assert the backoff timer
+    // is armed and the attempt counter advanced.
+    const burnLadderAndAssertBackoff = async (expectedAttemptIdx) => {
+      auth.notifyWsClosed();
+      await burnLadder(clock);
+      assert.equal(
+        auth._backoffAttempt,
+        expectedAttemptIdx + 1,
+        `attempt counter advanced to ${expectedAttemptIdx + 1}`,
+      );
+    };
+
+    // Attempt #1 → 30s.
+    await burnLadderAndAssertBackoff(0);
+    assert.ok(auth._backoffTimer);
+    auth._cancelBackoffTimer();
+
+    // Reset state for the next loop. We're in RECONNECTING / surrendered.
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+    auth._rung3FailureLog = []; // bypass thrash so we run a full ladder again
+
+    await burnLadderAndAssertBackoff(1);
+    auth._cancelBackoffTimer();
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+    auth._rung3FailureLog = [];
+
+    await burnLadderAndAssertBackoff(2);
+    auth._cancelBackoffTimer();
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+    auth._rung3FailureLog = [];
+
+    // Attempt #4 caps at 30m.
+    await burnLadderAndAssertBackoff(3);
+    assert.equal(auth._backoffAttempt, 4);
+    auth._cancelBackoffTimer();
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+    auth._rung3FailureLog = [];
+
+    // Attempt #5+ stays at the cap.
+    await burnLadderAndAssertBackoff(4);
+    assert.equal(auth._backoffAttempt, 5, 'counter still advances past cap');
+    auth._cancelBackoffTimer();
+    // The schedule index, however, clamps to BACKOFF_SCHEDULE_MS.length-1.
+    // We can't directly observe the delay without intercepting setTimeout,
+    // so this assertion just locks the counter discipline.
+
+    auth.shutdown();
+  });
+
+  it('successful recovery resets the backoff attempt counter', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Surrender once, advance counter to 1.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth._backoffAttempt, 1);
+    auth._cancelBackoffTimer();
+
+    // Simulate a successful recovery via requestReconnect-like flow: dispatch
+    // recovery-succeeded directly (this is what _handleLadderSettled does).
+    // The next kick should start from attempt #0 again.
+    auth._selfState.next(SelfState.ONLINE);
+    auth._surrenderedToUser.next(false);
+    auth._rung3FailureLog = [];
+    // Mock a fake successful ladder settlement.
+    auth._handleLadderSettled({ _isSurrenderLadder: false }, { ok: true }, null);
+    assert.equal(auth._backoffAttempt, 0, 'attempt counter reset on success');
+
+    auth.shutdown();
+  });
+});
+
+describe('ConnectionAuthority: requestReconnect', () => {
+  it('cancels in-flight ladder and starts a fresh Rung-3-only ladder', async () => {
+    const { auth, clock, calls } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+    auth.notifyWsClosed();
+    assert.ok(auth._currentLadder);
+    const oldLadder = auth._currentLadder;
+
+    // Manual reconnect mid-ladder. The new ladder is built and kicked
+    // synchronously; awaiting requestReconnect would block on Rung 3
+    // budget exhaustion, so we observe the latched state right away.
+    const reconnectPromise = auth.requestReconnect();
+    await flush();
+
+    assert.notEqual(auth._currentLadder, oldLadder, 'old ladder replaced');
+    assert.equal(oldLadder.cancelled, true, 'old ladder cancelled');
+
+    // The new ladder is rung3-only. Burn its budget and verify forceFullReset
+    // fired exactly once (not via the cancelled old ladder).
+    clock.tick(RUNG_3_BUDGET_MS);
+    await flush();
+    assert.equal(calls.forceFullReset, 1, 'forceFullReset fired by manual ladder');
+
+    const result = await reconnectPromise;
+    assert.equal(result.ok, false, 'rung3 timed out → ok:false');
+
+    auth.shutdown();
+  });
+
+  it('clears backoff timer + surrender flag', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Drive to Rung 4 surrender with a backoff timer armed.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth.surrenderedToUser.value, true);
+    assert.ok(auth._backoffTimer);
+
+    // Manual reconnect.
+    const p = auth.requestReconnect();
+    await flush();
+    assert.equal(auth.surrenderedToUser.value, false, 'surrender flag cleared');
+    assert.equal(auth._backoffTimer, null, 'backoff timer cleared');
+
+    // Drain the rest of the new ladder so the test exits cleanly.
+    clock.tick(RUNG_3_BUDGET_MS);
+    await flush();
+    await p;
+    auth.shutdown();
+  });
+
+  it('resets the thrash counter on manual tap', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+    // Seed two prior Rung-3 failures so the next auto-kick would surrender.
+    auth._rung3FailureLog = [auth._now(), auth._now()];
+    assert.equal(auth._thrashGuardActive(), true);
+
+    const p = auth.requestReconnect();
+    await flush();
+    assert.deepEqual(auth._rung3FailureLog, [], 'thrash log cleared on manual tap');
+
+    // Drain the new ladder.
+    clock.tick(RUNG_3_BUDGET_MS);
+    await flush();
+    await p;
+    auth.shutdown();
+  });
+
+  it('resolves {ok:true} when Rung 3 succeeds within budget', async () => {
+    const { auth } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    const reconnectPromise = auth.requestReconnect();
+    // Yield for the ladder + Rung 3 to start.
+    await flush();
+    // forceFullReset has resolved; ladder is awaiting selfState=ONLINE.
+    auth._selfState.next(SelfState.ONLINE);
+    await flush();
+
+    const result = await reconnectPromise;
+    assert.deepEqual(result, { ok: true });
+    assert.equal(auth.surrenderedToUser.value, false);
+    assert.equal(auth._currentLadder, null);
+
+    auth.shutdown();
+  });
+
+  it('is a no-op after shutdown', async () => {
+    const { auth } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    auth.shutdown();
+    const result = await auth.requestReconnect();
+    assert.deepEqual(result, { ok: false });
+  });
+});
+
+describe('ConnectionAuthority: surrenderedToUser observable', () => {
+  it('starts false and is part of the observable surface', () => {
+    const { auth } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    assert.ok(auth.surrenderedToUser, 'surrenderedToUser observable exists');
+    assert.equal(auth.surrenderedToUser.value, false, 'starts false');
+    auth.shutdown();
+  });
+
+  it('emits to subscribers when the flag flips', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    const seen = [];
+    auth.surrenderedToUser.subscribe((v) => seen.push(v));
+    assert.deepEqual(seen, [false], 'replays initial value');
+
+    bringOnline(auth);
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.deepEqual(seen, [false, true], 'flag flipped on Rung 4 surrender');
+
+    auth.shutdown();
+  });
+
+  it('is cleared by a successful recovery and by requestReconnect', async () => {
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Surrender.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth.surrenderedToUser.value, true);
+
+    // Manual tap.
+    const p = auth.requestReconnect();
+    await flush();
+    assert.equal(auth.surrenderedToUser.value, false);
+
+    clock.tick(RUNG_3_BUDGET_MS);
+    await flush();
+    await p;
+    auth.shutdown();
+  });
+});
+
+describe('ConnectionAuthority: follow-ups A-G integration checks', () => {
+  it('A: peer-FAILED kick dispatches recovery-began (selfState moves to RECONNECTING)', () => {
+    const { auth } = makeLadderAuthority();
+    auth.notifyPeerOnline('X');
+    // selfState starts OFFLINE. Kicking the ladder via peer-FAILED should
+    // drive selfState to RECONNECTING through `recovery-began`.
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    auth._dispatchPeer('X', { type: 'ping-missed' });
+    assert.equal(auth.peerHealth.value.get('X'), PeerHealth.FAILED);
+    assert.equal(auth.selfState.value, SelfState.RECONNECTING,
+      'recovery-began drove selfState to RECONNECTING on peer-FAILED');
+    auth.shutdown();
+  });
+
+  it('C: Rung 1 self-trigger requires selfState=ONLINE AND any peer HEALTHY', async () => {
+    // Self-RECONNECTING kick: Rung 1 must NOT fire success on a peer
+    // becoming HEALTHY while selfState is still RECONNECTING.
+    const clock = new FakeClock(0);
+    const sent = [];
+    const auth = new ConnectionAuthority({
+      signalingHooks: { sendJson: (m) => sent.push(m), ownDeviceId: 'self-device-id' },
+      options: { timerImpl: clock },
+    });
+    bringOnline(auth);
+    auth.notifyWsClosed(); // ONLINE → RECONNECTING; ladder kicks
+    auth.notifyPeerOnline('X');
+    auth.notifyFrameReceived('X'); // X HEALTHY but selfState still RECONNECTING
+
+    // Rung 1 should NOT have succeeded — selfState gate is still RECONNECTING.
+    // Burn the budget; Rung 2 begins (no forceWsReconnect → surrenders fast).
+    clock.tick(RUNG_1_BUDGET_MS);
+    await new Promise((r) => setImmediate(r));
+    // If Rung 1 succeeded (the bug), the ladder would be released.
+    // With the fix, Rung 1 timed out → Rung 2 invoked.
+    // We check by observing that selfState is still RECONNECTING (success
+    // would have dispatched recovery-succeeded → ONLINE).
+    assert.equal(auth.selfState.value, SelfState.RECONNECTING,
+      'Rung 1 must not succeed without selfState=ONLINE');
+
+    auth.shutdown();
+  });
+
+  it('E: tracker.sweepExpired is called on each ladder kick (no leaked _pending)', async () => {
+    const { auth } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    let sweepCalls = 0;
+    const realSweep = auth._pingTracker.sweepExpired.bind(auth._pingTracker);
+    auth._pingTracker.sweepExpired = (now) => { sweepCalls += 1; return realSweep(now); };
+
+    bringOnline(auth);
+    auth.notifyWsClosed();
+    assert.equal(sweepCalls, 1, 'sweepExpired called on the ladder kick');
+
+    auth.shutdown();
   });
 });

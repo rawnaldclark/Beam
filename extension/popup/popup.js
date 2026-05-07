@@ -146,6 +146,17 @@ let peerHealthMap = {};
  */
 let selfStateValue = SELF_STATE.ONLINE;
 
+/**
+ * Live `surrenderedToUser` flag from the authority (Task 11). When `true`,
+ * the recovery ladder gave up and the popup banner shows the red "Connection
+ * failed — tap to reconnect" UI instead of the yellow "Reconnecting…" UI.
+ * Cleared by the next successful recovery or by the user tapping the
+ * Reconnect button (which dispatches REQUEST_RECONNECT to the SW).
+ *
+ * @type {boolean}
+ */
+let surrenderedToUserValue = false;
+
 // ---------------------------------------------------------------------------
 // State
 // ---------------------------------------------------------------------------
@@ -483,7 +494,7 @@ async function fetchConnectionStateSnapshot() {
  * Defensive: if `payload.peerHealth` is missing/malformed, treat it as an
  * empty map (everything offline). Same for selfState.
  *
- * @param {{selfState?: string, peerHealth?: Object<string, string>}} payload
+ * @param {{selfState?: string, peerHealth?: Object<string, string>, surrenderedToUser?: boolean}} payload
  */
 function applyConnectionState(payload) {
   if (!payload) return;
@@ -496,6 +507,9 @@ function applyConnectionState(payload) {
 
   peerHealthMap = newPeerHealth;
   selfStateValue = newSelfState;
+  // Task 11: surrender flag drives banner styling. Defensive defaulting —
+  // older SW builds may not include this field; treat absent as `false`.
+  surrenderedToUserValue = payload.surrenderedToUser === true;
 
   // Reconcile each device's isOnline flag against the new peerHealth map.
   // Devices not present in the map keep their existing isOnline value — the
@@ -520,13 +534,20 @@ function applyConnectionState(payload) {
 }
 
 /**
- * Show / hide / update the connection banner based on `selfStateValue`.
+ * Show / hide / update the connection banner based on `selfStateValue` and
+ * `surrenderedToUserValue`.
  *
  * Visible whenever `selfState != ONLINE`. Message text varies:
- *   OFFLINE      -> "Not connected"
- *   CONNECTING   -> "Connecting…"   (no Reconnect button — already trying)
- *   RECONNECTING -> "Reconnecting…" (button still shown so the user can
- *                    bypass the in-flight ladder if it's stuck)
+ *   OFFLINE                            -> "Not connected"
+ *   CONNECTING                         -> "Connecting…"   (no Reconnect button)
+ *   RECONNECTING (surrendered=false)   -> "Reconnecting…" (yellow, button shown)
+ *   RECONNECTING (surrendered=true)    -> "Connection failed — tap to reconnect"
+ *                                         (red, button shown). Per Task 11
+ *                                         spec §"Rung 4 — Surface to user":
+ *                                         no auto-retry text — the user
+ *                                         doesn't need to know we'll try
+ *                                         again in 30s, they need to know
+ *                                         their action is required.
  *
  * The button always sends REQUEST_RECONNECT; the SW handler decides whether
  * to delegate to the authority or fall back to a WS bounce.
@@ -537,6 +558,7 @@ function updateConnectionBanner() {
 
   if (selfStateValue === SELF_STATE.ONLINE) {
     banner.classList.add('hidden');
+    banner.classList.remove('connection-banner-surrendered');
     return;
   }
 
@@ -546,13 +568,19 @@ function updateConnectionBanner() {
   const buttonEl  = document.getElementById('connection-banner-button');
   let messageText;
   let showButton = true;
+  let surrendered = false;
   switch (selfStateValue) {
     case SELF_STATE.CONNECTING:
       messageText = 'Connecting\u2026';
       showButton  = false;
       break;
     case SELF_STATE.RECONNECTING:
-      messageText = 'Reconnecting\u2026';
+      if (surrenderedToUserValue) {
+        messageText = 'Connection failed \u2014 tap to reconnect';
+        surrendered = true;
+      } else {
+        messageText = 'Reconnecting\u2026';
+      }
       break;
     case SELF_STATE.OFFLINE:
     default:
@@ -560,6 +588,10 @@ function updateConnectionBanner() {
   }
   if (messageEl) messageEl.textContent = messageText;
   if (buttonEl)  buttonEl.classList.toggle('hidden', !showButton);
+  // The CSS `.connection-banner-surrendered` class shifts the banner to a
+  // higher-attention red treatment. The base `.connection-banner` style
+  // remains the yellow/amber "we're working on it" look.
+  banner.classList.toggle('connection-banner-surrendered', surrendered);
 }
 
 // ---------------------------------------------------------------------------

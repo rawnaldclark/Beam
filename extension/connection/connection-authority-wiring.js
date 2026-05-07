@@ -12,13 +12,14 @@
  *   - (b) know its own deviceId so peer-ping frames carry the correct
  *         `rendezvousId`,
  *   - (c) trigger a full WS tear-down + reconnect via `forceWsReconnect`
- *         when the recovery ladder's Rung 2 fires (Task 8 declares the
- *         contract; the wiring-layer implementation lands in a follow-up
- *         task — `background-relay.js` will close `pairingWs` and re-enter
- *         `_doConnect`).
- *
- * Task 11 will extend the hook bag further with full-reset triggers for
- * Rung 3.
+ *         when the recovery ladder's Rung 2 fires (`background-relay.js`
+ *         closes `pairingWs` and re-enters `_doConnect`),
+ *   - (d) trigger a complete session reset via `forceFullReset` when the
+ *         ladder's Rung 3 fires — tears down the WS, the v2 transport
+ *         singleton, and any inflight-connect bookkeeping, then re-enters
+ *         the SW boot path. Returns a promise that resolves once the restart
+ *         has been kicked off (NOT when `selfState === ONLINE` — the ladder
+ *         awaits that itself with its own 30s budget).
  */
 
 import { ConnectionAuthority } from './connection-authority.js';
@@ -35,13 +36,15 @@ let _authority = null;
  *   sendJson: (msg: object) => void,
  *   ownDeviceId: string,
  *   forceWsReconnect?: () => void | Promise<void>,
+ *   forceFullReset?: () => Promise<void>,
  *   register?: () => void | Promise<void>,
  * }} hooks
  *   `forceWsReconnect` is optional at the type level: skeleton-mode tests
- *   omit it (Rung 2 surrenders fast in that case), and the wiring-layer
- *   implementation is a follow-up to Task 8. `register` is an optional
- *   alternate to the default `sendJson({type:'register-rendezvous', ...})`
- *   used by Rung 1.
+ *   omit it (Rung 2 surrenders fast in that case). `forceFullReset` is the
+ *   Rung-3 hook for the full session-reset path — when omitted, Rung 3
+ *   surrenders immediately and the ladder advances to Rung 4. `register` is
+ *   an optional alternate to the default
+ *   `sendJson({type:'register-rendezvous', ...})` used by Rung 1.
  * @returns {ConnectionAuthority}
  */
 export function ensureConnectionAuthority(hooks) {
@@ -122,6 +125,12 @@ export function installPopupBroadcaster() {
     const payload = {
       selfState: authority.selfState.value,
       peerHealth: peerHealthObj,
+      // Task 11: surrender flag drives the popup banner's "Connection failed
+      // — tap to reconnect" red variant vs. the yellow "Reconnecting…" mode.
+      // Defensive `?? false` — older builds may run against an authority
+      // without the observable; treating absent as "not surrendered" keeps
+      // the popup safe.
+      surrenderedToUser: authority.surrenderedToUser?.value ?? false,
     };
     try {
       // Promise-returning chrome.runtime.sendMessage in MV3; .catch absorbs
@@ -143,4 +152,9 @@ export function installPopupBroadcaster() {
   // for via GET_CONNECTION_STATE anyway.
   authority.selfState.subscribe(broadcast);
   authority.peerHealth.subscribe(broadcast);
+  // Task 11: re-broadcast on surrender-flag changes so the popup banner
+  // re-styles even when neither selfState nor peerHealth changed.
+  if (authority.surrenderedToUser) {
+    authority.surrenderedToUser.subscribe(broadcast);
+  }
 }

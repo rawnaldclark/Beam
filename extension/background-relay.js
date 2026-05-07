@@ -22,7 +22,7 @@
  * @module background-relay
  */
 
-import { ensureTransport } from './crypto/beam-v2-wiring.js';
+import { ensureTransport, _resetTransportSingleton } from './crypto/beam-v2-wiring.js';
 import {
   ensureConnectionAuthority,
   getConnectionAuthority,
@@ -79,6 +79,29 @@ export function _setRelayUrl(url) {
 
 /** @type {WebSocket|null} Active pairing WebSocket connection. */
 let pairingWs = null;
+
+/**
+ * Caller-injected restart function used by Rung 2/3 of the recovery ladder.
+ * Set by `background.js` at SW boot via {@link setRestartHook}, where it
+ * resolves to `autoStartRelayIfPaired`. We can't import that directly because
+ * `background.js` already imports from this module — the indirection inverts
+ * the dependency without introducing a circular import.
+ *
+ * @type {(() => Promise<void>) | null}
+ */
+let _restartHook = null;
+
+/**
+ * Inject the SW restart function (typically `autoStartRelayIfPaired`). Called
+ * once at SW boot from `background.js` immediately after the import resolves.
+ * Safe to call multiple times — overwrites the previous hook. No-op if `fn`
+ * is not a function (defensive: a typo at the call site shouldn't crash boot).
+ *
+ * @param {() => Promise<void>} fn
+ */
+export function setRestartHook(fn) {
+  if (typeof fn === 'function') _restartHook = fn;
+}
 
 /** @type {string|null} Device ID for the current pairing session. */
 let pairingDeviceId = null;
@@ -240,6 +263,27 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
   const authority = ensureConnectionAuthority({
     sendJson: (msg) => sendPairingMessage(msg),
     ownDeviceId: deviceId,
+    // Rung 2: bounce the WS without dropping the v2 transport. Equivalent to
+    // a soft reset — the relay sees us close + open a new socket, and the
+    // existing transport singleton (with cached cipher state) is reused.
+    forceWsReconnect: async () => {
+      if (typeof _restartHook !== 'function') {
+        console.warn('[Beam SW] forceWsReconnect: no _restartHook installed');
+        return;
+      }
+      stopPairingListener();
+      // Clear the explicit-stop sentinel before restarting (stopPairingListener
+      // sets it to true; without flipping it back, the auto-reconnect guard
+      // in ws.onclose would suppress the new connect).
+      _explicitStop = false;
+      try {
+        await _restartHook();
+      } catch (err) {
+        console.error('[Beam SW] forceWsReconnect: restart failed:', err && err.message);
+      }
+    },
+    // Rung 3: full session reset — see forceFullReset() above.
+    forceFullReset: () => forceFullReset(_restartHook),
   });
   // Task 10: broadcast every selfState / peerHealth change to the popup.
   // Idempotent — the wiring module guards against double-subscription, so
@@ -521,6 +565,69 @@ export function stopPairingListener() {
     pairingWs = null;
   }
   pairingDeviceId = null;
+}
+
+/**
+ * Rung 3 hook: tear down EVERY piece of relay/transport state and re-enter
+ * the boot path from scratch. Implements spec §"Rung 3 — Full session reset"
+ * step-by-step:
+ *
+ *   1. `stopPairingListener()` — close the WS and clear heartbeat / inflight.
+ *   2. Clear the module-level `pairingWs` / `_inflightConnect` /
+ *      `_inflightDeviceId` (stopPairingListener already did the WS close;
+ *       we belt-and-braces null them in case a racing connect re-set them
+ *       between our calls).
+ *   3. `_resetTransportSingleton()` — drop the BeamV2Transport singleton so
+ *      any cached cipher / chunked-send state is forgotten.
+ *   4. Call the caller-supplied `restartFn` (typically `autoStartRelayIfPaired`
+ *      from `background.js`) to begin a fresh `_doConnect` cycle. The
+ *      indirection keeps `background-relay.js` free of a circular import on
+ *      `background.js`.
+ *
+ * The auth-side `await for selfState === ONLINE` budget timer is owned by the
+ * recovery ladder (see `connection-authority.js` `_rung3Action`) — this
+ * function only performs the I/O. We deliberately reset `_explicitStop` after
+ * `stopPairingListener` so the restart path isn't suppressed by the
+ * "user wanted to stop" sentinel that `stopPairingListener` sets.
+ *
+ * @param {() => Promise<void>} restartFn
+ *   Function that re-opens the relay connection. Typically
+ *   `autoStartRelayIfPaired` from `background.js`. Required — Rung 3 without
+ *   a restart hook is a no-op that surrenders to the user immediately.
+ * @returns {Promise<void>} Resolves once `restartFn()` has settled. Does NOT
+ *                          wait for `selfState === ONLINE` — that wait is the
+ *                          ladder's responsibility.
+ */
+export async function forceFullReset(restartFn) {
+  console.log('[Beam SW] forceFullReset: tearing down WS + transport singleton');
+  // Step 1: tear down WS, heartbeat, and inflight tracking. After this,
+  // _explicitStop = true (set by stopPairingListener) — flip it back so the
+  // restart path can run.
+  stopPairingListener();
+  // Step 2: belt-and-braces null in case a racing connect set them between
+  // step 1 and now (defensive — should be no-op after stopPairingListener).
+  pairingWs = null;
+  _inflightConnect = null;
+  _inflightDeviceId = null;
+  // Step 3: drop the v2 transport singleton.
+  _resetTransportSingleton();
+  // Allow the caller's restart path to actually start by clearing the stop
+  // flag stopPairingListener set. Without this, a racing reconnect would be
+  // suppressed by the auto-reconnect guard in the ws.onclose handler.
+  _explicitStop = false;
+  // Step 4: re-enter the SW boot connect path.
+  if (typeof restartFn !== 'function') {
+    console.warn('[Beam SW] forceFullReset: no restartFn supplied — cannot recover');
+    return;
+  }
+  try {
+    await restartFn();
+    console.log('[Beam SW] forceFullReset: restart kicked off');
+  } catch (err) {
+    console.error('[Beam SW] forceFullReset: restart failed:', err && err.message);
+    // Swallow — the ladder's selfState wait will time out if the connect
+    // ultimately failed; we don't want to throw out of the rung action.
+  }
 }
 
 /**

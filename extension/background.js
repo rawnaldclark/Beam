@@ -30,7 +30,7 @@
 
 import { MSG }                  from './shared/message-types.js';
 import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
-import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted } from './background-relay.js';
+import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted, setRestartHook } from './background-relay.js';
 import { beamErrorMessage } from './crypto/beam-errors.js';
 import { getConnectionAuthority } from './connection/connection-authority-wiring.js';
 
@@ -136,6 +136,13 @@ async function autoStartRelayIfPaired() {
   }
 }
 
+// Inject autoStartRelayIfPaired into background-relay so the recovery ladder's
+// Rung 2 (forceWsReconnect) and Rung 3 (forceFullReset) can re-enter the boot
+// path without an SW restart. The dependency direction is inverted via a
+// setter to avoid a circular import (background.js already imports from
+// background-relay.js).
+setRestartHook(autoStartRelayIfPaired);
+
 // ---------------------------------------------------------------------------
 // Alarm handler — keepalive ping
 // ---------------------------------------------------------------------------
@@ -237,7 +244,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         // Authority not yet constructed (e.g. SW just started, no pairing).
         sendResponse({
           ok: true,
-          payload: { selfState: 'OFFLINE', peerHealth: {} },
+          payload: { selfState: 'OFFLINE', peerHealth: {}, surrenderedToUser: false },
         });
         return false;
       }
@@ -250,6 +257,10 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         payload: {
           selfState: auth.selfState.value,
           peerHealth: peerHealthObj,
+          // Task 11: include the surrender flag so the popup can choose
+          // between the "Reconnecting…" and "Connection failed" banner UIs
+          // on its first paint, without waiting for a CONNECTION_STATE_CHANGED.
+          surrenderedToUser: auth.surrenderedToUser?.value ?? false,
         },
       });
       return false;

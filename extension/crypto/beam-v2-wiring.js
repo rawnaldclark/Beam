@@ -79,6 +79,22 @@ export function ensureTransport(args) {
   return _transport;
 }
 
+/**
+ * Drop the cached transport so the next {@link ensureTransport} call constructs
+ * a fresh one. Used by Rung 3 of the recovery ladder (see `background-relay.js`
+ * `forceFullReset`) to clear any in-flight per-transfer state machines / cipher
+ * caches a stale session may have accumulated.
+ *
+ * Discipline: callers MUST also tear down the WebSocket and reissue
+ * `ensureTransport` with fresh hooks afterwards — we reset the singleton, not
+ * the relay's view of us. The transport's chunked-send state for any in-flight
+ * transfers is dropped on the floor (Rung 3 is a "give up and start over"
+ * recovery, not a graceful close).
+ */
+export function _resetTransportSingleton() {
+  _transport = null;
+}
+
 // ---------------------------------------------------------------------------
 // Hooks: peer roster ↔ chrome.storage.local
 // ---------------------------------------------------------------------------
