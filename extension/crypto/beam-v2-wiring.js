@@ -12,6 +12,7 @@
 import { BeamV2Transport } from './beam-v2-transport.js';
 import { pkcs8X25519SkToRaw } from './beam-crypto.js';
 import { getConnectionAuthority } from '../connection/connection-authority-wiring.js';
+import { MSG } from '../shared/message-types.js';
 
 /**
  * Coerce whatever shape the popup stored as `deviceKeys.x25519.sk` into a
@@ -37,6 +38,86 @@ function coerceX25519SkRaw(skBytesOrArray) {
 
 /** @type {BeamV2Transport|null} */
 let _transport = null;
+
+/**
+ * Per-outbound-transfer metadata seeded by the transport's `onSendStart` hook
+ * and consumed by `onProgress` to expand the transport's bare
+ * `(transferIdHex, percent)` event into the popup's full
+ * `MSG.TRANSFER_PROGRESS` and (at 100%) `MSG.TRANSFER_COMPLETE` shapes.
+ *
+ * Keyed by `transferIdHex` (lower-case hex string).
+ *
+ * @type {Map<string, {
+ *   targetDeviceId: string,
+ *   fileName: string,
+ *   totalBytes: number,
+ *   startedAt: number,
+ * }>}
+ */
+const _outboundMeta = new Map();
+
+/**
+ * TEST-ONLY: surface the metadata map for assertion in unit tests. Production
+ * code never reads this directly — callers go through the transport's hooks.
+ *
+ * @returns {Map<string, object>}
+ */
+export function _getOutboundMetaForTest() {
+  return _outboundMeta;
+}
+
+/**
+ * Build the popup-facing TRANSFER_PROGRESS payload from a transferId + percent
+ * pair, looking up the metadata map and computing a rolling speed estimate.
+ *
+ * Returns `null` if no metadata has been seeded for this transferId — the
+ * caller should drop the event in that case (it would have only `transferId`
+ * + `percent`, not enough to render meaningfully).
+ *
+ * @param {string} transferIdHex
+ * @param {number} percent  — 0..100, monotonic per the transport's send loop
+ * @returns {{
+ *   transferId: string, fileName: string,
+ *   bytesTransferred: number, totalBytes: number,
+ *   speedBps: number, targetDeviceId: string,
+ * } | null}
+ */
+function buildProgressPayload(transferIdHex, percent) {
+  const meta = _outboundMeta.get(transferIdHex);
+  if (!meta) return null;
+  const bytesTransferred = Math.round((percent / 100) * meta.totalBytes);
+
+  // Cumulative average since send start. Mirrors the v1 transfer-manager
+  // `_estimateSpeed` shape (bytes/sec) without sharing its module state.
+  const elapsedMs = Date.now() - meta.startedAt;
+  const speedBps  = elapsedMs < 100 ? 0 : Math.round((bytesTransferred / elapsedMs) * 1000);
+
+  return {
+    transferId: transferIdHex,
+    fileName:   meta.fileName,
+    bytesTransferred,
+    totalBytes: meta.totalBytes,
+    speedBps,
+    targetDeviceId: meta.targetDeviceId,
+  };
+}
+
+/**
+ * Push a chrome.runtime message to the popup. Failures are swallowed —
+ * `chrome.runtime.sendMessage` rejects with "Receiving end does not exist"
+ * whenever the popup is closed, which is the common case.
+ *
+ * @param {string} type
+ * @param {object} payload
+ */
+function emitToPopup(type, payload) {
+  try {
+    const p = chrome?.runtime?.sendMessage?.({ type, payload });
+    if (p && typeof p.catch === 'function') p.catch(() => {});
+  } catch {
+    /* popup closed — drop silently */
+  }
+}
 
 /**
  * Lazily construct (or return) the singleton transport. The send hooks
@@ -74,6 +155,54 @@ export function ensureTransport(args) {
         getConnectionAuthority()?.notifyFrameReceived(a.fromDeviceId);
         await args.onFileReceived(a);
       },
+      // ── Outbound progress wiring (Task 10.5) ───────────────────────────
+      // The transport emits `(transferIdHex, percent)` from inside its
+      // chunked send loop. We expand it into the popup's full
+      // `MSG.TRANSFER_PROGRESS` payload using metadata seeded by
+      // `onSendStart` below. Decision: chose Option A from the task plan
+      // (an `onSendStart` transport hook) over Option B (pre-compute the
+      // transferId outside the transport) because Option A is a 5-line
+      // additive change to TransportHooks while Option B would require
+      // inverting the transport's transferId ownership model.
+      onSendStart: (transferIdHex, sendArgs) => {
+        // Only file sends drive a streaming progress UI. Clipboard sends
+        // fire `onSendStart` for symmetry, but their single-frame nature
+        // means there's no per-chunk progress to surface — skip the seed
+        // to avoid leaking entries that nothing will ever clean up.
+        if (sendArgs.kind !== 'file') return;
+        _outboundMeta.set(transferIdHex, {
+          targetDeviceId: sendArgs.targetDeviceId,
+          fileName:       sendArgs.fileName ?? 'file',
+          totalBytes:     sendArgs.fileSize ?? 0,
+          startedAt:      Date.now(),
+        });
+      },
+      onProgress: (transferIdHex, percent) => {
+        const payload = buildProgressPayload(transferIdHex, percent);
+        if (!payload) return; // unseeded id — drop (e.g. tests that bypass onSendStart)
+        emitToPopup(MSG.TRANSFER_PROGRESS, payload);
+        // Final tick (`percent === 100` on the final iteration of the send
+        // loop) is the cleanup signal AND the success-state trigger for the
+        // popup's device-row UI. The popup's MSG.TRANSFER_COMPLETE handler
+        // (popup.js) destructures `{ transferId, fileName, fileSize,
+        // targetDeviceId }` — match that shape exactly. v1's transfer-
+        // manager emits the same on its happy path; this brings v2 to parity.
+        if (percent >= 100) {
+          const meta = _outboundMeta.get(transferIdHex);
+          if (meta) {
+            emitToPopup(MSG.TRANSFER_COMPLETE, {
+              transferId:     transferIdHex,
+              fileName:       meta.fileName,
+              fileSize:       meta.totalBytes,
+              targetDeviceId: meta.targetDeviceId,
+            });
+          }
+          _outboundMeta.delete(transferIdHex);
+        }
+      },
+      onSendError: (transferIdHex, _code) => {
+        _outboundMeta.delete(transferIdHex);
+      },
     },
   });
   return _transport;
@@ -93,6 +222,10 @@ export function ensureTransport(args) {
  */
 export function _resetTransportSingleton() {
   _transport = null;
+  // Drop the per-transfer metadata seeded by `onSendStart`. Any progress
+  // events that arrive after a Rung-3 reset would target a stale targetDeviceId
+  // anyway (the recovery ladder is post-failure cleanup).
+  _outboundMeta.clear();
 }
 
 // ---------------------------------------------------------------------------

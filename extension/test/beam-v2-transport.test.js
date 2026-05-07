@@ -240,3 +240,63 @@ describe('BeamV2Transport — resend', () => {
     assert.deepEqual(captured.bReceivedFile[0].bytes, bytes);
   });
 });
+
+describe('BeamV2Transport — send-path errors invoke onSendError', () => {
+  // Without these, an adapter that seeds per-transfer state in `onSendStart`
+  // (e.g. the popup-progress wiring's metadata map) leaks the entry on a
+  // mid-send WS drop because the throw propagates up but never surfaces
+  // via the onSendError contract the adapter relies on.
+
+  it('sendFile: NO_TRANSPORT (sendBinary returns false) fires onSendError with the throw code', async () => {
+    const { a, b } = await makePairedFixture();
+    const errors = [];
+    const transport = new BeamV2Transport({
+      sendBinary: () => false,                        // simulate WS dropped
+      sendJson:   () => {},
+      hooks: {
+        async getPeer(_id)      { return a.peer; },
+        async listPeers()       { return [a.peer]; },
+        async storeKABRing()    { /* no-op */ },
+        async onClipboardReceived() {},
+        async onFileReceived()      {},
+        onSendError: (id, code) => errors.push({ id, code }),
+      },
+    });
+
+    const bytes = new Uint8Array(8); // single tiny chunk
+    await assert.rejects(
+      transport.sendFile(b.deviceId, {
+        fileName: 'doomed.bin', fileSize: 8, mimeType: 'application/octet-stream', bytes,
+      }),
+      (err) => err && err.code === 'NO_TRANSPORT',
+    );
+
+    assert.equal(errors.length, 1, 'onSendError fires exactly once on send-path throw');
+    assert.equal(errors[0].code, 'NO_TRANSPORT', 'error code propagates from the throw');
+  });
+
+  it('sendClipboard: NO_TRANSPORT also fires onSendError so adapter state is released', async () => {
+    const { a, b } = await makePairedFixture();
+    const errors = [];
+    const transport = new BeamV2Transport({
+      sendBinary: () => false,
+      sendJson:   () => {},
+      hooks: {
+        async getPeer(_id)      { return a.peer; },
+        async listPeers()       { return [a.peer]; },
+        async storeKABRing()    { /* no-op */ },
+        async onClipboardReceived() {},
+        async onFileReceived()      {},
+        onSendError: (id, code) => errors.push({ id, code }),
+      },
+    });
+
+    await assert.rejects(
+      transport.sendClipboard(b.deviceId, 'lost in transit'),
+      (err) => err && err.code === 'NO_TRANSPORT',
+    );
+
+    assert.equal(errors.length, 1);
+    assert.equal(errors[0].code, 'NO_TRANSPORT');
+  });
+});

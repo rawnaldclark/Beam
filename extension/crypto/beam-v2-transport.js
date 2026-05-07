@@ -75,6 +75,16 @@ function toHex(bytes) {
  */
 
 /**
+ * @typedef {object} SendStartArgs
+ * @property {'clipboard'|'file'} kind
+ * @property {string} targetDeviceId
+ * @property {string} [fileName]    — file kind only
+ * @property {number} [fileSize]    — file kind only; clipboards report payload byte length
+ * @property {string} [mimeType]    — file kind only
+ * @property {number} [totalChunks] — file kind only (excludes the meta frame)
+ */
+
+/**
  * @typedef {object} TransportHooks
  * @property {(deviceId: string) => Promise<PairedPeer|null>} getPeer
  * @property {() => Promise<PairedPeer[]>} listPeers
@@ -84,6 +94,12 @@ function toHex(bytes) {
  * @property {(transferIdHex: string, code: string) => void} [onSendError]
  * @property {(transferIdHex: string, code: string) => void} [onReceiveError]
  * @property {(transferIdHex: string, percent: number) => void} [onProgress]
+ * @property {(transferIdHex: string, args: SendStartArgs) => void} [onSendStart]
+ *   Fired once per outbound transfer immediately after the transferId is
+ *   assigned and before any frames are sent. Lets adapters seed
+ *   per-transfer metadata (e.g. fileName / targetDeviceId) so the later
+ *   `onProgress(transferIdHex, percent)` callbacks can be expanded into
+ *   richer progress events. Optional — transport works without it.
  */
 
 export class BeamV2Transport {
@@ -133,33 +149,51 @@ export class BeamV2Transport {
     // Plaintext = u16BE(metaLen) || meta JSON || textBytes
     const meta = new TextEncoder().encode(JSON.stringify({ kind: 'clipboard', v: 2 }));
     const text_b = new TextEncoder().encode(text);
-    const plaintext = new Uint8Array(2 + meta.byteLength + text_b.byteLength);
-    new DataView(plaintext.buffer).setUint16(0, meta.byteLength, false);
-    plaintext.set(meta, 2);
-    plaintext.set(text_b, 2 + meta.byteLength);
 
-    const outbox = this._registerOutbox({
-      transferIdHex, targetDeviceId, generation,
-      framesByIndex: new Map([[0, { plaintext, isFinal: true, hasMeta: true }]]),
-    });
-
-    // Bind the transferId on the relay BEFORE the first binary frame so
-    // the server pre-populates the peer's WS via rendezvous lookup. The
-    // receiver never needs to bind (it learns transferId only by
-    // decrypting the frame, which would arrive after the relay's drop).
-    this._sendJson({
-      type: 'relay-bind',
-      transferId: b64urlFromBytes(transferId),
+    // Notify adapters even though clipboard does not stream progress — keeps
+    // the start signal symmetric across send kinds, so later wiring (e.g.
+    // TRANSFER_COMPLETE emission) has a single observation point.
+    this._hooks.onSendStart?.(transferIdHex, {
+      kind: 'clipboard',
       targetDeviceId,
-      rendezvousId: targetDeviceId,
+      fileSize: text_b.byteLength,
     });
+    // After onSendStart fires, every throw on the send path must surface via
+    // onSendError so adapters can release the per-transfer state they seeded.
+    // Without this, a `NO_TRANSPORT` from `_sendOutboxFrame` (WS dropped
+    // mid-send) leaves the wiring layer holding metadata until SW eviction.
+    try {
+      const plaintext = new Uint8Array(2 + meta.byteLength + text_b.byteLength);
+      new DataView(plaintext.buffer).setUint16(0, meta.byteLength, false);
+      plaintext.set(meta, 2);
+      plaintext.set(text_b, 2 + meta.byteLength);
 
-    await this._sendOutboxFrame(outbox, transferId, 0, kAB);
-    console.log('[BeamV2T] sendClipboard: completed id=', transferIdHex);
-    // Single-frame transfer — completion is implicit. Caller does not await
-    // an ack; receiver-side decrypt is the sole authority.
-    this._scheduleSenderGiveup(transferIdHex);
-    return { transferIdHex };
+      const outbox = this._registerOutbox({
+        transferIdHex, targetDeviceId, generation,
+        framesByIndex: new Map([[0, { plaintext, isFinal: true, hasMeta: true }]]),
+      });
+
+      // Bind the transferId on the relay BEFORE the first binary frame so
+      // the server pre-populates the peer's WS via rendezvous lookup. The
+      // receiver never needs to bind (it learns transferId only by
+      // decrypting the frame, which would arrive after the relay's drop).
+      this._sendJson({
+        type: 'relay-bind',
+        transferId: b64urlFromBytes(transferId),
+        targetDeviceId,
+        rendezvousId: targetDeviceId,
+      });
+
+      await this._sendOutboxFrame(outbox, transferId, 0, kAB);
+      console.log('[BeamV2T] sendClipboard: completed id=', transferIdHex);
+      // Single-frame transfer — completion is implicit. Caller does not await
+      // an ack; receiver-side decrypt is the sole authority.
+      this._scheduleSenderGiveup(transferIdHex);
+      return { transferIdHex };
+    } catch (err) {
+      this._hooks.onSendError?.(transferIdHex, err?.code || 'SEND_THROW');
+      throw err;
+    }
   }
 
   // -----------------------------------------------------------------------
@@ -200,53 +234,74 @@ export class BeamV2Transport {
     const transferId    = newTransferId();
     const transferIdHex = toHex(transferId);
 
-    // Frame 0 plaintext: u16BE(metaLen) || meta JSON.
-    const meta = new TextEncoder().encode(JSON.stringify({
-      kind: 'file', v: 2, fileName, fileSize, mime: mimeType, totalChunks,
-    }));
-    const metaPlain = new Uint8Array(2 + meta.byteLength);
-    new DataView(metaPlain.buffer).setUint16(0, meta.byteLength, false);
-    metaPlain.set(meta, 2);
-
-    const framesByIndex = new Map();
-    framesByIndex.set(0, { plaintext: metaPlain, isFinal: false, hasMeta: true });
-    for (let i = 0; i < totalChunks; i += 1) {
-      const start = i * FILE_CHUNK_SIZE;
-      const end   = Math.min(start + FILE_CHUNK_SIZE, fileSize);
-      framesByIndex.set(i + 1, {
-        plaintext: bytes.subarray(start, end),
-        isFinal: i === totalChunks - 1,
-        hasMeta: false,
-      });
-    }
-
-    const outbox = this._registerOutbox({
-      transferIdHex, targetDeviceId, generation, framesByIndex,
-    });
-
-    // One-shot relay-bind ahead of the first binary frame. See sendClipboard
-    // for the rationale.
-    this._sendJson({
-      type: 'relay-bind',
-      transferId: b64urlFromBytes(transferId),
+    // Notify adapters BEFORE the chunked send loop so any per-transfer
+    // metadata (fileName / targetDeviceId / etc.) is seeded by the time the
+    // first onProgress(...) callback fires inside the loop below.
+    this._hooks.onSendStart?.(transferIdHex, {
+      kind: 'file',
       targetDeviceId,
-      rendezvousId: targetDeviceId,
+      fileName,
+      fileSize,
+      mimeType,
+      totalChunks,
     });
+    // After onSendStart fires, every throw on the send path must surface via
+    // onSendError. The chunked loop calls _sendOutboxFrame which throws
+    // NO_TRANSPORT when sendBinary returns false (WS dropped mid-send), and
+    // without this catch the wiring layer's _outboundMeta entry would leak
+    // until the SW is evicted.
+    try {
+      // Frame 0 plaintext: u16BE(metaLen) || meta JSON.
+      const meta = new TextEncoder().encode(JSON.stringify({
+        kind: 'file', v: 2, fileName, fileSize, mime: mimeType, totalChunks,
+      }));
+      const metaPlain = new Uint8Array(2 + meta.byteLength);
+      new DataView(metaPlain.buffer).setUint16(0, meta.byteLength, false);
+      metaPlain.set(meta, 2);
 
-    // Send all frames with 20ms spacing (relay-friendly).
-    for (let idx = 0; idx <= totalChunks; idx += 1) {
-      // eslint-disable-next-line no-await-in-loop
-      await this._sendOutboxFrame(outbox, transferId, idx, kAB);
-      if (idx < totalChunks) {
-        // eslint-disable-next-line no-await-in-loop
-        await sleep(20);
+      const framesByIndex = new Map();
+      framesByIndex.set(0, { plaintext: metaPlain, isFinal: false, hasMeta: true });
+      for (let i = 0; i < totalChunks; i += 1) {
+        const start = i * FILE_CHUNK_SIZE;
+        const end   = Math.min(start + FILE_CHUNK_SIZE, fileSize);
+        framesByIndex.set(i + 1, {
+          plaintext: bytes.subarray(start, end),
+          isFinal: i === totalChunks - 1,
+          hasMeta: false,
+        });
       }
-      this._hooks.onProgress?.(transferIdHex, Math.round(((idx + 1) / (totalChunks + 1)) * 100));
-    }
 
-    console.log('[BeamV2T] sendFile: completed id=', transferIdHex, 'frames=', totalChunks + 1);
-    this._scheduleSenderGiveup(transferIdHex);
-    return { transferIdHex, totalChunks };
+      const outbox = this._registerOutbox({
+        transferIdHex, targetDeviceId, generation, framesByIndex,
+      });
+
+      // One-shot relay-bind ahead of the first binary frame. See sendClipboard
+      // for the rationale.
+      this._sendJson({
+        type: 'relay-bind',
+        transferId: b64urlFromBytes(transferId),
+        targetDeviceId,
+        rendezvousId: targetDeviceId,
+      });
+
+      // Send all frames with 20ms spacing (relay-friendly).
+      for (let idx = 0; idx <= totalChunks; idx += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await this._sendOutboxFrame(outbox, transferId, idx, kAB);
+        if (idx < totalChunks) {
+          // eslint-disable-next-line no-await-in-loop
+          await sleep(20);
+        }
+        this._hooks.onProgress?.(transferIdHex, Math.round(((idx + 1) / (totalChunks + 1)) * 100));
+      }
+
+      console.log('[BeamV2T] sendFile: completed id=', transferIdHex, 'frames=', totalChunks + 1);
+      this._scheduleSenderGiveup(transferIdHex);
+      return { transferIdHex, totalChunks };
+    } catch (err) {
+      this._hooks.onSendError?.(transferIdHex, err?.code || 'SEND_THROW');
+      throw err;
+    }
   }
 
   /**

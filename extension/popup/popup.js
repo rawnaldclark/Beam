@@ -1778,12 +1778,6 @@ async function sendFile(file) {
   }
   base64 = btoa(base64);
 
-  // Phase 2c: start mock progress animation on the device row while the real
-  // transfer is dispatched. If the SW sends TRANSFER_PROGRESS with a
-  // targetDeviceId, the mock will be overridden by real data. If not, the
-  // mock provides a smooth 0->100% animation as a visual placeholder.
-  startMockTransferProgress(targetId, file.name, file.size);
-
   chrome.runtime.sendMessage({
     type: 'SEND_FILE',
     payload: {
@@ -2300,59 +2294,6 @@ function retryTransfer(deviceId) {
   selectedDeviceId = deviceId;
   updateSelection(deviceId);
   el('file-input').click();
-}
-
-// ---------------------------------------------------------------------------
-// Phase 2c — Mock transfer progress (for testing without real SW data)
-// ---------------------------------------------------------------------------
-
-/**
- * Start a mock 3-second transfer animation on the given device.
- * Used when the real transfer data flow doesn't include targetDeviceId
- * or when testing the UI without a connected relay.
- *
- * @param {string} deviceId
- * @param {string} fileName
- * @param {number} fileSize
- */
-function startMockTransferProgress(deviceId, fileName, fileSize) {
-  const transferId = 'mock-' + Date.now();
-  const duration   = 3000; // 3 seconds
-  const startTime  = Date.now();
-
-  activeTransfersByDevice.set(deviceId, {
-    percent: 0,
-    fileName,
-    bytesTransferred: 0,
-    bytesTotal: fileSize,
-    direction: 'out',
-    transferId,
-    state: 'progress',
-    targetDeviceId: deviceId,
-  });
-
-  renderDeviceRowsOnly();
-
-  const interval = setInterval(() => {
-    const elapsed = Date.now() - startTime;
-    const pct     = Math.min(100, Math.round((elapsed / duration) * 100));
-    const bytes   = Math.round((pct / 100) * fileSize);
-
-    const entry = activeTransfersByDevice.get(deviceId);
-    if (!entry || entry.transferId !== transferId) {
-      clearInterval(interval);
-      return;
-    }
-
-    entry.percent = pct;
-    entry.bytesTransferred = bytes;
-    renderDeviceRowsOnly();
-
-    if (pct >= 100) {
-      clearInterval(interval);
-      handleTransferSuccess(deviceId, transferId, fileName, fileSize);
-    }
-  }, 50);
 }
 
 // ---------------------------------------------------------------------------
