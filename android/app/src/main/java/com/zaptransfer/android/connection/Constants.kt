@@ -59,3 +59,32 @@ const val PING_TIMEOUT_MS: Long = 10_000L
  */
 @Suppress("unused") // Defined now for cross-platform parity; Task 18 wires the consumer.
 const val RECENT_TRAFFIC_WINDOW_MS: Long = 30_000L
+
+/**
+ * Recovery ladder Rung 1 budget, in milliseconds.
+ *
+ * Rung 1 ("re-register rendezvous") dispatches a `register-rendezvous` frame
+ * over the existing WebSocket and waits up to this budget for the peer to
+ * become healthy again (peer-trigger) or for self+any-peer to become healthy
+ * (self-trigger). 5s is short enough that a clean `peer-failed` -> `frame-
+ * received` round-trip via the relay completes well before timeout, and
+ * short enough that an unrecoverable peer doesn't delay Rung 2's WS rebuild.
+ *
+ * Mirrors `RUNG_1_BUDGET_MS` in `extension/connection/constants.js`.
+ */
+const val RUNG_1_BUDGET_MS: Long = 5_000L
+
+/**
+ * Recovery ladder Rung 2 budget, in milliseconds.
+ *
+ * Rung 2 ("WebSocket reconnect") tears down the WS via
+ * [com.zaptransfer.android.webrtc.SignalingClient.disconnect] +
+ * [com.zaptransfer.android.webrtc.SignalingClient.connect] and waits up to
+ * this budget for self to return to ONLINE AND any paired peer to become
+ * HEALTHY. 15s is the spec budget — long enough to absorb a typical OS-
+ * level network handover (wifi <-> mobile) plus the relay's auth round-trip,
+ * short enough that an unrecoverable transport doesn't delay surrender.
+ *
+ * Mirrors `RUNG_2_BUDGET_MS` in `extension/connection/constants.js`.
+ */
+const val RUNG_2_BUDGET_MS: Long = 15_000L

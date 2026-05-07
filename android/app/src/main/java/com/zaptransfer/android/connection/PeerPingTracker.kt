@@ -127,7 +127,14 @@ data class PeerPingMessage(
 class PeerPingTracker(
     private val sendMessage: (PeerPingMessage) -> Unit,
     private val timeoutMs: Long,
-    private val ownDeviceId: String,
+    /**
+     * This client's own device ID. Exposed (read-only) so the recovery
+     * ladder's Rung 1 action can populate the `rendezvousId` field on the
+     * register-rendezvous frame without re-deriving it from [KeyManager].
+     * Production callers obtain this via the construction path; tests pass
+     * a literal.
+     */
+    val ownDeviceId: String,
     private val random: SecureRandom = SecureRandom(),
 ) {
 

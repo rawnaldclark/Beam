@@ -18,7 +18,10 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -174,6 +177,31 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * Cleared on pong arrival, on cadence stop, and on shutdown.
      */
     private val nonceToPeer = mutableMapOf<String, String>()
+
+    /**
+     * Recovery ladder owns "I'm trying to recover" sequencing. Non-null
+     * while a ladder is in flight; reset to null in [handleLadderSettled].
+     *
+     * Reads/writes happen on [scope]'s single-thread confinement, so no
+     * additional synchronization is needed. Tests probe this field via
+     * [VisibleForTesting] to verify single-flight discipline (concurrent
+     * peer-FAILED transitions must share the in-flight ladder).
+     */
+    @VisibleForTesting
+    internal var currentLadder: RecoveryLadder? = null
+        private set
+
+    /**
+     * Track of whether the authority is in "shutting down" state. Set in
+     * [shutdown] before scope cancellation so any post-cancel observable
+     * collector that races the teardown can short-circuit cleanly. Without
+     * this guard, a peer-FAILED event landing on the worker thread the
+     * exact tick before [scope] cancels would attempt to kick a new ladder
+     * after teardown — harmless in isolation, but the leaked
+     * [RecoveryLadder] would never settle.
+     */
+    @Volatile
+    private var shuttingDown: Boolean = false
 
     /**
      * Per-peer cadence record. `pingJob` is the scheduled "next ping fires"
@@ -476,7 +504,19 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * updates will occur.
      */
     fun shutdown() {
+        // Set the shutting-down latch BEFORE cancelling anything: the ladder
+        // settle handler reads it on the worker thread to decide whether to
+        // dispatch RecoverySucceeded etc. on the way out. Without the latch,
+        // a Cancelled-result settle racing the scope cancellation could
+        // re-enter dispatchSelf on a half-torn-down state machine.
+        shuttingDown = true
         signalingClient.removeListener(relayListener)
+        // Cancel any in-flight ladder so its budget timers / Flow.first
+        // subscriptions release. The ladder's run() resolves with a
+        // Cancelled outcome which the settle handler ignores once shutting-
+        // Down is true.
+        currentLadder?.cancel()
+        currentLadder = null
         // Cancel cadence jobs explicitly before tearing down the scope.
         // scope.cancel() would cancel them too, but doing it here keeps the
         // bookkeeping consistent for the tests that introspect peerCadence
@@ -488,6 +528,236 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         peerCadence.clear()
         nonceToPeer.clear()
         scope.cancel()
+    }
+
+    // ── Recovery ladder (Task 17) ─────────────────────────────────────────
+    //
+    // Mirror of `extension/connection/connection-authority.js` _kickLadder /
+    // _buildLadder / _rung1Action / _rung2Action / _handleLadderSettled
+    // (commit `dd87ae2`). Tasks 11+ (Rungs 3+4, thrash guard, backoff) are
+    // intentionally NOT yet wired; the ladder is a two-rung
+    // (re-register + WS reconnect) sequence here. Exhaustion clears
+    // `currentLadder` without dispatching `RecoveryGivenUp` — Rung 4
+    // surrender lands in the follow-up task.
+
+    /**
+     * Start the recovery ladder if none is currently running. Idempotent:
+     * concurrent failures (multiple peers FAILED in the same tick, or a
+     * `selfState = RECONNECTING` cross while a peer-FAILED ladder is in
+     * flight) are absorbed into the existing ladder rather than starting
+     * a second.
+     *
+     * Resets [currentLadder] = null once the ladder resolves (success,
+     * exhaustion, or cancellation) so the next failure starts from Rung 1
+     * again — matching the spec's discipline rule "A rung that succeeds
+     * resets the ladder to idle."
+     *
+     * MUST be called on [scope] (it is — the dispatchSelf / dispatchPeer
+     * post-hooks both run on the worker thread).
+     *
+     * @param triggerPeerId The peer that crossed into [PeerHealth.Failed],
+     *        or `null` for self-RECONNECTING / shutdown / pre-flight kicks.
+     * @param reason Short tag for the kick log line; one of
+     *        `peer-failed`, `self-reconnecting`.
+     */
+    private fun kickLadder(triggerPeerId: String?, reason: String) {
+        if (shuttingDown) return
+        if (currentLadder != null) return // ladder owns the floor
+
+        val ladder = buildLadder(triggerPeerId)
+        // CRITICAL ordering (mirrors Chrome): latch `currentLadder` BEFORE
+        // dispatching `RecoveryBegan`. The selfState reducer's RECONNECTING
+        // post-hook in [dispatchSelf] re-enters [kickLadder]; latching first
+        // makes the re-entry hit the "ladder owns the floor" guard cleanly
+        // so we never run two concurrent ladders.
+        currentLadder = ladder
+
+        // Dispatch RecoveryBegan so the popup banner shows "Reconnecting"
+        // immediately on a peer-FAILED kick, not just on a self-RECONNECTING
+        // ws-closed transition. Per follow-up A on Chrome's Task 11 review.
+        dispatchSelf(SelfStateEvent.RecoveryBegan)
+
+        Log.i(
+            TAG,
+            "[CA] ladder: kicked reason=$reason triggerPeer=${triggerPeerId ?: "none"}",
+        )
+
+        scope.launch {
+            val result = ladder.run()
+            // After the ladder settles, if shutdown raced us, the assignment
+            // here is harmless (currentLadder is already null) — the guard
+            // in handleLadderSettled prevents post-shutdown dispatches.
+            if (currentLadder === ladder) currentLadder = null
+            handleLadderSettled(result, triggerPeerId)
+        }
+    }
+
+    /**
+     * Build the two-rung ladder for the given trigger.
+     *
+     * Tasks 11+ (Rungs 3+4 + thrash + backoff) extend this — for Task 17 we
+     * have the re-register-rendezvous and WS-reconnect rungs only. Rung
+     * actions close over `this` so they can read the live state and emit
+     * via [signalingClient].
+     *
+     * @param triggerPeerId The peer that crossed into [PeerHealth.Failed],
+     *        or `null` for self-RECONNECTING.
+     */
+    private fun buildLadder(triggerPeerId: String?): RecoveryLadder = RecoveryLadder(
+        rungs = listOf(
+            RecoveryRung(
+                name = "rung1",
+                budgetMs = RUNG_1_BUDGET_MS,
+                action = { rungScope -> rung1Action(triggerPeerId, rungScope) },
+            ),
+            RecoveryRung(
+                name = "rung2",
+                budgetMs = RUNG_2_BUDGET_MS,
+                action = { rungScope -> rung2Action(rungScope) },
+            ),
+        ),
+    )
+
+    /**
+     * Rung 1 — re-register-rendezvous + wait for success indicator.
+     *
+     * Action: dispatch a `register-rendezvous` JSON frame over the existing
+     * [signalingClient] (relay may have GC'd our session). Success indicator:
+     *
+     *  - Peer-trigger (`triggerPeerId != null`): the failed peer becomes
+     *    [PeerHealth.Healthy] within [RUNG_1_BUDGET_MS].
+     *  - Self-trigger (`triggerPeerId == null`): [selfState] is
+     *    [SelfState.Online] AND any peer in [peerHealth] is
+     *    [PeerHealth.Healthy] within [RUNG_1_BUDGET_MS]. Per Chrome Task 8
+     *    follow-up C: a Rung 1 fired by self-RECONNECTING really should
+     *    require self-online, not just "some peer eventually became
+     *    HEALTHY" — the latter could read as a success while we're still
+     *    stuck CONNECTING.
+     *
+     * A throwing [signalingClient.send] (e.g. WS already closed) is caught
+     * and swallowed: the action falls through to the success-criterion
+     * await, which will time out cleanly and advance to Rung 2.
+     *
+     * @param triggerPeerId The peer that crossed into FAILED, or `null`.
+     * @param rungScope The rung's cancellation scope. The
+     *        [withTimeoutOrNull] / Flow.first pattern observes its
+     *        cancellation cooperatively; an external [RecoveryLadder.cancel]
+     *        propagates here as a [kotlinx.coroutines.CancellationException]
+     *        out of the suspending wait.
+     */
+    private suspend fun rung1Action(
+        triggerPeerId: String?,
+        @Suppress("UNUSED_PARAMETER") rungScope: kotlinx.coroutines.CoroutineScope,
+    ): Boolean {
+        // Best-effort dispatch. A throwing send shouldn't crash the ladder
+        // — it just means Rung 1 cannot recover and we'll time out and
+        // advance to Rung 2.
+        try {
+            val frame = JSONObject().apply {
+                put("type", "register-rendezvous")
+                // Match the JS shape: a single rendezvousId field carrying
+                // own deviceId. The relay accepts both this and the array
+                // form used by [SignalingClient.registerRendezvous] for
+                // multi-rendezvous scenarios.
+                pingTracker?.let { put("rendezvousId", it.ownDeviceId) }
+            }
+            signalingClient.send(frame)
+        } catch (e: Exception) {
+            // Swallow — see KDoc.
+            Log.d(TAG, "rung1Action: send register-rendezvous failed", e)
+        }
+
+        return withTimeoutOrNull(RUNG_1_BUDGET_MS) {
+            if (triggerPeerId != null) {
+                _peerHealth.first { map -> map[triggerPeerId] === PeerHealth.Healthy }
+            } else {
+                combine(_selfState, _peerHealth) { s, m ->
+                    s === SelfState.Online && m.values.any { it === PeerHealth.Healthy }
+                }.first { it }
+            }
+            true
+        } ?: false
+    }
+
+    /**
+     * Rung 2 — tear down the WebSocket and reopen it.
+     *
+     * Action: call [signalingClient.disconnect] then [signalingClient.connect]
+     * — the production [com.zaptransfer.android.webrtc.SignalingClient]
+     * idempotently reopens via its existing reconnect loop, and the auth-
+     * complete handler auto-replays the most recent register-rendezvous so
+     * the relay's presence module rebinds without a separate dispatch.
+     *
+     * Success indicator (same composite predicate as Rung 1's self-trigger):
+     * [selfState] is [SelfState.Online] AND any paired peer is
+     * [PeerHealth.Healthy] within [RUNG_2_BUDGET_MS].
+     *
+     * A throwing disconnect/connect pair is caught and swallowed — the
+     * success-criterion wait still gets the budget to observe success-by-
+     * other-path before surrendering.
+     *
+     * @param rungScope The rung's cancellation scope (consumed by
+     *        [withTimeoutOrNull] cooperatively via the suspending Flow ops).
+     */
+    private suspend fun rung2Action(
+        @Suppress("UNUSED_PARAMETER") rungScope: kotlinx.coroutines.CoroutineScope,
+    ): Boolean {
+        try {
+            signalingClient.disconnect()
+            signalingClient.connect()
+        } catch (e: Exception) {
+            Log.d(TAG, "rung2Action: disconnect/connect cycle failed", e)
+        }
+
+        return withTimeoutOrNull(RUNG_2_BUDGET_MS) {
+            combine(_selfState, _peerHealth) { s, m ->
+                s === SelfState.Online && m.values.any { it === PeerHealth.Healthy }
+            }.first { it }
+            true
+        } ?: false
+    }
+
+    /**
+     * Common settlement handler. Called from [kickLadder]'s `scope.launch`
+     * once the ladder resolves.
+     *
+     * Mirrors `_handleLadderSettled` in
+     * `extension/connection/connection-authority.js` (commit `dd87ae2`),
+     * **minus the Rung 4 surrender path**: Task 17 does not yet dispatch
+     * [SelfStateEvent.RecoveryGivenUp] on exhaustion. The reducer already
+     * supports it but no caller fires it until the surrender follow-up
+     * task lands. On exhaustion we just clear [currentLadder] — selfState
+     * stays [SelfState.Reconnecting]`(false)`.
+     *
+     * @param result The ladder's outcome.
+     * @param triggerPeerId The peer that triggered the kick (for lifting
+     *        FAILED → UNKNOWN on success), or `null` if self-triggered.
+     */
+    private fun handleLadderSettled(result: LadderResult, triggerPeerId: String?) {
+        if (shuttingDown) return
+        when (result) {
+            is LadderResult.Success -> {
+                // Lift selfState (RECONNECTING -> ONLINE) and the trigger
+                // peer (FAILED -> UNKNOWN). The reducers are no-ops if we
+                // are already there. dispatchSelf re-enters via the post-
+                // hook only on RECONNECTING transitions — RecoverySucceeded
+                // moves us OUT of RECONNECTING, so no re-entry.
+                dispatchSelf(SelfStateEvent.RecoverySucceeded)
+                if (triggerPeerId != null) {
+                    dispatchPeer(triggerPeerId, PeerHealthEvent.RecoverySucceeded)
+                }
+            }
+            is LadderResult.Cancelled -> {
+                // Cancelled by `requestReconnect` mid-ladder (Task 11) or by
+                // [shutdown]. The canceller already owns the recovery state
+                // machine from here — do nothing.
+            }
+            is LadderResult.Exhausted -> {
+                // Task 17 stops here; Rung 4 surrender (RecoveryGivenUp)
+                // lands in the follow-up task. selfState stays Reconnecting
+                // (the ladder didn't lift it).
+            }
+        }
     }
 
     // ── Cadence engine (Task 16) ──────────────────────────────────────────
@@ -652,11 +922,23 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * already running on [scope]. Skips emission on no-op transitions
      * (reducer returned the same `state` instance) so [StateFlow] does not
      * re-emit on a non-change.
+     *
+     * Post-dispatch hook (Task 17): if the transition crossed any non-
+     * Reconnecting state into [SelfState.Reconnecting], kick the recovery
+     * ladder with `triggerPeerId = null`. Mirrors the `_dispatchSelf` post-
+     * hook in `extension/connection/connection-authority.js` (commit
+     * `dd87ae2`). The single-flight guard inside [kickLadder] absorbs the
+     * re-entry that occurs when the ladder's own [SelfStateEvent.RecoveryBegan]
+     * dispatch lands here a moment later.
      */
     private fun dispatchSelf(event: SelfStateEvent) {
         val current = _selfState.value
         val next = SelfState.reduce(current, event)
-        if (next !== current) _selfState.value = next
+        if (next === current) return
+        _selfState.value = next
+        if (current !is SelfState.Reconnecting && next is SelfState.Reconnecting) {
+            kickLadder(triggerPeerId = null, reason = "self-reconnecting")
+        }
     }
 
     /**
@@ -680,6 +962,13 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      *
      * For peers already in the map, no-op transitions skip emission so
      * [StateFlow] does not re-emit on a non-change.
+     *
+     * Post-dispatch hook (Task 17): if the transition crossed a non-
+     * [PeerHealth.Failed] state into [PeerHealth.Failed], kick the recovery
+     * ladder with `triggerPeerId = peerId`. Mirrors the `_dispatchPeer`
+     * post-hook in `extension/connection/connection-authority.js` (commit
+     * `dd87ae2`). Concurrent peers FAILED in the same tick share the in-
+     * flight ladder via [kickLadder]'s single-flight guard.
      */
     private fun dispatchPeer(peerId: String, event: PeerHealthEvent) {
         val current = _peerHealth.value
@@ -690,6 +979,9 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         val newMap = LinkedHashMap(current)
         newMap[peerId] = next
         _peerHealth.value = newMap
+        if (before !== PeerHealth.Failed && next === PeerHealth.Failed) {
+            kickLadder(triggerPeerId = peerId, reason = "peer-failed")
+        }
     }
 
     private companion object {
