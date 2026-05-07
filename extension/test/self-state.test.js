@@ -13,7 +13,7 @@
  *
  *   Forward transitions:
  *     start-connect       : OFFLINE                          -> CONNECTING
- *     auth-complete       : CONNECTING                       -> ONLINE
+ *     auth-complete       : CONNECTING | RECONNECTING        -> ONLINE
  *     ws-closed           : ONLINE | CONNECTING              -> RECONNECTING
  *     recovery-began      : OFFLINE | CONNECTING | ONLINE    -> RECONNECTING
  *     recovery-succeeded  : RECONNECTING                     -> ONLINE
@@ -87,8 +87,13 @@ describe('reduceSelfState: auth-complete', () => {
   it('ONLINE stays ONLINE (no-op; already authed)', () => {
     assert.equal(reduceSelfState(SelfState.ONLINE, ev), SelfState.ONLINE);
   });
-  it('RECONNECTING stays RECONNECTING (auth-complete during recovery is handled by recovery-succeeded)', () => {
-    assert.equal(reduceSelfState(SelfState.RECONNECTING, ev), SelfState.RECONNECTING);
+  it('RECONNECTING -> ONLINE (recovery path: WS reauth is the success signal a ladder rung observes)', () => {
+    // Without this transition, Rungs 2/3 deadlock — they call
+    // forceWsReconnect/forceFullReset which reopens + reauthenticates the WS,
+    // but the rung's "selfState === ONLINE" success observer never fires
+    // because nothing else lifts RECONNECTING. recovery-succeeded is
+    // dispatched AFTER a rung resolves, so it cannot be the trigger.
+    assert.equal(reduceSelfState(SelfState.RECONNECTING, ev), SelfState.ONLINE);
   });
 });
 

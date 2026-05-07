@@ -1112,6 +1112,55 @@ describe('ConnectionAuthority: Rung 3 (full session reset)', () => {
     assert.equal(clock.pending, 0, 'shutdown clears backoff timer');
   });
 
+  it('out-of-band auth-complete during RECONNECTING lifts state to ONLINE and clears surrender + backoff', async () => {
+    // Reproduces the smoke-test bug: surrender to Rung 4 (banner red, backoff
+    // timer armed) and then drive auth-complete from outside the ladder
+    // (real-world: the legacy 2s reconnect in background-relay.js races the
+    // ladder and reauths first). State must reach ONLINE, surrender flag
+    // drops, and the armed backoff timer is cancelled so it cannot
+    // spuriously re-engage the ladder against an already-healthy connection.
+    const { auth, clock } = makeRung3Authority({ rung3Behaviour: 'noop' });
+    bringOnline(auth);
+
+    // Force surrender: drop WS, burn ladder budget, ladder exhausts → Rung 4.
+    auth.notifyWsClosed();
+    await burnLadder(clock);
+    assert.equal(auth.surrenderedToUser.value, true, 'ladder surrendered to user');
+    assert.notEqual(auth._backoffTimer, null, 'backoff retry timer is armed after surrender');
+    assert.ok(auth._backoffAttempt >= 1, 'at least one backoff attempt was scheduled');
+
+    // Out-of-band recovery: a fresh WS opens and authenticates without the
+    // ladder running a rung. Authority sees only the notifyWsOpening /
+    // notifyAuthComplete pair from background-relay.js.
+    auth.notifyWsOpening();    // no-op from RECONNECTING per reducer
+    auth.notifyAuthComplete(); // RECONNECTING → ONLINE (the fix)
+
+    assert.equal(auth.selfState.value, SelfState.ONLINE, 'auth-complete lifts RECONNECTING to ONLINE');
+    assert.equal(auth.surrenderedToUser.value, false, 'surrender flag dropped on out-of-band recovery');
+    assert.equal(auth._backoffTimer, null, 'backoff retry timer was cancelled');
+    assert.equal(auth._backoffAttempt, 0, 'backoff attempt counter reset');
+    assert.equal(auth._rung3FailureLog.length, 0, 'thrash counter reset');
+
+    // Idempotency check (per code-review follow-up): if a ladder rung's
+    // success observer subsequently resolves and `_handleLadderSettled(ok=true)`
+    // re-runs the same cleanup against an already-clean state, nothing
+    // observable changes. This guards against a future refactor that turns
+    // either cleanup path into something with side-effects on clean state.
+    let surrenderEmissions = 0;
+    const unsub = auth.surrenderedToUser.subscribe(() => { surrenderEmissions += 1; });
+    surrenderEmissions = 0; // initial subscribe replay does not count
+    auth._handleLadderSettled({ _isSurrenderLadder: false }, { ok: true }, null);
+    assert.equal(auth.selfState.value, SelfState.ONLINE, 'still ONLINE');
+    assert.equal(auth.surrenderedToUser.value, false, 'still cleared');
+    assert.equal(auth._backoffAttempt, 0, 'still zero');
+    assert.equal(auth._rung3FailureLog.length, 0, 'still empty');
+    assert.equal(surrenderEmissions, 0, 'no spurious surrender re-emission');
+    unsub();
+
+    auth.shutdown();
+    await flush();
+  });
+
   it('Rung 3 with no forceFullReset hook surrenders synchronously (skeleton mode)', async () => {
     // Mirror the original Task 8/9 skeleton-mode behaviour: without the
     // forceFullReset hook, Rung 3's action returns false immediately, and

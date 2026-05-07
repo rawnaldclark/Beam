@@ -719,11 +719,19 @@ export class ConnectionAuthority {
    * different state. Identity check (===) is sufficient since the reducer
    * returns enum string constants.
    *
-   * Side effect: when the transition crosses *into* `RECONNECTING` from any
-   * other state, kick the recovery ladder (if no ladder is already running).
-   * Per spec §"Recovery ladder", `selfState` going `RECONNECTING` is one of
-   * the two ladder triggers; the other is `peerHealth[X] = FAILED`, handled
-   * in {@link _dispatchPeer}.
+   * Side effects:
+   *   - On any transition INTO `RECONNECTING`, kick the recovery ladder (if
+   *     no ladder is already running). Per spec §"Recovery ladder", `selfState`
+   *     going `RECONNECTING` is one of the two ladder triggers; the other is
+   *     `peerHealth[X] = FAILED`, handled in {@link _dispatchPeer}.
+   *   - On `RECONNECTING → ONLINE`, drop the surrender flag, cancel the
+   *     backoff retry timer, and reset the thrash + backoff counters. This
+   *     mirrors the cleanup `_handleLadderSettled` does on a successful rung,
+   *     but covers the case where state recovers via `auth-complete` driven
+   *     by an out-of-band reconnect path (the legacy 2s reconnect in
+   *     `background-relay.js`, or any future external recovery hook). Without
+   *     this, a previously-armed backoff timer would fire spuriously and
+   *     re-engage the ladder against an already-healthy connection.
    */
   _dispatchSelf(event) {
     const prev = this._selfState.value;
@@ -733,6 +741,30 @@ export class ConnectionAuthority {
     if (prev !== SelfState.RECONNECTING && next === SelfState.RECONNECTING) {
       this._kickLadder({ triggerPeerId: null, reason: 'self-reconnecting' });
     }
+    if (prev === SelfState.RECONNECTING && next === SelfState.ONLINE) {
+      this._onRecoveryRestored();
+    }
+  }
+
+  /**
+   * Idempotent cleanup invoked whenever `selfState` transitions from
+   * `RECONNECTING` to `ONLINE`, regardless of which path drove the recovery.
+   * The ladder's `_handleLadderSettled(ok=true)` already runs equivalent
+   * cleanup, but it ONLY fires when a rung's success observer resolves.
+   * State can also reach ONLINE without the ladder resolving — e.g. when
+   * `auth-complete` arrives from an out-of-band reconnect. This helper is
+   * the common drain so both paths leave the same post-conditions.
+   *
+   * Operations are individually idempotent: clearing a null timer is a no-op,
+   * setting `false` on an already-`false` Observable does not re-emit, etc.
+   *
+   * @private
+   */
+  _onRecoveryRestored() {
+    this._rung3FailureLog = [];
+    this._backoffAttempt = 0;
+    this._cancelBackoffTimer();
+    if (this._surrenderedToUser.value) this._surrenderedToUser.next(false);
   }
 
   /**

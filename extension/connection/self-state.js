@@ -80,11 +80,18 @@ export function reduceSelfState(state, event) {
     }
 
     // ─── auth-complete: relay accepted our auth frame ───────────────────────
-    // Only valid lifting CONNECTING to ONLINE. Outside CONNECTING this is a
-    // no-op; in particular, RECONNECTING uses recovery-succeeded (not
-    // auth-complete) to leave RECONNECTING — the ladder owns that exit.
+    // Lifts both CONNECTING → ONLINE (cold-boot path) and RECONNECTING →
+    // ONLINE (recovery path). The recovery transition is the only signal a
+    // ladder rung's "selfState === ONLINE" success observer can act on:
+    // without it, Rung 2's `forceWsReconnect` and Rung 3's `forceFullReset`
+    // could reopen + reauthenticate the WS but the rung would still time out
+    // because nothing else flips selfState back. The ladder's own
+    // `recovery-succeeded` event is dispatched after a rung resolves; it
+    // performs surrender-flag + thrash-counter cleanup but is a state-machine
+    // no-op once we're already ONLINE.
     case 'auth-complete': {
-      if (state === SelfState.CONNECTING) return SelfState.ONLINE;
+      if (state === SelfState.CONNECTING)   return SelfState.ONLINE;
+      if (state === SelfState.RECONNECTING) return SelfState.ONLINE;
       return state;
     }
 
