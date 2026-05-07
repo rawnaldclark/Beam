@@ -1838,3 +1838,40 @@ button:focus-visible,
 .connection-banner.connection-banner-surrendered .connection-banner-button:focus-visible {
   outline: 1px solid var(--beam-danger, var(--danger));
 }
+
+/* ==========================================================================
+   Task 12 — Failed transfer history row
+   --------------------------------------------------------------------------
+   Persisted Failed entries get a red accent on the icon and a "Failed" label
+   so they're visually distinct from completed entries; the trailing Retry
+   chip reuses the existing .retry-chip pill but gets a danger-tinted border
+   to read as a primary action on this row variant.
+   ========================================================================== */
+.activity-row.activity-row-failed {
+  /* Subtle danger-dim wash so the row reads as a Failed item without
+     drowning out completed entries above/below it in the unified list. */
+  background: var(--beam-danger-dim, var(--danger-dim));
+  border-radius: 6px;
+}
+
+.activity-row.activity-row-failed .row-icon-failed {
+  color: var(--beam-danger, var(--danger));
+}
+
+.activity-row.activity-row-failed .row-meta-failed {
+  color:       var(--beam-danger, var(--danger));
+  font-weight: 600;
+  text-transform: uppercase;
+  font-size:   var(--beam-size-xs, 11px);
+  letter-spacing: 0.04em;
+}
+
+.retry-chip.retry-chip-history {
+  border-color: var(--beam-danger, var(--danger));
+  color:        var(--beam-danger, var(--danger));
+}
+
+.retry-chip.retry-chip-history:hover {
+  background: var(--beam-danger, var(--danger));
+  color:      var(--beam-bg-0, var(--bg));
+}

@@ -33,6 +33,7 @@ import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
 import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted, setRestartHook } from './background-relay.js';
 import { beamErrorMessage } from './crypto/beam-errors.js';
 import { getConnectionAuthority } from './connection/connection-authority-wiring.js';
+import { appendHistoryEntry, buildFailedEntry } from './shared/transfer-history.js';
 
 // ---------------------------------------------------------------------------
 // Badge state — tracks a pending "failure" clear so we can dismiss it on the
@@ -358,7 +359,38 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .then(({ transferIdHex }) => sendResponse({ ok: true, transferId: transferIdHex }))
         .catch((err) => {
           console.error('[Beam SW] SEND_FILE failed:', err);
-          sendResponse({ ok: false, error: beamErrorMessage(err.code) });
+          // Task 12: persist a Failed history entry for any failure that
+          // means "the file did not reach the peer" — covers spec
+          // §"Detection points" 1-4 (pre-flight unreachable, mid-stream WS
+          // drop = NO_TRANSPORT, sender-side throws via onSendError =
+          // SEND_THROW, etc.) so the popup-history retry-with-re-pick path
+          // is reachable after the popup closes. SELF_OFFLINE is the one
+          // exclusion: the user is the cause, the top banner already
+          // surfaces it, and a per-device history entry would be noise. A
+          // missing `code` (legacy rejections) is also skipped — without a
+          // code we can't render a meaningful retry hint.
+          const code = err?.code;
+          if (code && code !== 'SELF_OFFLINE') {
+            const { fileName, fileSize, mimeType, targetDeviceId } = msg.payload || {};
+            appendHistoryEntry(buildFailedEntry({
+              deviceId: targetDeviceId,
+              fileName,
+              fileSize,
+              mimeType,
+              reason:   code,
+            })).catch((writeErr) => {
+              console.error('[Beam SW] Failed to persist transfer history:', writeErr);
+            });
+          }
+          sendResponse({
+            ok:    false,
+            // `code` is the raw error enum (`PEER_UNREACHABLE`,
+            // `SELF_OFFLINE`, `NO_TRANSPORT`, …) — popup branches on this.
+            // `error` keeps the existing user-facing string for callers that
+            // don't recognise the code (Step-1 fallback path).
+            code:  err?.code,
+            error: beamErrorMessage(err?.code),
+          });
         });
       return true; // async sendResponse
     }
@@ -370,7 +402,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
         .then(() => sendResponse({ ok: true }))
         .catch((err) => {
           console.error('[Beam SW] SEND_CLIPBOARD failed:', err);
-          sendResponse({ ok: false, error: beamErrorMessage(err.code) });
+          sendResponse({ ok: false, code: err?.code, error: beamErrorMessage(err?.code) });
         });
       return true; // async sendResponse
     }

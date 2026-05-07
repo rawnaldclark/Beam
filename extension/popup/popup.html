@@ -42,7 +42,16 @@
       based on the authority's broadcast `selfState`. Click "Reconnect" sends
       REQUEST_RECONNECT to the SW.
     -->
-    <div id="connection-banner" class="connection-banner hidden" role="alert"
+    <!--
+      Task 12 follow-up (c): role="alert" was dropped here because it caused
+      double announcements. role="alert" implies aria-live="assertive" and
+      forces re-announcement on every text mutation; combined with the popup's
+      existing aria-live="polite" mechanisms (toast + this banner), screen
+      readers re-spoke the banner on every selfState transition. Keeping
+      aria-live="polite" alone preserves the announcement once per visibility
+      transition without the double-speak.
+    -->
+    <div id="connection-banner" class="connection-banner hidden"
          aria-live="polite">
       <span class="connection-banner-icon" aria-hidden="true"><svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" x2="12" y1="9" y2="13"/><line x1="12" x2="12.01" y1="17" y2="17"/></svg></span>
       <span class="connection-banner-message" id="connection-banner-message">Not connected</span>

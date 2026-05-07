@@ -21,6 +21,7 @@
  */
 
 import { MSG } from '../shared/message-types.js';
+import { normalizeHistoryEntries } from '../shared/transfer-history.js';
 import {
   startPairing,
   renderQR,
@@ -126,6 +127,31 @@ function peerHealthToDotClass(health) {
     case PEER_HEALTH.FAILED:  return 'dot-failed';
     case PEER_HEALTH.OFFLINE: return 'dot-offline';
     default:                  return 'dot-offline';
+  }
+}
+
+/**
+ * Map a PeerHealth enum value to the screen-reader label applied to
+ * `.row-dot` (Task 12 follow-up d).
+ *
+ * The dot is purely visual; without an explicit `aria-label` screen readers
+ * skip past it and the user has no signal that the device is online/offline.
+ * The strings here mirror the dot-class semantics: HEALTHY = "Online",
+ * STALE = "Online (slow)" (so the user knows we're double-checking but the
+ * device is reachable), FAILED = "Reconnecting" (matches the visible subtext),
+ * UNKNOWN = "Status unknown" (we have no proof of life yet), and any
+ * other / missing health (OFFLINE, undefined) = "Offline".
+ *
+ * @param {string|undefined} health
+ * @returns {string}
+ */
+function peerHealthToDotAriaLabel(health) {
+  switch (health) {
+    case PEER_HEALTH.HEALTHY: return 'Online';
+    case PEER_HEALTH.STALE:   return 'Online (slow)';
+    case PEER_HEALTH.FAILED:  return 'Reconnecting';
+    case PEER_HEALTH.UNKNOWN: return 'Status unknown';
+    default:                  return 'Offline';
   }
 }
 
@@ -425,7 +451,9 @@ async function loadDevices() {
  */
 async function loadTransferHistory() {
   const stored = await chrome.storage.session.get('transferHistory').catch(() => ({}));
-  renderTransferHistory(stored?.transferHistory ?? []);
+  // Task 12: legacy entries without a `status` field are backfilled as
+  // 'completed'. Reader-side default; we never mutate stored data.
+  renderTransferHistory(normalizeHistoryEntries(stored?.transferHistory ?? []));
 }
 
 /**
@@ -689,6 +717,13 @@ function deviceRowHTML(d) {
   const dotClass = health
     ? peerHealthToDotClass(health)
     : (d.isOnline ? 'dot-online' : 'dot-offline');
+  // Task 12 follow-up (d): aria-label on the dot. When we don't yet have a
+  // PeerHealth observation, fall back to the binary isOnline flag using the
+  // same vocabulary (Online / Offline) so screen-reader output stays
+  // consistent with the dot colour.
+  const dotAria  = health
+    ? peerHealthToDotAriaLabel(health)
+    : (d.isOnline ? 'Online' : 'Offline');
   const trailing = relayErrorActive ? 'unavailable'
                  : d.isOnline       ? 'send'
                  :                    'offline';
@@ -704,7 +739,7 @@ function deviceRowHTML(d) {
   return `
     <div class="device-row ${statusClass} ${selectedClass}" data-id="${escapeAttr(d.deviceId)}"
          role="button" tabindex="0" aria-label="${escapeAttr(d.name)}, ${statusClass}">
-      <span class="row-dot ${dotClass}"></span>
+      <span class="row-dot ${dotClass}" role="img" aria-label="${escapeAttr(dotAria)}"></span>
       <span class="row-icon" aria-hidden="true">${icon}</span>
       <span class="row-name">${escapeHtml(d.name)}</span>
       <span class="row-trailing">${trailing}</span>
@@ -911,6 +946,32 @@ function renderActivityList() {
     const sizeMeta = formatBytes(item.fileSize);
     const device   = item.targetDeviceName ? escapeHtml(item.targetDeviceName) : '';
     const time     = formatRelativeTime(item.timestamp);
+
+    if (item.status === 'failed') {
+      // Task 12: failed history entry gets a Retry button. Tap → file
+      // picker (we don't store blobs); on file chosen, validate name+size
+      // against the entry and re-send. The re-pick flow is handled in
+      // `handleHistoryRetryClick` below.
+      const transferId = escapeAttr(item.transferId || '');
+      entries.push({
+        type: 'transfer',
+        timestamp: item.timestamp,
+        html: `
+          <div class="activity-row activity-row-failed" data-history-failed="${transferId}">
+            <span class="row-icon row-icon-failed" aria-hidden="true">${icon}</span>
+            <span class="row-name">${escapeHtml(item.fileName)}</span>
+            <span class="row-meta row-meta-failed">Failed</span>
+            <span class="row-meta">${sizeMeta}</span>
+            ${device ? `<span class="row-meta">${device}</span>` : ''}
+            <span class="row-meta">${time}</span>
+            <button class="retry-chip retry-chip-history"
+                    data-history-retry="${transferId}"
+                    type="button">retry</button>
+          </div>
+        `,
+      });
+      continue;
+    }
 
     entries.push({
       type: 'transfer',
@@ -1277,6 +1338,37 @@ function cancelSAS() {
 // Event listeners
 // ---------------------------------------------------------------------------
 
+/**
+ * Task 12 follow-up (a): shared timestamp gate for REQUEST_RECONNECT button
+ * presses. Both the header Reconnect and the banner's Reconnect funnel
+ * through the same SW handler, so they share one debounce — a frustrated
+ * user can't fire 30 reconnect requests in a second by alternating clicks.
+ *
+ * 1000ms is the smallest window that absorbs accidental double-clicks while
+ * still letting the user retry within a real "connection might have come
+ * back" timeframe.
+ *
+ * @type {number}
+ */
+let lastReconnectRequestAt = 0;
+
+/** Minimum delay between user-initiated REQUEST_RECONNECT dispatches. */
+const RECONNECT_DEBOUNCE_MS = 1000;
+
+/**
+ * Returns true and stamps `lastReconnectRequestAt` if a reconnect request
+ * may proceed. Returns false if the previous request was within
+ * {@link RECONNECT_DEBOUNCE_MS}.
+ *
+ * @returns {boolean}
+ */
+function tryClaimReconnect() {
+  const now = Date.now();
+  if (now - lastReconnectRequestAt < RECONNECT_DEBOUNCE_MS) return false;
+  lastReconnectRequestAt = now;
+  return true;
+}
+
 /** Wire up all static event listeners after DOM is ready. */
 function setupEventListeners() {
   // Empty state: Pair first device button
@@ -1294,6 +1386,7 @@ function setupEventListeners() {
   // from prior versions); the banner is loud-when-disconnected. They wire
   // to the same SW handler so behaviour is consistent.
   document.getElementById('btn-reconnect')?.addEventListener('click', async () => {
+    if (!tryClaimReconnect()) return;
     const dot = document.getElementById('relay-status-dot');
     if (dot) dot.classList.add('disconnected');
     try {
@@ -1313,6 +1406,7 @@ function setupEventListeners() {
   // minus the header dot animation. The banner already provides loud visual
   // feedback that recovery is in flight via the warn-coloured surface.
   document.getElementById('connection-banner-button')?.addEventListener('click', async () => {
+    if (!tryClaimReconnect()) return;
     try {
       await chrome.runtime.sendMessage({ type: 'REQUEST_RECONNECT' });
       await loadDevices();
@@ -1789,10 +1883,37 @@ async function sendFile(file) {
       rendezvousId,
     },
   }).then(resp => {
-    if (!resp?.ok) {
-      // Send was rejected — transition device row to failed state.
-      handleTransferFailure(targetId, 'send-' + Date.now(), 'relay not connected');
+    if (resp?.ok) return;
+
+    // Task 12: branch on the SW's raw error code (resp.code) to choose the
+    // correct UX. The SW's SEND_FILE handler now includes both `code` (raw
+    // enum) and `error` (user-facing string) on failure; older builds may
+    // omit `code` and `resp.code` falls through to the legacy fallback.
+    const code = resp?.code;
+
+    if (code === 'SELF_OFFLINE') {
+      // SELF_OFFLINE: we're offline, the top connection banner already says
+      // "Not connected — Reconnect" via the Task 10/11 banner pipeline.
+      // Rendering a per-device Failed card on top would be duplicate noise.
+      // Skip silently — the user already sees the actionable signal.
+      return;
     }
+
+    if (code === 'PEER_UNREACHABLE') {
+      // PEER_UNREACHABLE: peer-ping ladder failed. Render a Failed card with
+      // a Retry that re-runs the original sendFile(file). The closure here
+      // captures the live File object so retry is friction-free.
+      handleTransferFailure(targetId, 'send-' + Date.now(),
+        resp?.error || "That device isn't responding right now.",
+        () => sendFile(file));
+      return;
+    }
+
+    // Any other failure (NO_TRANSPORT, missing key, malformed payload, …)
+    // routes through the legacy generic-failure fallback; the user-facing
+    // message comes from beamErrorMessage in the SW so we just surface it.
+    handleTransferFailure(targetId, 'send-' + Date.now(),
+      resp?.error || 'relay not connected');
   }).catch(err => {
     handleTransferFailure(targetId, 'send-' + Date.now(), err.message);
   });
@@ -1983,10 +2104,21 @@ function handleDeviceListClick(e) {
 /**
  * Handle clicks in the unified activity list (Phase 2a).
  * Clipboard activity rows can be clicked to copy content.
+ * Task 12: a `.retry-chip-history` click on a Failed transfer row triggers
+ * a re-pick file flow.
  *
  * @param {MouseEvent} e
  */
 function handleActivityListClick(e) {
+  // Task 12: history retry on a Failed transfer row.
+  const retryBtn = e.target.closest('.retry-chip-history[data-history-retry]');
+  if (retryBtn) {
+    e.stopPropagation();
+    const transferId = retryBtn.dataset.historyRetry;
+    if (transferId) handleHistoryRetryClick(transferId);
+    return;
+  }
+
   const row = e.target.closest('.activity-row[data-clip-content]');
   if (!row) return;
 
@@ -1998,6 +2130,101 @@ function handleActivityListClick(e) {
   }).catch(() => {
     showToast('Could not copy to clipboard.', 'error');
   });
+}
+
+/**
+ * Hidden file input used by {@link handleHistoryRetryClick} to prompt the
+ * user to re-pick a file for a persisted Failed history entry. Lazily
+ * created on first use; lives at the document root and is reused.
+ *
+ * @type {HTMLInputElement|null}
+ */
+let historyRetryInput = null;
+
+/**
+ * The currently-pending `change` listener on {@link historyRetryInput}, if
+ * any. Tracked so a second Retry click can detach a stale listener from a
+ * cancelled prior click (the file-picker fires no event on cancel, so the
+ * listener never auto-removes itself). Without this, two retries with one
+ * cancel between them would stack listeners and the next pick would invoke
+ * `sendFile` once per attached listener.
+ *
+ * @type {((evt: Event) => void) | null}
+ */
+let historyRetryInputListener = null;
+
+/**
+ * Handle the user tapping the Retry button on a Failed transfer history row.
+ *
+ * Spec §"Failed-transfer card UX, retry from history": we don't store the
+ * file bytes, so retry asks the user to re-pick. We then validate that the
+ * picked file matches the failed entry by `fileName` and `fileSize` —
+ * mismatches prompt for confirmation rather than silently sending the wrong
+ * file.
+ *
+ * @param {string} transferId - PK of the Failed history entry.
+ */
+async function handleHistoryRetryClick(transferId) {
+  // Look up the entry from the cached history (already normalised).
+  const entry = cachedTransferHistory.find(e => e?.transferId === transferId);
+  if (!entry) return;
+
+  // Lazily create the file input. Reused across retries — clearing `value`
+  // before each click is what lets the user pick the same file twice.
+  if (!historyRetryInput) {
+    historyRetryInput = document.createElement('input');
+    historyRetryInput.type = 'file';
+    historyRetryInput.style.display = 'none';
+    document.body.appendChild(historyRetryInput);
+  }
+  const input = historyRetryInput;
+
+  // Detach any pending listener from a previous click the user cancelled.
+  // The file-picker fires no event on cancel, so the prior `onChange` never
+  // auto-removed itself. Skipping this would let consecutive retries stack
+  // listeners and the eventual file pick would call sendFile once per stack.
+  if (historyRetryInputListener) {
+    input.removeEventListener('change', historyRetryInputListener);
+    historyRetryInputListener = null;
+  }
+
+  input.value = '';
+
+  // One-shot change handler that captures the entry in its closure.
+  const onChange = async () => {
+    input.removeEventListener('change', onChange);
+    historyRetryInputListener = null;
+    const picked = input.files?.[0];
+    if (!picked) return;
+
+    const nameMatches = picked.name === entry.fileName;
+    const sizeMatches = picked.size === entry.fileSize;
+
+    if (!nameMatches || !sizeMatches) {
+      // Mismatch path: a single confirmation covers both the renamed-but-
+      // same-size case and the wrong-file-entirely case. The user is the
+      // best judge — we just make sure they're conscious of the mismatch.
+      const detail = !sizeMatches
+        ? `expected ${formatBytes(entry.fileSize)}, picked ${formatBytes(picked.size)}`
+        : `expected "${entry.fileName}", picked "${picked.name}"`;
+      const proceed = window.confirm(
+        `This file looks different from the one that failed (${detail}). ` +
+        `Send it anyway?`
+      );
+      if (!proceed) {
+        showToast('Retry cancelled.');
+        return;
+      }
+    }
+
+    selectedDeviceId = entry.deviceId;
+    updateSelection(entry.deviceId);
+    await sendFile(picked);
+  };
+
+  historyRetryInputListener = onChange;
+  input.addEventListener('change', onChange);
+  input.click();
 }
 
 /**
@@ -2251,11 +2478,20 @@ function handleTransferSuccess(deviceId, transferId, fileName, fileSize) {
 /**
  * Transition a device row to the failed state with retry option.
  *
+ * Task 12: when `liveRetry` is supplied (PEER_UNREACHABLE path) the retry
+ * chip re-invokes that callback directly — the original `File` object is
+ * captured in the caller's closure, so retry is friction-free. Without it
+ * (relay-not-connected, NO_TRANSPORT, …) the retry chip falls back to the
+ * legacy "open the file picker" flow.
+ *
  * @param {string} deviceId
  * @param {string} transferId
  * @param {string} [reason]
+ * @param {(() => void) | null} [liveRetry] - Callback re-invoked when the
+ *   user taps the retry chip. Captured in the caller's closure to keep the
+ *   live File reference alive.
  */
-function handleTransferFailure(deviceId, transferId, reason) {
+function handleTransferFailure(deviceId, transferId, reason, liveRetry) {
   const existing = activeTransfersByDevice.get(deviceId);
 
   activeTransfersByDevice.set(deviceId, {
@@ -2269,6 +2505,7 @@ function handleTransferFailure(deviceId, transferId, reason) {
     error: reason || 'Transfer failed',
     targetDeviceId: deviceId,
     sendPayload: existing?.sendPayload || null,
+    liveRetry: typeof liveRetry === 'function' ? liveRetry : null,
   });
 
   renderDeviceRowsOnly();
@@ -2278,19 +2515,32 @@ function handleTransferFailure(deviceId, transferId, reason) {
  * Retry a failed transfer for a given device.
  * Clears the error state and re-triggers the send.
  *
+ * Task 12: when the failed entry was created with a `liveRetry` callback
+ * (PEER_UNREACHABLE pre-flight failure with the original File still in
+ * memory), invoke it directly — same validation runs as on first send.
+ * Otherwise fall back to opening the file picker so the user can re-pick.
+ *
  * @param {string} deviceId
  */
 function retryTransfer(deviceId) {
   const xfer = activeTransfersByDevice.get(deviceId);
   if (!xfer || xfer.state !== 'failed') return;
 
+  const liveRetry = xfer.liveRetry;
+
   // Clear the failed state.
   activeTransfersByDevice.delete(deviceId);
   renderDeviceRowsOnly();
 
-  // Re-trigger: select the device and open the file picker.
-  // If the original sendPayload was stored, we could re-send automatically,
-  // but for safety we prompt the user to re-select the file.
+  if (liveRetry) {
+    // Live retry: re-invoke the original send path with the captured File.
+    selectedDeviceId = deviceId;
+    updateSelection(deviceId);
+    liveRetry();
+    return;
+  }
+
+  // Fallback: prompt user to re-select the file.
   selectedDeviceId = deviceId;
   updateSelection(deviceId);
   el('file-input').click();

@@ -117,7 +117,18 @@ export function installPopupBroadcaster() {
   if (!authority) return;
   _popupBroadcasterInstalled = true;
 
-  const broadcast = () => {
+  // Task 12 follow-up (b): coalesce. The three observables (selfState,
+  // peerHealth, surrenderedToUser) frequently change in the same synchronous
+  // batch (e.g. ladder transition). Without coalescing the popup receives 3
+  // identical CONNECTION_STATE_CHANGED messages and re-renders 3 times. We
+  // schedule a single microtask-deferred broadcast and drop any redundant
+  // requests within the same microtask turn. queueMicrotask is preferred over
+  // requestAnimationFrame (not available in SW context) and over setTimeout(0)
+  // (RAF semantics; microtask is the right cadence — it fires before the next
+  // chrome.runtime turn but after the synchronous reducer batch settles).
+  let broadcastScheduled = false;
+  const sendBroadcast = () => {
+    broadcastScheduled = false;
     const peerHealthObj = {};
     for (const [peerId, health] of authority.peerHealth.value.entries()) {
       peerHealthObj[peerId] = health;
@@ -146,10 +157,16 @@ export function installPopupBroadcaster() {
     }
   };
 
-  // Subscribing replays the current value synchronously, which dispatches an
-  // initial broadcast. That's harmless: if the popup is closed, the message
-  // is dropped; if open, the popup gets a fresh snapshot it would have asked
-  // for via GET_CONNECTION_STATE anyway.
+  const broadcast = () => {
+    if (broadcastScheduled) return;
+    broadcastScheduled = true;
+    queueMicrotask(sendBroadcast);
+  };
+
+  // Subscribing replays the current value synchronously, which schedules an
+  // initial coalesced broadcast. That's harmless: if the popup is closed, the
+  // message is dropped; if open, the popup gets a fresh snapshot it would
+  // have asked for via GET_CONNECTION_STATE anyway.
   authority.selfState.subscribe(broadcast);
   authority.peerHealth.subscribe(broadcast);
   // Task 11: re-broadcast on surrender-flag changes so the popup banner
