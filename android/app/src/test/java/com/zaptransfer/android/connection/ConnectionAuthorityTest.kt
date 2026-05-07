@@ -16,6 +16,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.json.JSONObject
 import org.junit.Assert.assertEquals
@@ -680,6 +681,437 @@ class ConnectionAuthorityTest {
         assertSame(PeerHealth.Offline, emissions[1]["X"])
 
         collector.cancel()
+    }
+
+    // ── Task 16: background ping cadence ───────────────────────────────────
+    //
+    // Mirrors `extension/test/connection-authority.test.js`'s "Task 7"
+    // describe block. Each test seeds a peer, advances virtual time across
+    // BG_PING_INTERVAL_MS (and PING_TIMEOUT_MS), captures outbound peer-ping
+    // wire frames via the injected sendMessage closure, and asserts on:
+    //   - which pings fired and to whom (the `sent` list),
+    //   - the resulting peerHealth state,
+    //   - whether timer jobs leaked (probed via `runCurrent` + a final
+    //     `assertEquals(PeerHealth.X, ...)`).
+    //
+    // The cadence engine's `delay(BG_PING_INTERVAL_MS)` participates in the
+    // StandardTestDispatcher's virtual time, so `advanceTimeBy(N)` is the
+    // canonical "drive the clock forward" call. `runCurrent()` pumps any
+    // microtasks (e.g. the launch body that follows a delay) before we
+    // assert.
+
+    /**
+     * Bundle of a cadence-enabled authority plus the captured `sent` list
+     * of outbound peer-ping wire frames. The injected [PeerPingTracker]
+     * uses a fixed `ownDeviceId` so tests can assert on `rendezvousId`.
+     */
+    private data class CadenceFixture(
+        val auth: ConnectionAuthority,
+        val signaling: FakeSignaling,
+        val sent: MutableList<PeerPingMessage>,
+    )
+
+    /**
+     * Build an authority with a real [PeerPingTracker] wired to a captured
+     * `sent` list. [ownDeviceId] defaults to the JS test's literal so the
+     * Kotlin / JS expectations align.
+     */
+    private fun buildCadenceAuthority(
+        dispatcher: CoroutineDispatcher,
+        ownDeviceId: String = "self-device-id",
+        pingTimeoutMs: Long = PING_TIMEOUT_MS,
+    ): CadenceFixture {
+        val signaling = newFakeSignaling()
+        val sent = mutableListOf<PeerPingMessage>()
+        val tracker = PeerPingTracker(
+            sendMessage = { sent += it },
+            timeoutMs = pingTimeoutMs,
+            ownDeviceId = ownDeviceId,
+        )
+        val auth = ConnectionAuthority(signaling.client, dispatcher, tracker)
+        return CadenceFixture(auth, signaling, sent)
+    }
+
+    @Test
+    fun cadence_schedulesAPingAtBgPingIntervalMs_whenPeerComesOnline() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        // IMPORTANT: use `runCurrent()`, NOT `advanceUntilIdle()`, between
+        // notify calls and explicit time advancements. `advanceUntilIdle`
+        // would advance virtual time to whatever delayed task is pending
+        // — including the cadence's own `delay(BG_PING_INTERVAL_MS)` — and
+        // then keep firing the next-ping reschedule chain forever, which
+        // OOMs the JVM.
+        runCurrent()
+
+        // Just before 120s: no ping yet.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS - 1)
+        runCurrent()
+        assertEquals("no ping before 120s", 0, sent.size)
+
+        // At exactly 120s: peer-ping is sent for X.
+        testScheduler.advanceTimeBy(1)
+        runCurrent()
+        assertEquals("ping fires at 120s", 1, sent.size)
+        assertEquals("peer-ping", sent[0].type)
+        assertEquals("X", sent[0].targetDeviceId)
+        assertEquals("self-device-id", sent[0].rendezvousId)
+        assertTrue("nonce is non-empty", sent[0].nonce.isNotEmpty())
+
+        // Cadence is still armed (timeoutJob counting down at virtual_time=130s);
+        // shutdown drops it before runTest's cleanup so we don't leak.
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_pongWithinDeadline_promotesToHealthyAndReschedules() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+
+        // Drive to first ping fire.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals(1, sent.size)
+        val nonce = sent[0].nonce
+
+        // Pong arrives 5s later (well inside the 10s timeout).
+        testScheduler.advanceTimeBy(5_000)
+        auth.notifyPongReceived(nonce)
+        runCurrent()
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        // Next ping is scheduled for now + 120s. Tick to just before, then to it.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS - 1)
+        runCurrent()
+        assertEquals("no second ping until 120s after pong", 1, sent.size)
+        testScheduler.advanceTimeBy(1)
+        runCurrent()
+        assertEquals("second ping fires 120s after pong", 2, sent.size)
+        assertEquals("X", sent[1].targetDeviceId)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_twoConsecutiveMissedPings_escalateUnknownToStaleToFailed() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        assertSame(PeerHealth.Unknown, auth.peerHealth.value["X"])
+
+        // First ping at t=120s, no pong, timeout at t=130s -> Stale.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals("first ping fires", 1, sent.size)
+        testScheduler.advanceTimeBy(PING_TIMEOUT_MS)
+        runCurrent()
+        assertSame(PeerHealth.Stale, auth.peerHealth.value["X"])
+
+        // Second cycle: next ping at t=250s, timeout at t=260s -> Failed.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals("second ping fires", 2, sent.size)
+        testScheduler.advanceTimeBy(PING_TIMEOUT_MS)
+        runCurrent()
+        assertSame(PeerHealth.Failed, auth.peerHealth.value["X"])
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_offlinePeer_isSkipped_noPingsFired() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        auth.notifyPeerOffline("X")
+        runCurrent()
+        assertSame(PeerHealth.Offline, auth.peerHealth.value["X"])
+
+        // Advance well past the cadence interval. The cadence entry has been
+        // torn down on offline; even if a tick fired, the OFFLINE check
+        // would skip the send.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS * 3)
+        runCurrent()
+        assertEquals("no ping issued to OFFLINE peer", 0, sent.size)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_frameReceivedMidWindow_resetsTheNextPingTimer() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+
+        // At t=100s a real frame arrives — reschedule for 100 + 120 = 220s.
+        testScheduler.advanceTimeBy(100_000)
+        auth.notifyFrameReceived("X")
+        runCurrent()
+
+        // At t=120s (the original schedule) no ping should fire.
+        testScheduler.advanceTimeBy(20_000)
+        runCurrent()
+        assertEquals("frame at t=100 must push ping past t=120", 0, sent.size)
+
+        // At t=220s the rescheduled ping fires.
+        testScheduler.advanceTimeBy(99_999)
+        runCurrent()
+        assertEquals("no ping just before t=220", 0, sent.size)
+        testScheduler.advanceTimeBy(1)
+        runCurrent()
+        assertEquals("ping fires at t=220 (reset by frame)", 1, sent.size)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_sendCompletedMidWindow_resetsTheNextPingTimer_sameAsFrameReceived() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+
+        testScheduler.advanceTimeBy(60_000)
+        auth.notifySendCompleted("X")
+        runCurrent()
+
+        // Original schedule was t=120s; new schedule is t=60+120 = 180s.
+        testScheduler.advanceTimeBy(60_000) // now t=120s
+        runCurrent()
+        assertEquals("send-completed at t=60 must reschedule past t=120", 0, sent.size)
+
+        testScheduler.advanceTimeBy(60_000) // now t=180s
+        runCurrent()
+        assertEquals("ping fires at t=180 (60s + 120s)", 1, sent.size)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_inFlightPing_isNotInterruptedByActivity() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+
+        // First ping fires at t=120s; timeout armed.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals(1, sent.size)
+        val nonce = sent[0].nonce
+
+        // 5s into the timeout, a frame arrives. The cadence MUST NOT cancel
+        // the timeout (would leak the tracker entry); the in-flight ping
+        // settles via pong or timeout. The frame still promotes the peer
+        // through the reducer.
+        testScheduler.advanceTimeBy(5_000)
+        auth.notifyFrameReceived("X")
+        runCurrent()
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        // Pong within the 10s deadline still works (4s more = 9s in total).
+        testScheduler.advanceTimeBy(4_000)
+        auth.notifyPongReceived(nonce)
+        runCurrent()
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_offlineToUnknownViaRelayPeerOnline_restartsCadence() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        auth.notifyPeerOffline("X")
+        runCurrent()
+        assertSame(PeerHealth.Offline, auth.peerHealth.value["X"])
+
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        assertSame(PeerHealth.Unknown, auth.peerHealth.value["X"])
+
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals("cadence resumes after relay-peer-online resurrects peer", 1, sent.size)
+        assertEquals("X", sent[0].targetDeviceId)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_unknownNonceInNotifyPongReceived_isASilentNoOp() = runTest {
+        val (auth, _, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        // No ping in flight yet — pong with a fabricated nonce is ignored.
+        auth.notifyPongReceived("fabricated-nonce")
+        runCurrent()
+        assertSame(PeerHealth.Unknown, auth.peerHealth.value["X"])
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_multiplePeers_runIndependentCadenceLoops() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        testScheduler.advanceTimeBy(30_000)        // t=30
+        auth.notifyPeerOnline("Y")                 // Y due at 30 + 120 = 150
+        runCurrent()
+
+        testScheduler.advanceTimeBy(90_000)        // t=120 — X due now
+        runCurrent()
+        assertEquals("X fires at t=120", 1, sent.size)
+        assertEquals("X", sent[0].targetDeviceId)
+
+        testScheduler.advanceTimeBy(30_000)        // t=150 — Y due now
+        runCurrent()
+        assertEquals("Y fires at t=150 (30 + 120)", 2, sent.size)
+        assertEquals("Y", sent[1].targetDeviceId)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_doesNotFire_whenAuthorityHasNoPingTracker() = runTest {
+        // Skeleton-mode (no tracker injected) — the existing two-arg
+        // constructor path used by every Task 15 test. notifyPeerOnline
+        // should still seed peer-health (Unknown) but no ping should fire,
+        // because ensureCadenceFor short-circuits when the tracker is null.
+        val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS * 3)
+        runCurrent()
+        // No assertion on sent: we have no tracker to capture from. The
+        // assertion here is that the test doesn't hang (no ping coroutine
+        // waiting to fire) and the peer-health state is the expected
+        // skeleton-mode value.
+        assertSame(PeerHealth.Unknown, auth.peerHealth.value["X"])
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun cadence_shutdownCancelsAllJobs_noLeakedCoroutines() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        auth.notifyPeerOnline("Y")
+        runCurrent()
+
+        // Pre-shutdown: each peer has an armed pingJob counting down to 120s.
+        // Drive halfway through the first cycle to prove the jobs are alive.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS / 2)
+        runCurrent()
+        assertEquals("no pings fired yet at t=60s", 0, sent.size)
+
+        auth.shutdown()
+        runCurrent()
+
+        // Post-shutdown: advance well past the cadence interval. No new
+        // pings should fire — every cadence job was cancelled by shutdown.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS * 5)
+        runCurrent()
+        assertEquals("no pings fire after shutdown", 0, sent.size)
+    }
+
+    @Test
+    fun cadence_shutdownClearsInFlightTimeout() = runTest {
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        // Drive to first ping fire (timeout job armed).
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals(1, sent.size)
+        val healthBeforeShutdown = auth.peerHealth.value["X"]
+
+        auth.shutdown()
+        runCurrent()
+        // Past the original timeout deadline: if the timeout job had not
+        // been cancelled, peerHealth would have escalated UNKNOWN -> STALE
+        // here. Since shutdown cancelled it, peerHealth stays as it was.
+        testScheduler.advanceTimeBy(PING_TIMEOUT_MS * 2)
+        runCurrent()
+        assertSame(
+            "shutdown must cancel the in-flight timeout job",
+            healthBeforeShutdown,
+            auth.peerHealth.value["X"],
+        )
+    }
+
+    @Test
+    fun cadence_notifyPongReceived_afterShutdown_isSilentlyDropped() = runTest {
+        // Symmetric to postShutdown_notifyCallsAreSilentlyDropped_andStatePreserved
+        // but exercises the pong path that was added in Task 16. After
+        // shutdown, the cancelled scope rejects new launches, so the late
+        // pong leaves both StateFlows untouched.
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        // Send a ping so a nonce is in-flight, then capture state, shut down,
+        // then deliver the pong AFTER shutdown.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals(1, sent.size)
+        val nonce = sent[0].nonce
+        val healthBeforeShutdown = auth.peerHealth.value["X"]
+
+        auth.shutdown()
+        runCurrent()
+
+        auth.notifyPongReceived(nonce)
+        runCurrent()
+
+        // The post-shutdown pong must NOT promote the peer (no PongReceived
+        // dispatch), and must not throw.
+        assertSame(
+            "post-shutdown pong must leave peerHealth unchanged",
+            healthBeforeShutdown,
+            auth.peerHealth.value["X"],
+        )
+    }
+
+    @Test
+    fun cadence_relayListenerHandlesPeerPongWireMessage() = runTest {
+        val (auth, signaling, sent) =
+            buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        val listener = signaling.listenerSlot.captured
+
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        // Drive to first ping fire so we know the nonce.
+        testScheduler.advanceTimeBy(BG_PING_INTERVAL_MS)
+        runCurrent()
+        assertEquals(1, sent.size)
+        val nonce = sent[0].nonce
+
+        // Simulate the relay routing back a peer-pong wire frame. The
+        // listener pulls "nonce" out and forwards to notifyPongReceived;
+        // peerHealth should promote to Healthy.
+        val pongJson = mockk<JSONObject>()
+        every { pongJson.optString("type") } returns "peer-pong"
+        every { pongJson.optString("nonce", "") } returns nonce
+        listener.onMessage(RelayMessage.Text(pongJson))
+        runCurrent()
+
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        auth.shutdown()
     }
 }
 
