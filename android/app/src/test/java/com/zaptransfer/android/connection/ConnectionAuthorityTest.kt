@@ -1159,6 +1159,30 @@ class ConnectionAuthorityTest {
     // The cadence helper [buildCadenceAuthority] supplies a captured `sent`
     // list so we can introspect the register-rendezvous frame the ladder
     // emits via the mocked SignalingClient.send adapter.
+    //
+    // Two test-suite-wide gotchas apply across this and the Task 16 cadence
+    // section above (consolidated here for the deferred Task 17 fold-ins):
+    //
+    //   1. Use `runCurrent()`, NOT `advanceUntilIdle()`, between notify
+    //      calls and explicit time advancements. `advanceUntilIdle` can
+    //      hop onto the cadence's `delay(BG_PING_INTERVAL_MS)` and
+    //      reschedule forever in virtual time, OOMing the JVM. (Same
+    //      gotcha called out in the Task 16 KDoc above.)
+    //   2. Mockk introspection (`verify`, especially `capture(list)`)
+    //      against the relaxed [SignalingClient] mock while the ladder /
+    //      cadence supervisor scope is still alive triggers a test-JVM
+    //      OOM under [StandardTestDispatcher] (~140s heap exhaustion in
+    //      isolation). Drain the ladder to exhaustion AND call
+    //      `auth.shutdown()` BEFORE introspecting. Plain-matcher `verify`
+    //      with no `capture` is also fine post-shutdown; capture against
+    //      a relaxed mock is the specific OOM trap.
+    //   3. `isReturnDefaultValues = true` (see app/build.gradle.kts) makes
+    //      `org.json.JSONObject` an opaque default mock — its
+    //      `put`/`optString`/etc. are no-ops returning defaults, so wire-
+    //      frame *content* assertions (matching Chrome JS's
+    //      `registerFrame.rendezvousId === 'self-device-id'`) cannot be
+    //      expressed without Robolectric or a gson workaround. The
+    //      Android tests assert call-count invariants instead.
 
     @Test
     fun ladder_kicksWhenAPeerCrossesIntoFailed() = runTest {
@@ -1183,6 +1207,41 @@ class ConnectionAuthorityTest {
 
         auth.shutdown()
         // Verify the disconnect/connect calls happened during Rung 2.
+        verify(atLeast = 1) { signaling.client.disconnect() }
+        verify(atLeast = 1) { signaling.client.connect(any()) }
+    }
+
+    @Test
+    fun ladder_rung1_invokesSignalingClientSendExactlyOnce() = runTest {
+        // Android counterpart of Chrome JS lines 619-625 (which assert
+        // `registerFrame.rendezvousId === 'self-device-id'`). Wire-frame
+        // *content* is unverifiable here (gotcha #3 above), so assert the
+        // structural invariant: Rung 1 dispatches exactly one outbound
+        // JSON frame on first kick.
+        //
+        // The `send(any()) exactly = 1` assertion is load-bearing on Rung
+        // 2 NOT calling `send` (it calls `disconnect()`/`connect()`
+        // separately — see ConnectionAuthority.kt:706-707). The
+        // disconnect/connect verifies pin that Rung 2 actually ran, so a
+        // future Rung-2 refactor that adds a `send` call breaks this test
+        // unambiguously (count goes 1→2 AND Rung 2 still happened).
+        val (auth, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        auth.notifyPingMissed("X") // Unknown -> Stale
+        auth.notifyPingMissed("X") // Stale -> Failed (kicks ladder)
+        runCurrent()
+        assertNotNull("ladder kicked on peer->FAILED", auth.currentLadder)
+
+        // Drain to exhaustion and shut down before introspecting the mock
+        // (gotcha #2 above).
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        auth.shutdown()
+
+        verify(exactly = 1) { signaling.client.send(any()) }
         verify(atLeast = 1) { signaling.client.disconnect() }
         verify(atLeast = 1) { signaling.client.connect(any()) }
     }
@@ -1215,6 +1274,152 @@ class ConnectionAuthorityTest {
         )
 
         // Drain to exhaustion before shutdown so we don't leak.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        auth.shutdown()
+    }
+
+    @Test
+    fun ladder_singleFlight_secondKickEmitsNoExtraSignalingClientSend() = runTest {
+        // Belt-and-suspenders for [ladder_singleFlight_secondFailedPeer...].
+        // That test asserts `currentLadder` reference identity stays stable
+        // across a second peer-FAILED kick; this one proves no extra
+        // outbound wire frame leaks either. Android counterpart of Chrome
+        // JS lines 645-653 — the count-based assertion captures the
+        // single-flight invariant without needing JSONObject content
+        // (gotcha #3 above).
+        //
+        // Like the rung1 test above, this assertion is load-bearing on
+        // Rung 2 NOT calling `send`. The disconnect/connect verifies pin
+        // that Rung 2 ran exactly once (not twice), so a future bug where
+        // the absorbed kick somehow advanced through Rungs 1+2 again
+        // would fail loudly.
+        val (auth, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+
+        auth.notifyPeerOnline("X")
+        auth.notifyPeerOnline("Y")
+        runCurrent()
+
+        // Drive X -> FAILED -> kick #1 (Rung 1 dispatches one send).
+        auth.notifyPingMissed("X")
+        auth.notifyPingMissed("X")
+        runCurrent()
+
+        // Drive Y -> FAILED -> would-be-kick #2. Single-flight discipline
+        // must absorb it without dispatching a second register-rendezvous.
+        auth.notifyPingMissed("Y")
+        auth.notifyPingMissed("Y")
+        runCurrent()
+
+        // Drain + shutdown before introspecting (gotcha #2 above).
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        auth.shutdown()
+
+        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.disconnect() }
+        verify(exactly = 1) { signaling.client.connect(any()) }
+    }
+
+    @Test
+    fun ladder_singleFlight_peerFailedThenSelfReconnectingShareTheLadder() = runTest {
+        // Reverse-ordering mirror of
+        // [ladder_singleFlight_selfReconnectingAndPeerFailedShareTheLadder]
+        // — that one tests self-trigger first; this one tests peer-trigger
+        // first then self. The single-flight guard at
+        // ConnectionAuthority.kt:564-566 is symmetric by construction, but
+        // symmetric-by-inspection isn't symmetric-by-test.
+        val (auth, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        assertSame(SelfState.Online, auth.selfState.value)
+
+        // Peer-trigger fires first: drive X -> FAILED -> kick #1.
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        auth.notifyPingMissed("X")
+        auth.notifyPingMissed("X")
+        runCurrent()
+        val firstLadder = auth.currentLadder
+        assertNotNull("peer->FAILED transition kicks the ladder", firstLadder)
+        assertSame(PeerHealth.Failed, auth.peerHealth.value["X"])
+
+        // Self-trigger second: WsClosed would normally kick a ladder via
+        // the Online->Reconnecting transition's post-hook, but
+        // single-flight discipline must absorb it into the existing
+        // instance.
+        auth.notifyWsClosed()
+        runCurrent()
+        assertSame(
+            "peer+self triggers must share the in-flight ladder regardless of order",
+            firstLadder,
+            auth.currentLadder,
+        )
+
+        // Drain + shutdown.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        auth.shutdown()
+
+        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.disconnect() }
+        verify(exactly = 1) { signaling.client.connect(any()) }
+    }
+
+    @Test
+    fun ladder_singleFlight_selfReconnectingAndPeerFailedShareTheLadder() = runTest {
+        // Belt-and-suspenders for the two-FAILED-peers single-flight test:
+        // verify that a self-trigger and a peer-trigger landing in the same
+        // tick share one ladder rather than starting two. The Chrome JS
+        // counterpart tests both orderings too, but the assertion is the
+        // same — `currentLadder` reference identity stays stable across the
+        // second trigger.
+        //
+        // Sequence: drive self ONLINE, then notifyWsClosed (Online ->
+        // Reconnecting kicks ladder #1 with triggerPeerId=null), then drive
+        // a peer through Stale -> Failed. The peer->FAILED transition would
+        // normally kick a peer-trigger ladder; the single-flight guard in
+        // [ConnectionAuthority.kickLadder] absorbs it.
+        val (auth, _, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        assertSame(SelfState.Online, auth.selfState.value)
+
+        // Seed peer X so it can later go Failed.
+        auth.notifyPeerOnline("X")
+        runCurrent()
+
+        // Self-trigger fires first: Online -> Reconnecting kicks ladder #1.
+        auth.notifyWsClosed()
+        runCurrent()
+        val firstLadder = auth.currentLadder
+        assertNotNull("self->RECONNECTING transition kicks the ladder", firstLadder)
+        assertTrue(
+            "selfState moved into Reconnecting on WsClosed",
+            auth.selfState.value is SelfState.Reconnecting,
+        )
+
+        // Now drive X -> FAILED. The peer-trigger normally kicks a ladder
+        // too, but single-flight discipline must absorb it into the
+        // existing instance.
+        auth.notifyPingMissed("X") // Unknown -> Stale
+        auth.notifyPingMissed("X") // Stale -> Failed (would normally kick)
+        runCurrent()
+        assertSame(PeerHealth.Failed, auth.peerHealth.value["X"])
+        assertSame(
+            "self+peer triggers must share the in-flight ladder",
+            firstLadder,
+            auth.currentLadder,
+        )
+
+        // Drain to exhaustion before shutdown so we don't leak coroutines.
+        // RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS = 20s; the +1s margin matches
+        // the existing two-FAILED-peers test.
         testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
         runCurrent()
         auth.shutdown()
@@ -1369,6 +1574,73 @@ class ConnectionAuthorityTest {
         testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
         runCurrent()
         assertNull(auth.currentLadder)
+    }
+
+    @Test
+    fun ladder_shutdownMidRung_propagatesCancellationCleanly_noLeakedCadence() = runTest {
+        // Kotlin-specific structured-concurrency hygiene. No JS counterpart
+        // (JS has no CancellationException). Extends
+        // [ladder_shutdownCancelsTheInFlightLadder] by advancing 2s INTO
+        // Rung 1's 5s budget before calling shutdown, so the rung action
+        // is mid-flight (suspended inside
+        // `withTimeoutOrNull(5_000) { _peerHealth.first { ... } }`) when
+        // shutdown lands. Shutdown:
+        //   1. cancels the ladder via its own latch (currentLadder.cancel()),
+        //   2. clears currentLadder = null,
+        //   3. cancels scope (parent of `launch { ladder.run() }`).
+        //
+        // Cancelling the worker scope propagates CE through the
+        // supervisorScope inside RecoveryLadder.runInternal: the child
+        // async's CE becomes ActionOutcome.Cancelled, and the
+        // supervisorScope block then re-receives CE because its parent
+        // launch is cancelled. That CE bubbles out of run() as part of
+        // normal structured concurrency — runTest's watchdog would flag a
+        // swallowed-then-rethrown CE as a test failure, so the test
+        // completing without an unhandled-exception report IS the
+        // structural assertion.
+        //
+        // Integration assertions: currentLadder is null after shutdown;
+        // post-shutdown virtual-time advance produces NO new outbound
+        // peer-pings AND no peerHealth mutations (catches both leaked
+        // cadence reschedules and leaked timeout jobs).
+        val (auth, _, sent) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        auth.notifyPingMissed("X")
+        auth.notifyPingMissed("X")
+        runCurrent()
+        assertNotNull("ladder kicked on peer->FAILED", auth.currentLadder)
+
+        // Advance 2s into Rung 1. The rung is now suspended on the
+        // peer-Healthy await inside withTimeoutOrNull.
+        testScheduler.advanceTimeBy(2_000L)
+        runCurrent()
+        assertNotNull("ladder still in flight 2s into Rung 1", auth.currentLadder)
+        val sentBeforeShutdown = sent.size
+
+        auth.shutdown()
+        runCurrent()
+        assertNull("shutdown cleared currentLadder", auth.currentLadder)
+        // Snapshot peerHealth immediately post-shutdown — a leaked timeout
+        // job would mutate it during the post-shutdown advance below.
+        val peerHealthAfterShutdown = auth.peerHealth.value
+
+        // Past both budgets plus a generous margin: no zombie cadence
+        // reschedules (sent stays at sentBeforeShutdown), no leaked
+        // timeout jobs (peerHealth stays at the post-shutdown snapshot).
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 5_000L)
+        runCurrent()
+        assertEquals(
+            "no new sends post-shutdown — cadence + ladder fully drained",
+            sentBeforeShutdown,
+            sent.size,
+        )
+        assertSame(
+            "peerHealth must not mutate post-shutdown — no leaked timeout/rung jobs",
+            peerHealthAfterShutdown,
+            auth.peerHealth.value,
+        )
     }
 
     @Test
