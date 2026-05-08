@@ -7,12 +7,16 @@ import com.zaptransfer.android.webrtc.ConnectionState
 import com.zaptransfer.android.webrtc.RelayMessage
 import com.zaptransfer.android.webrtc.SignalingClient
 import com.zaptransfer.android.webrtc.SignalingListener
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineDispatcher
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -21,6 +25,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import javax.inject.Inject
@@ -47,9 +53,10 @@ private const val TAG = "ConnectionAuthority"
  *      peer in [peerHealth] is pinged every [BG_PING_INTERVAL_MS] after
  *      its last activity; on [PING_TIMEOUT_MS] without a pong, the
  *      reducer is dispatched [PeerHealthEvent.PingMissed].
- *   5. Provide `ensureSendable(peerId)` — synchronous classifier returning
- *      one of the three [SendGate] cases (Task 18 will replace with the
- *      full algorithm).
+ *   5. Provide `ensureSendable(peerId)` — full async pre-flight: HEALTHY-
+ *      with-recent-traffic skip, 5s peer-ping probe, recovery-ladder
+ *      kick on probe failure, await-and-re-probe on ladder success.
+ *      Returns one of the three [SendGate] cases.
  *   6. Provide `requestReconnect()` — skeleton stub; Task 17 wires the
  *      recovery ladder.
  *
@@ -74,8 +81,10 @@ private const val TAG = "ConnectionAuthority"
  * Reads (`selfState.value`, `peerHealth.value`, StateFlow collection) are
  * safe from any thread — [StateFlow] is documented thread-safe.
  *
- * [ensureSendable] reads only the current snapshots — no dispatch — so it
- * is safe to call from any thread, including the send path's caller.
+ * [ensureSendable] is `suspend` (Task 18). It is safe to invoke from any
+ * caller's coroutine context: the per-peer coalescing map mutation is
+ * guarded by [preflightMutex], and the inner pre-flight algorithm runs
+ * on [scope] via `scope.async` so its reducer dispatches stay confined.
  *
  * [shutdown] cancels the supervisor [scope] and stops observation. After
  * shutdown, further notify calls drop their dispatches silently
@@ -108,6 +117,22 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
     private val signalingClient: SignalingClient,
     private val dispatcher: CoroutineDispatcher,
     private val pingTracker: PeerPingTracker? = null,
+    /**
+     * Wall-clock source for the pre-flight `lastTrafficAt` window
+     * (Task 18 / §"Send-time pre-flight"). Tests inject a fake clock
+     * lambda to drive the 30s recent-traffic skip deterministically;
+     * production uses [System.currentTimeMillis].
+     *
+     * Why a separate lambda (vs. relying on virtual time): the cadence
+     * engine's `delay(...)` participates in [StandardTestDispatcher]
+     * virtual time, but the recent-traffic window compares wall-clock
+     * timestamps written from the worker thread. Using the test
+     * scheduler's virtual time would couple the two clocks and force
+     * pre-flight tests to advance virtual time even when probing a
+     * peer that is HEALTHY-with-recent-traffic (a path that should
+     * issue zero pings). The lambda decouples the two cleanly.
+     */
+    private val now: () -> Long = System::currentTimeMillis,
 ) {
 
     /**
@@ -177,6 +202,42 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * Cleared on pong arrival, on cadence stop, and on shutdown.
      */
     private val nonceToPeer = mutableMapOf<String, String>()
+
+    /**
+     * Per-peer wall-clock timestamp of the most recent **user-data** frame
+     * (received or sent). Updated by [notifyFrameReceived] and
+     * [notifySendCompleted]; consumed by [isHealthyWithRecentTraffic] for
+     * the pre-flight HEALTHY-with-recent-traffic skip.
+     *
+     * **Deliberately NOT updated on pong arrival** (Task 11 follow-up F,
+     * `connection-authority.js:283-297`): pongs are the cadence engine's
+     * own bookkeeping and would otherwise paper over the "no real traffic
+     * for 5 minutes" case where a probe is precisely what we want.
+     *
+     * Reads/writes happen on the single-threaded [scope], so no extra
+     * synchronization is required (per the threading contract on [scope]).
+     */
+    private val lastTrafficAt = mutableMapOf<String, Long>()
+
+    /**
+     * Per-peer pre-flight coalescing map. Concurrent [ensureSendable] calls
+     * for the same peer share the in-flight [Deferred]; the first caller
+     * drives the probe + ladder await, others just `await()` the same
+     * outcome. Cleared when the Deferred completes.
+     *
+     * Mirror of `_inflightPreflight: Map<String, Promise>` in
+     * `connection-authority.js#ensureSendable`. Prevents a clipboard burst
+     * (e.g. 5 files dragged in) from firing 5 redundant peer-pings to the
+     * same peer.
+     *
+     * Mutations are guarded by [preflightMutex] because callers can land
+     * from any coroutine context (not just [scope]) — a Mutex is the
+     * minimum-overhead serializer for the get-then-set / get-then-remove
+     * race that two concurrent [ensureSendable] calls would otherwise hit
+     * if mutating off [scope].
+     */
+    private val inflightPreflight = mutableMapOf<String, Deferred<SendGate>>()
+    private val preflightMutex = Mutex()
 
     /**
      * Recovery ladder owns "I'm trying to recover" sequencing. Non-null
@@ -345,6 +406,11 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
             dispatchPeer(peerId, PeerHealthEvent.FrameReceived)
             ensureCadenceFor(peerId)
             noteActivity(peerId)
+            // Task 18: record real user-data traffic for the recent-traffic
+            // pre-flight skip. Snapshotted on the worker thread so reads
+            // from `_isHealthyWithRecentTraffic` (also on the worker thread
+            // for the single-flight branch) see a consistent value.
+            lastTrafficAt[peerId] = now()
         }
     }
 
@@ -357,6 +423,10 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
             dispatchPeer(peerId, PeerHealthEvent.SendCompleted)
             ensureCadenceFor(peerId)
             noteActivity(peerId)
+            // Task 18: same recent-traffic bookkeeping as notifyFrameReceived
+            // — both inbound and outbound v2 frames count as proof-of-life
+            // for the 30s skip window.
+            lastTrafficAt[peerId] = now()
         }
     }
 
@@ -387,9 +457,9 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
     fun notifyPongReceived(nonce: String) {
         scope.launch {
             // Always feed the tracker — its bookkeeping is independent of
-            // the cadence engine's nonce map (Task 18 ensureSendable will
-            // await tracker promises directly), and recordPong on an
-            // unknown nonce is a harmless no-op.
+            // the cadence engine's nonce map (the Task 18 `ensureSendable`
+            // pre-flight awaits tracker promises directly), and recordPong
+            // on an unknown nonce is a harmless no-op.
             pingTracker?.recordPong(nonce)
 
             val peerId = nonceToPeer.remove(nonce) ?: return@launch
@@ -435,8 +505,8 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
 
     /**
      * Send-time pre-flight check failed for `peerId`. Drives [PeerHealth]
-     * to [PeerHealth.Failed] from any state. Wired by Task 18's
-     * `ensureSendable` upgrade.
+     * to [PeerHealth.Failed] from any state. Used by [ensureSendable]
+     * after a probe-then-ladder cycle exhausts.
      */
     fun notifyPreFlightFailed(peerId: String) =
         dispatchPeerAsync(peerId, PeerHealthEvent.PreFlightFailed)
@@ -444,38 +514,209 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
     // ── Public actions ────────────────────────────────────────────────────
 
     /**
-     * Pre-send gate. Synchronous classification based on the current
-     * [selfState] and [peerHealth] snapshots:
+     * Send-time pre-flight gate. Mirror of `_runEnsureSendable` in
+     * `extension/connection/connection-authority.js` (Chrome Task 9).
      *
-     *  - [SendGate.Ok] when [selfState] is [SelfState.Online] AND
-     *    `peerHealth[peerId]` is [PeerHealth.Healthy], [PeerHealth.Stale],
-     *    or [PeerHealth.Unknown] (or absent — UNKNOWN is the implicit
-     *    default for unseen peers).
-     *  - [SendGate.SelfOffline] when [selfState] is anything other than
-     *    [SelfState.Online].
-     *  - [SendGate.PeerUnreachable] when self is online but the peer is
-     *    [PeerHealth.Failed] or [PeerHealth.Offline]. The carried
-     *    `reason` is the literal string `"PEER_UNREACHABLE"`, matching
-     *    the JS contract.
+     * The algorithm:
+     * ```
+     * 1. selfState != ONLINE          → SelfOffline
+     * 2. peerHealth==HEALTHY AND lastTrafficAt within 30s → Ok (skip probe)
+     * 3a. probe with 5s peer-ping
+     *      pong → dispatch PongReceived (promotes peer) → Ok
+     *      timeout → continue
+     * 3b. dispatch PreFlightFailed → drives peer to FAILED, post-hook kicks
+     *      ladder; explicit kickLadder follow-through (idempotent — single-
+     *      flight guard absorbs re-entry).
+     * 3c. await currentLadder?.run(); on Cancelled / Exhausted →
+     *      PeerUnreachable; on Success → continue.
+     * 3d. re-probe; pong → Ok; otherwise PeerUnreachable.
+     * ```
      *
-     * **Skeleton form.** Task 18 will replace this with the full
-     * `ensureSendable` algorithm: recent-traffic skip, peer-ping probe,
-     * recovery-ladder trigger on failure.
+     * **Per-peer coalescing.** Concurrent calls for the same peer share
+     * one in-flight [Deferred] via [inflightPreflight]; the first caller
+     * drives the probe + ladder await, others just `await()` the same
+     * outcome. The self-offline gate (step 1) runs BEFORE the coalescing
+     * map is consulted — a self-offline answer is the same for every
+     * peer, no benefit to sharing the inflight slot.
      *
-     * Safe to call from any thread — reads only the [StateFlow] snapshots,
-     * does not dispatch.
+     * **Zero frames transmitted on a non-Ok gate.** This is the entire
+     * reason for this method existing — the caller (TransferEngine /
+     * DeviceHubViewModel) MUST NOT call `beamV2Wiring.transport.sendFile`
+     * unless the verdict is [SendGate.Ok]. See spec §"Send-time pre-flight"
+     * line 317.
+     *
+     * Safe to call from any coroutine context. The internal map mutation
+     * goes through [preflightMutex]; the probe + ladder await happen on
+     * the caller's context (suspending), with reducer dispatches going
+     * through the existing [scope] launches.
      *
      * @param peerId Target peer's device ID.
      */
-    fun ensureSendable(peerId: String): SendGate {
+    suspend fun ensureSendable(peerId: String): SendGate {
+        // Step 1: self-online gate. Cheap, applies before any per-peer
+        // coalescing — a self-offline answer is the same for every peer,
+        // no benefit to sharing the inflight slot.
         if (_selfState.value !is SelfState.Online) return SendGate.SelfOffline
-        val health = _peerHealth.value[peerId] ?: PeerHealth.Unknown
-        return when (health) {
-            PeerHealth.Healthy,
-            PeerHealth.Stale,
-            PeerHealth.Unknown -> SendGate.Ok
-            PeerHealth.Failed,
-            PeerHealth.Offline -> SendGate.PeerUnreachable(reason = "PEER_UNREACHABLE")
+
+        // Coalesce concurrent calls for the same peer. We use scope.async
+        // so the worker-thread state mutations inside `runEnsureSendable`
+        // (lastTrafficAt read, dispatch hooks) inherit the single-thread
+        // confinement; the coalescing map itself is guarded by a Mutex
+        // so off-scope callers can serialize get-then-set without racing.
+        val deferred = preflightMutex.withLock {
+            inflightPreflight[peerId]?.let { return@withLock it }
+            // Skeleton-mode: no scope to launch on once shutdown started,
+            // and no tracker means we'd just bounce off step 3a anyway.
+            // Hand the caller a synchronous PEER_UNREACHABLE to match
+            // Chrome's `_preFlightProbe` skeleton-mode short-circuit
+            // (`connection-authority.js:560-562`).
+            if (shuttingDown) {
+                val unreachable = CompletableDeferred<SendGate>().apply {
+                    complete(SendGate.PeerUnreachable("PEER_UNREACHABLE"))
+                }
+                return@withLock unreachable
+            }
+            val fresh: Deferred<SendGate> = scope.async { runEnsureSendable(peerId) }
+            inflightPreflight[peerId] = fresh
+            fresh.invokeOnCompletion {
+                // Clear only if the entry is still ours — defensive; in
+                // practice the Deferred reference identity stays stable.
+                scope.launch {
+                    preflightMutex.withLock {
+                        if (inflightPreflight[peerId] === fresh) {
+                            inflightPreflight.remove(peerId)
+                        }
+                    }
+                }
+            }
+            fresh
+        }
+        return deferred.await()
+    }
+
+    /**
+     * Inner pre-flight body — separated so [ensureSendable] can wrap it
+     * with the coalescing map without nesting the algorithm.
+     *
+     * Runs on [scope] (the single-thread confinement) via the
+     * `scope.async { ... }` launch in [ensureSendable]. Reads of
+     * [_peerHealth] / [lastTrafficAt] are therefore consistent with any
+     * concurrent reducer dispatch; the dispatchPeer / kickLadder calls
+     * here piggyback on the same worker thread.
+     */
+    private suspend fun runEnsureSendable(peerId: String): SendGate {
+        // Step 2: HEALTHY + recent traffic skip. Worker-thread read of
+        // both maps — no race with notifyFrameReceived / notifySendCompleted.
+        if (isHealthyWithRecentTraffic(peerId)) {
+            return SendGate.Ok
+        }
+
+        // Step 3a: probe with a 5s peer-ping. Skeleton-mode (no tracker
+        // and/or shutting down) cannot probe; treat as unreachable rather
+        // than waving the send through.
+        val firstProbe = preFlightProbe(peerId)
+        if (firstProbe) return SendGate.Ok
+
+        // Step 3b: probe failed. Mark FAILED (idempotent if already FAILED)
+        // and ensure a recovery ladder is running. The reducer's
+        // pre-flight-failed event drives any non-OFFLINE state directly to
+        // FAILED. The [dispatchPeer] post-hook kicks [kickLadder] only on
+        // the OLD→FAILED transition; if the peer was already FAILED we
+        // still need a ladder so we explicitly call [kickLadder] after
+        // (idempotent — a running ladder is reused).
+        dispatchPeer(peerId, PeerHealthEvent.PreFlightFailed)
+        kickLadder(triggerPeerId = peerId, reason = "pre-flight-failed")
+
+        // Step 3c: await the in-flight ladder. The ladder owns its own
+        // budget timers and resolves with `ok=false` on exhaustion /
+        // cancellation. No ladder running (skeleton-mode where kickLadder
+        // bailed because shutdown started) is treated as a synchronous
+        // failure.
+        val ladder = currentLadder ?: return SendGate.PeerUnreachable("PEER_UNREACHABLE")
+        val ladderResult = try {
+            ladder.run()
+        } catch (ce: CancellationException) {
+            // Structured-concurrency shutdown — propagate so the caller's
+            // scope tears down. Catching CE as a domain outcome would mask
+            // parent-cancellation as PEER_UNREACHABLE and leak the
+            // launched-from-here `scope.async` chain.
+            throw ce
+        } catch (e: Exception) {
+            // RecoveryLadder.run is documented "never throws", but defend
+            // against it anyway.
+            Log.w(TAG, "ensureSendable: ladder.run() threw", e)
+            return SendGate.PeerUnreachable("PEER_UNREACHABLE")
+        }
+        if (!ladderResult.ok) return SendGate.PeerUnreachable("PEER_UNREACHABLE")
+
+        // Step 3d: ladder succeeded. Re-probe one more time. The ladder's
+        // success path already dispatched RecoverySucceeded which dropped
+        // the peer to UNKNOWN, so the HEALTHY-skip branch won't short-
+        // circuit; we issue a fresh peer-ping to confirm the send path
+        // before the caller commits to encoding frames.
+        val retryProbe = preFlightProbe(peerId)
+        return if (retryProbe) SendGate.Ok else SendGate.PeerUnreachable("PEER_UNREACHABLE")
+    }
+
+    /**
+     * Step-2 helper: returns true iff the peer is [PeerHealth.Healthy] AND
+     * a recent traffic timestamp falls within [RECENT_TRAFFIC_WINDOW_MS].
+     *
+     * MUST be called on [scope] (it is — invoked from [runEnsureSendable]
+     * which runs via `scope.async`).
+     */
+    private fun isHealthyWithRecentTraffic(peerId: String): Boolean {
+        if (_peerHealth.value[peerId] !== PeerHealth.Healthy) return false
+        val last = lastTrafficAt[peerId] ?: return false
+        return (now() - last) < RECENT_TRAFFIC_WINDOW_MS
+    }
+
+    /**
+     * Issue a single peer-ping racing the tracker's resolve against a 5s
+     * timer. Returns `true` on a pong landing inside the window, `false`
+     * on either the timer expiring first or skeleton-mode (no tracker /
+     * shutting down).
+     *
+     * Implementation note: the cadence-loop [pingTracker] has its own 10s
+     * timeoutMs. Reusing it for pre-flight is fine — we ignore the
+     * tracker's longer timeout by resolving on whichever lands first
+     * (pong via `await()`, or our 5s `withTimeoutOrNull`). A late pong
+     * after our timer fires is still safe: the tracker cleans up its own
+     * pending entry on `recordPong` / `sweepExpired`.
+     *
+     * Per Task 11 follow-up F: a successful pre-flight pong is real proof
+     * of peer life and SHOULD promote peerHealth through the reducer. We
+     * deliberately do NOT register the nonce in [nonceToPeer] (that map
+     * is the cadence engine's bookkeeping; mixing pre-flight nonces in
+     * would complicate the cadence-engine invariants). Instead, we
+     * explicitly dispatch [PeerHealthEvent.PongReceived] directly when
+     * the tracker promise resolves inside this function.
+     *
+     * MUST be called on [scope].
+     */
+    private suspend fun preFlightProbe(peerId: String): Boolean {
+        val tracker = pingTracker ?: return false
+        if (shuttingDown) return false
+
+        val (_, deferred) = tracker.sendPing(peerId, now())
+        // Race the tracker's deferred against our 5s timer. Note that the
+        // virtual-time `delay(...)` inside `withTimeoutOrNull` resolves
+        // via the cadence engine's StandardTestDispatcher in tests, so the
+        // tracker's wall-clock-based timeout is irrelevant — pre-flight's
+        // shorter window always wins or the pong does.
+        val result = withTimeoutOrNull(PRE_FLIGHT_PING_TIMEOUT_MS) {
+            deferred.await()
+        }
+        return when (result) {
+            is PingResult.Pong -> {
+                // Pong landed within our 5s window — promote the peer to
+                // HEALTHY through the reducer (Task 11 follow-up F).
+                dispatchPeer(peerId, PeerHealthEvent.PongReceived)
+                true
+            }
+            // null = our 5s timer fired first (or the tracker resolved
+            // TimedOut on its own 10s deadline; either way, no pong).
+            else -> false
         }
     }
 
@@ -527,6 +768,17 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         }
         peerCadence.clear()
         nonceToPeer.clear()
+        // Cancel any in-flight pre-flight Deferreds so callers awaiting
+        // them resolve via CancellationException rather than hanging on a
+        // never-completed Deferred. The map is read off-scope (via
+        // [preflightMutex]); here we touch it from the [shutdown] caller's
+        // thread, which is racy in the strict sense but safe in practice
+        // — the worst case is a concurrent ensureSendable observes the
+        // pre-clear snapshot and bounces off the `shuttingDown` guard
+        // inside the lock instead.
+        for (deferred in inflightPreflight.values) deferred.cancel()
+        inflightPreflight.clear()
+        lastTrafficAt.clear()
         scope.cancel()
     }
 
@@ -850,6 +1102,12 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      *   - No tracker (skeleton-mode) — there is no transport.
      */
     private fun firePingTick(peerId: String) {
+        // Defend against a `delay(BG_PING_INTERVAL_MS)` that resumes during
+        // shutdown — without this, a pingJob could fire one wire frame after
+        // shutdown intent (cooperative cancellation handles the suspended
+        // resumption cleanly, but `tracker.sendPing` is non-suspending so
+        // the actual send call would still go out).
+        if (shuttingDown) return
         val entry = peerCadence[peerId] ?: return
         entry.pingJob = null
 

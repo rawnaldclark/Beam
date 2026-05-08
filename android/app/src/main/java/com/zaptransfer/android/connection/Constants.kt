@@ -57,8 +57,23 @@ const val PING_TIMEOUT_MS: Long = 10_000L
  * unconditionally pushes the next ping out by `BG_PING_INTERVAL_MS` on any
  * activity — this 30s window only governs the send-path skip.
  */
-@Suppress("unused") // Defined now for cross-platform parity; Task 18 wires the consumer.
 const val RECENT_TRAFFIC_WINDOW_MS: Long = 30_000L
+
+/**
+ * Per-probe deadline for the send-time pre-flight peer-ping, in milliseconds.
+ *
+ * `ensureSendable` races a 5s timer against the [PeerPingTracker]'s own (10s)
+ * timeout. We use the shorter window because pre-flight is on the user's
+ * critical send path — a 5s skid before failing over to the recovery ladder
+ * is the spec budget; the tracker's longer cadence-engine timeout doesn't
+ * apply here. (The tracker's deferred is still safe to await in parallel:
+ * whichever lands first wins, and a late tracker resolution after our timer
+ * has fired is harmless.)
+ *
+ * Mirrors `PRE_FLIGHT_PING_TIMEOUT_MS` in `extension/connection/connection-authority.js`.
+ * Spec: §"Send-time pre-flight" step 3a.
+ */
+const val PRE_FLIGHT_PING_TIMEOUT_MS: Long = 5_000L
 
 /**
  * Recovery ladder Rung 1 budget, in milliseconds.

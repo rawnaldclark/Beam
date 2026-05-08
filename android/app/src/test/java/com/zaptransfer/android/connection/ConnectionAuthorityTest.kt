@@ -15,6 +15,7 @@ import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
@@ -275,109 +276,19 @@ class ConnectionAuthorityTest {
         assertSame(PeerHealth.Unknown, auth.peerHealth.value["Y"])
     }
 
-    // ── ensureSendable ──────────────────────────────────────────────────────
+    // ── ensureSendable: pre-task-18 skeleton-only invariants ───────────────
 
     @Test
     fun ensureSendable_returnsSelfOffline_whenSelfStateIsNotOnline() = runTest {
+        // Step 1 of the algorithm short-circuits BEFORE the per-peer
+        // coalescing map is consulted, so this test stays valid under the
+        // async upgrade — no probe, no ladder, no virtual-time advancement
+        // needed.
         val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
         advanceUntilIdle()
         // selfState is Offline at construction.
         val result = auth.ensureSendable("X")
         assertSame(SendGate.SelfOffline, result)
-    }
-
-    @Test
-    fun ensureSendable_returnsSelfOffline_whenPeerIsFailedAndLadderHasMovedSelfToReconnecting() = runTest {
-        // TODO(Task 18): rewrite this test once the async ensureSendable
-        // upgrade lands. The current assertion is a TRANSIENT artefact of
-        // the Task 17 ↔ Task 15 interaction described below.
-        //
-        // Pre-Task 17 this test asserted PEER_UNREACHABLE when a peer is
-        // FAILED and self is ONLINE. Task 17 wires the recovery ladder to
-        // kick on the peer→FAILED transition and dispatch RecoveryBegan,
-        // which drives selfState ONLINE → RECONNECTING. With self no
-        // longer ONLINE, the skeleton classifier returns SELF_OFFLINE
-        // (matching Chrome's same-precedence rule: self-not-online wins
-        // over peer-unreachable).
-        //
-        // Task 18 (the async ensureSendable upgrade) will return
-        // PEER_UNREACHABLE only after the ladder actually exhausts its
-        // rungs — at which point the per-call await of the ladder's
-        // settle decides the gate. For the synchronous skeleton, the
-        // SELF_OFFLINE gate is the right read mid-ladder.
-        //
-        // Spec reviewer flagged this as a "transient skeleton-period
-        // assertion"; the rename + this comment exist to make sure Task 18
-        // doesn't ship without revisiting the contract.
-        val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
-        auth.notifyWsOpening()
-        auth.notifyAuthComplete()
-        // Unknown -> Stale -> Failed (Failed transition kicks the ladder,
-        // which dispatches RecoveryBegan, moving selfState to Reconnecting).
-        auth.notifyPingMissed("X")
-        auth.notifyPingMissed("X")
-        advanceUntilIdle()
-        assertSame(PeerHealth.Failed, auth.peerHealth.value["X"])
-        assertTrue(
-            "ladder-kickoff dispatched RecoveryBegan on peer-FAILED",
-            auth.selfState.value is SelfState.Reconnecting,
-        )
-
-        val result = auth.ensureSendable("X")
-        assertSame(
-            "self-not-online wins over peer-unreachable in the skeleton classifier",
-            SendGate.SelfOffline,
-            result,
-        )
-    }
-
-    @Test
-    fun ensureSendable_returnsPeerUnreachable_whenPeerIsOffline() = runTest {
-        val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
-        auth.notifyWsOpening()
-        auth.notifyAuthComplete()
-        auth.notifyPeerOffline("X")
-        advanceUntilIdle()
-
-        val result = auth.ensureSendable("X")
-        assertTrue(result is SendGate.PeerUnreachable)
-    }
-
-    @Test
-    fun ensureSendable_returnsOk_whenSelfOnlineAndPeerHealthy() = runTest {
-        val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
-        auth.notifyWsOpening()
-        auth.notifyAuthComplete()
-        auth.notifyFrameReceived("X")
-        advanceUntilIdle()
-        assertSame(SendGate.Ok, auth.ensureSendable("X"))
-    }
-
-    @Test
-    fun ensureSendable_returnsOk_whenSelfOnlineAndPeerStale() = runTest {
-        val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
-        auth.notifyWsOpening()
-        auth.notifyAuthComplete()
-        auth.notifyFrameReceived("X") // Healthy
-        auth.notifyPingMissed("X")    // Stale
-        advanceUntilIdle()
-        assertSame(PeerHealth.Stale, auth.peerHealth.value["X"])
-        assertSame(SendGate.Ok, auth.ensureSendable("X"))
-    }
-
-    @Test
-    fun ensureSendable_returnsOk_whenSelfOnlineAndPeerUnknown_includingUnseenPeer() = runTest {
-        val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
-        auth.notifyWsOpening()
-        auth.notifyAuthComplete()
-        advanceUntilIdle()
-        // Peer never seen -> implicit Unknown -> Ok
-        assertSame(SendGate.Ok, auth.ensureSendable("never-seen"))
     }
 
     // ── requestReconnect ────────────────────────────────────────────────────
@@ -1710,6 +1621,373 @@ class ConnectionAuthorityTest {
         // Drain so we don't leak coroutines.
         testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
         runCurrent()
+        auth.shutdown()
+    }
+
+    // ── Task 18: ensureSendable async upgrade ──────────────────────────────
+    //
+    // Mirrors `extension/test/connection-authority.test.js`'s
+    // `describe('ConnectionAuthority: ensureSendable (Task 9 pre-flight)')`
+    // block test-for-test, with these adaptations:
+    //
+    //   - Wire-frame *content* assertions ("registerFrame.rendezvousId ===
+    //     'self-device-id'") become call-count assertions on the captured
+    //     `sent: MutableList<PeerPingMessage>` list — that list IS the wire-
+    //     shape capture (the typed message, not a JSONObject), so we can
+    //     introspect type/targetDeviceId/rendezvousId directly without
+    //     fighting the relaxed JSONObject mock (gotcha #3 from the Task 17
+    //     KDoc above).
+    //
+    //   - The pre-flight 5s timer, the 30s recent-traffic window, and the
+    //     ladder budgets all live on virtual time — `testScheduler
+    //     .advanceTimeBy(...)` + `runCurrent()` is the canonical drive
+    //     pattern. We run pre-flight tests under the cadence-enabled
+    //     authority (built via [buildCadenceAuthority]) so the real
+    //     [PeerPingTracker] participates in the probe.
+    //
+    //   - The recent-traffic window's wall-clock comparison goes through an
+    //     injected `now: () -> Long` lambda so tests can advance the
+    //     pre-flight clock independently of the cadence engine's virtual-
+    //     time `delay(...)` ticks. (Cadence delays still drive cadence;
+    //     the recent-traffic clock drives only the Step-2 skip predicate.)
+    //
+    //   - Drain-then-shutdown discipline applies (gotcha #2 from the Task
+    //     17 KDoc). Every test that arms cadence or kicks the ladder
+    //     drains to exhaustion + calls shutdown() before the test ends.
+
+    /**
+     * Mutable wall-clock for the pre-flight `lastTrafficAt` window. Tests
+     * advance via [tick]; the captured lambda is passed to the authority's
+     * `now: () -> Long` constructor parameter.
+     *
+     * Decoupled from the [StandardTestDispatcher]'s virtual time on
+     * purpose (see Task 18 KDoc on [ConnectionAuthority] for why): the
+     * recent-traffic window compares wall-clock-shaped timestamps, while
+     * the cadence engine and ladder budgets live on the test scheduler's
+     * virtual time. Coupling the two would force pre-flight skip tests to
+     * advance virtual time even when the test's whole point is "no
+     * cadence interaction occurs".
+     */
+    private class FakePreFlightClock(private var t: Long = 0L) {
+        fun now(): Long = t
+        fun tick(deltaMs: Long) { t += deltaMs }
+    }
+
+    /**
+     * Bundle of an ensureSendable-ready authority + helpers. Mirrors
+     * [makePreFlightAuthority] in the JS suite: drives selfState ONLINE
+     * during construction so each test can focus on per-peer logic.
+     */
+    private data class PreFlightFixture(
+        val auth: ConnectionAuthority,
+        val signaling: FakeSignaling,
+        val sent: MutableList<PeerPingMessage>,
+        val clock: FakePreFlightClock,
+    )
+
+    /**
+     * Build a pre-flight-ready authority. Drives self ONLINE, returns the
+     * cadence-engine `sent` list for probe-count assertions, and exposes
+     * the [FakePreFlightClock] for `lastTrafficAt` window manipulation.
+     *
+     * The internal `runCurrent()` flushes the authority's `init`-time
+     * connection-state collector launch and the WsOpening/AuthComplete
+     * dispatches so the caller starts in a clean ONLINE state.
+     */
+    private fun TestScope.buildPreFlightAuthority(
+        ownDeviceId: String = "self-device-id",
+    ): PreFlightFixture {
+        val signaling = newFakeSignaling()
+        val sent = mutableListOf<PeerPingMessage>()
+        val tracker = PeerPingTracker(
+            sendMessage = { sent += it },
+            timeoutMs = PING_TIMEOUT_MS,
+            ownDeviceId = ownDeviceId,
+        )
+        val clock = FakePreFlightClock()
+        val auth = ConnectionAuthority(
+            signaling.client,
+            StandardTestDispatcher(testScheduler),
+            tracker,
+            now = clock::now,
+        )
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        return PreFlightFixture(auth, signaling, sent, clock)
+    }
+
+    /** Helper: count outbound peer-ping messages in `sent`. */
+    private fun countPings(sent: List<PeerPingMessage>): Int =
+        sent.count { it.type == "peer-ping" }
+
+    @Test
+    fun ensureSendable_returnsSelfOffline_withoutProbing_whenSelfNotOnline() = runTest {
+        // Mirror of Chrome JS `returns SELF_OFFLINE without probing when
+        // selfState != ONLINE`. Step 1 short-circuits the algorithm; no
+        // peer-ping should be issued.
+        val (auth, _, sent, _) = buildPreFlightAuthority()
+        // Drop selfState back to RECONNECTING.
+        auth.notifyWsClosed()
+        runCurrent()
+        assertTrue(auth.selfState.value is SelfState.Reconnecting)
+
+        val before = countPings(sent)
+        val result = auth.ensureSendable("X")
+        assertSame(SendGate.SelfOffline, result)
+        assertEquals("no peer-ping fired on self-offline gate", before, countPings(sent))
+
+        // Drain the self-RECONNECTING-kicked ladder so it doesn't leak.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_returnsOkImmediately_whenPeerHealthyWithRecentTraffic() = runTest {
+        // Mirror of Chrome JS `returns ok immediately when peer is HEALTHY
+        // with traffic in last 30s`. Step 2 skip path — no probe.
+        val (auth, _, sent, clock) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X")
+        // Real frame at t=0 promotes X to HEALTHY and records lastTrafficAt.
+        auth.notifyFrameReceived("X")
+        runCurrent()
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        // 5s later (well within the 30s window) → skip the probe.
+        clock.tick(5_000L)
+        val beforePings = countPings(sent)
+        val result = auth.ensureSendable("X")
+        runCurrent()
+        assertSame(SendGate.Ok, result)
+        assertEquals(
+            "no peer-ping fired when within 30s of fresh traffic",
+            beforePings,
+            countPings(sent),
+        )
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_issuesProbe_whenHealthyButTrafficStale() = runTest {
+        // Mirror of Chrome JS `issues a peer-ping when HEALTHY but traffic
+        // is older than 30s; ok on pong`.
+        val (auth, _, sent, clock) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X")
+        auth.notifyFrameReceived("X")
+        runCurrent()
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        // Advance the recent-traffic clock past the 30s window. The cadence
+        // engine's `delay(120s)` still hasn't fired (we don't advance virtual
+        // time), so any ping observed in `sent` is from pre-flight, not
+        // background cadence.
+        clock.tick(RECENT_TRAFFIC_WINDOW_MS + 1_000L)
+        val beforePings = countPings(sent)
+
+        val gateAsync = async { auth.ensureSendable("X") }
+        runCurrent()
+        assertEquals("pre-flight peer-ping issued", beforePings + 1, countPings(sent))
+
+        // Pong the most recent peer-ping.
+        val ping = sent.last { it.type == "peer-ping" }
+        auth.notifyPongReceived(ping.nonce)
+        runCurrent()
+
+        assertSame(SendGate.Ok, gateAsync.await())
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_issuesProbe_whenPeerUnknown_okOnPong() = runTest {
+        // Mirror of Chrome JS `issues a peer-ping when peer is UNKNOWN
+        // regardless of lastTrafficAt; ok on pong`. UNKNOWN never satisfies
+        // Step 2 because it's not HEALTHY — probe fires immediately.
+        val (auth, _, sent, _) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X") // UNKNOWN, no traffic recorded.
+        runCurrent()
+        val beforePings = countPings(sent)
+
+        val gateAsync = async { auth.ensureSendable("X") }
+        runCurrent()
+        assertEquals("UNKNOWN peer triggers a probe", beforePings + 1, countPings(sent))
+
+        val ping = sent.last { it.type == "peer-ping" }
+        auth.notifyPongReceived(ping.nonce)
+        runCurrent()
+
+        assertSame(SendGate.Ok, gateAsync.await())
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_coalescesConcurrentCallsForSamePeerIntoOneProbe() = runTest {
+        // Mirror of Chrome JS `coalesces concurrent ensureSendable calls for
+        // the same peer into one probe`. The per-peer in-flight Deferred
+        // is the load-bearing mechanism; without it a clipboard-burst (5
+        // files) would issue 5 redundant peer-pings.
+        val (auth, _, sent, _) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        val beforePings = countPings(sent)
+
+        val a = async { auth.ensureSendable("X") }
+        val b = async { auth.ensureSendable("X") }
+        val c = async { auth.ensureSendable("X") }
+        runCurrent()
+        assertEquals(
+            "one probe shared across concurrent callers",
+            beforePings + 1,
+            countPings(sent),
+        )
+
+        val ping = sent.last { it.type == "peer-ping" }
+        auth.notifyPongReceived(ping.nonce)
+        runCurrent()
+
+        assertSame(SendGate.Ok, a.await())
+        assertSame(SendGate.Ok, b.await())
+        assertSame(SendGate.Ok, c.await())
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_onProbeTimeout_kicksLadder_andRePingsOnSuccess() = runTest {
+        // Mirror of Chrome JS `on 5s ping timeout, kicks ladder; if ladder
+        // succeeds, re-pings and returns ok`. Step 3a → 3b → 3c → 3d
+        // happy path: ladder Rung 1 succeeds via FrameReceived, post-
+        // success retry probe gets a pong.
+        val (auth, _, sent, _) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        val beforePings = countPings(sent)
+
+        val gateAsync = async { auth.ensureSendable("X") }
+        runCurrent()
+        assertEquals("first probe-ping issued", beforePings + 1, countPings(sent))
+
+        // Advance past the 5s pre-flight timeout so the probe surrenders.
+        // The cadence-tracker's own 10s timeout has not yet fired — our
+        // 5s racer is what produces the failed result.
+        testScheduler.advanceTimeBy(PRE_FLIGHT_PING_TIMEOUT_MS + 1L)
+        runCurrent()
+
+        assertSame(PeerHealth.Failed, auth.peerHealth.value["X"])
+        assertNotNull("ladder kicked after pre-flight timeout", auth.currentLadder)
+
+        // Drive Rung 1 to success via a frame from X. The reducer promotes
+        // X → HEALTHY, the rung's `_peerHealth.first { Healthy }` predicate
+        // fires, and the ladder settles with Success.
+        auth.notifyFrameReceived("X")
+        runCurrent()
+        runCurrent() // second pump for the settle handler
+
+        assertNull("ladder released after Rung 1 success", auth.currentLadder)
+
+        // The post-success retry probe must have been issued. Pong it.
+        assertEquals(
+            "retry probe issued after ladder success",
+            beforePings + 2,
+            countPings(sent),
+        )
+        val retry = sent.last { it.type == "peer-ping" }
+        auth.notifyPongReceived(retry.nonce)
+        runCurrent()
+
+        assertSame(SendGate.Ok, gateAsync.await())
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_onProbeTimeout_returnsPeerUnreachable_onLadderExhaustion() = runTest {
+        // Mirror of Chrome JS `on 5s ping timeout with ladder failure,
+        // returns PEER_UNREACHABLE`. Step 3a fails → 3b kick → 3c await
+        // ladder → ladder exhausts → return PEER_UNREACHABLE.
+        val (auth, _, sent, _) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+        val beforePings = countPings(sent)
+
+        val gateAsync = async { auth.ensureSendable("X") }
+        runCurrent()
+        assertEquals("probe issued", beforePings + 1, countPings(sent))
+
+        // 5s → pre-flight timeout → FAILED → ladder kicks.
+        testScheduler.advanceTimeBy(PRE_FLIGHT_PING_TIMEOUT_MS + 1L)
+        runCurrent()
+        assertNotNull("ladder kicked", auth.currentLadder)
+
+        // Burn both ladder budgets. With no driver to flip peerHealth →
+        // Healthy or selfState → Online, both rungs surrender on
+        // withTimeoutOrNull → ladder.run() resolves Exhausted.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+
+        val result = gateAsync.await()
+        assertTrue(
+            "ladder exhausted → PEER_UNREACHABLE",
+            result is SendGate.PeerUnreachable,
+        )
+        assertNull("ladder released after exhaustion", auth.currentLadder)
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_lastTrafficAt_isUpdatedBySendCompleted_notJustFrameReceived() = runTest {
+        // Mirror of Chrome JS `lastTrafficAt is updated by send-completed
+        // (not just frame-received)`. Both producers count as recent
+        // traffic for the Step 2 skip.
+        val (auth, _, sent, clock) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X")
+        auth.notifySendCompleted("X") // promotes to HEALTHY + records traffic
+        runCurrent()
+        assertSame(PeerHealth.Healthy, auth.peerHealth.value["X"])
+
+        clock.tick(5_000L)
+        val beforePings = countPings(sent)
+        val result = auth.ensureSendable("X")
+        runCurrent()
+        assertSame(SendGate.Ok, result)
+        assertEquals(
+            "no probe — send-completed counted as recent traffic",
+            beforePings,
+            countPings(sent),
+        )
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ensureSendable_preFlightPongPromotesPeerToHealthyThroughTheReducer() = runTest {
+        // Mirror of Chrome JS `Task 11 follow-up F: pre-flight pong
+        // promotes peer to HEALTHY through the reducer`. Without this, an
+        // UNKNOWN peer probed by ensureSendable would resolve Ok but stay
+        // UNKNOWN — the popup dot would be stuck yellow.
+        val (auth, _, sent, _) = buildPreFlightAuthority()
+        auth.notifyPeerOnline("X") // UNKNOWN
+        runCurrent()
+        assertSame(PeerHealth.Unknown, auth.peerHealth.value["X"])
+
+        val gateAsync = async { auth.ensureSendable("X") }
+        runCurrent()
+        val ping = sent.last { it.type == "peer-ping" }
+        auth.notifyPongReceived(ping.nonce)
+        runCurrent()
+
+        assertSame(SendGate.Ok, gateAsync.await())
+        assertSame(
+            "pre-flight pong promoted peer through the reducer",
+            PeerHealth.Healthy,
+            auth.peerHealth.value["X"],
+        )
+
         auth.shutdown()
     }
 }

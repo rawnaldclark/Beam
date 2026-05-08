@@ -11,6 +11,9 @@ import android.util.Log
 import android.widget.Toast
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import com.zaptransfer.android.connection.ConnectionAuthority
+import com.zaptransfer.android.connection.PreFlightFailedException
+import com.zaptransfer.android.connection.SendGate
 import com.zaptransfer.android.crypto.BeamV2Transport
 import com.zaptransfer.android.crypto.BeamV2Wiring
 import com.zaptransfer.android.data.db.dao.ClipboardDao
@@ -143,6 +146,7 @@ class DeviceHubViewModel @Inject constructor(
     private val signalingClient: SignalingClient,
     private val userPreferences: UserPreferences,
     private val beamV2Wiring: BeamV2Wiring,
+    private val connectionAuthority: ConnectionAuthority,
     @ApplicationContext private val appContext: Context,
 ) : ViewModel() {
 
@@ -383,6 +387,19 @@ class DeviceHubViewModel @Inject constructor(
                 sendClipboardEncrypted(targetDeviceId, text)
                 val preview = if (text.length > 40) text.take(37) + "..." else text
                 _toastEvents.tryEmit("Clipboard sent (encrypted): $preview")
+            } catch (e: PreFlightFailedException) {
+                // Task 18: pre-flight gate failed — translate to a toast
+                // shaped like the spec's table at lines 311-315. The
+                // composable banner / "Reconnect" affordance work for
+                // SELF_OFFLINE lands in Task 19; until then a clear toast
+                // is the user-facing surface.
+                Log.w(TAG, "Encrypted clipboard send pre-flight failed: gate=${e.gate}")
+                val toast = when (e.gate) {
+                    is SendGate.SelfOffline -> "Not connected — reconnect to send"
+                    is SendGate.PeerUnreachable -> "Peer unreachable — try again"
+                    is SendGate.Ok -> "Send failed" // unreachable but keeps `when` exhaustive
+                }
+                _toastEvents.tryEmit(toast)
             } catch (e: com.zaptransfer.android.crypto.BeamV2Exception) {
                 Log.e(TAG, "Encrypted clipboard send failed: ${e.code}", e)
                 _toastEvents.tryEmit("Send failed — ${e.code}")
@@ -400,9 +417,23 @@ class DeviceHubViewModel @Inject constructor(
     /**
      * Send `text` as an encrypted clipboard payload via the Beam v2 transport.
      * One stateless AEAD frame; receiver decrypts on arrival, no handshake.
+     *
+     * Task 18: gates the transport call behind
+     * [ConnectionAuthority.ensureSendable]. On a non-Ok gate, throws
+     * [PreFlightFailedException] which the caller's try/catch translates
+     * into the "Send failed — Reconnect / Peer unreachable" toast surface.
+     * Zero frames are encoded on a non-Ok gate — that is the entire point
+     * of the pre-flight pattern (spec §"Send-time pre-flight" line 317).
      */
     private suspend fun sendClipboardEncrypted(targetDeviceId: String, text: String) {
+        val gate = connectionAuthority.ensureSendable(targetDeviceId)
+        if (gate !is SendGate.Ok) throw PreFlightFailedException(gate)
         beamV2Wiring.transport.sendClipboard(targetDeviceId, text)
+        // End-to-end success is strong proof of life — promote the peer
+        // to HEALTHY. Mirrors background-relay.js's
+        // `getConnectionAuthority()?.notifySendCompleted(targetDeviceId)`
+        // call in [sendClipboardEncrypted] (Chrome Task 9).
+        connectionAuthority.notifySendCompleted(targetDeviceId)
     }
 
 
@@ -459,24 +490,68 @@ class DeviceHubViewModel @Inject constructor(
      */
     fun sendFile(targetDeviceId: String, uri: Uri) {
         viewModelScope.launch {
-            try {
-                val contentResolver = appContext.contentResolver
-                val fileName = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
-                    cursor.moveToFirst()
-                    val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
-                    if (nameIndex >= 0) cursor.getString(nameIndex) else null
-                } ?: "file"
+            // Capture filename / size up front so the catch path can write a
+            // FAILED transfer-history row even if the file read failed before
+            // we could populate them inside the try.
+            val contentResolver = appContext.contentResolver
+            val fileName = contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                cursor.moveToFirst()
+                val nameIndex = cursor.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                if (nameIndex >= 0) cursor.getString(nameIndex) else null
+            } ?: "file"
+            val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
+            val startedAt = System.currentTimeMillis()
 
+            try {
                 val inputStream = contentResolver.openInputStream(uri) ?: run {
                     _toastEvents.tryEmit("Could not open file")
                     return@launch
                 }
                 val bytes = inputStream.use { it.readBytes() }
-                val mimeType = contentResolver.getType(uri) ?: "application/octet-stream"
 
                 Log.d(TAG, "Sending encrypted file: $fileName (${bytes.size} bytes) to $targetDeviceId")
                 sendFileEncrypted(targetDeviceId, fileName, mimeType, bytes)
                 _toastEvents.tryEmit("Sent $fileName (encrypted)")
+            } catch (e: PreFlightFailedException) {
+                // Task 18: pre-flight gate failed. Spec line 315: a
+                // PEER_UNREACHABLE result must surface as a Failed transfer
+                // card with retry button; SELF_OFFLINE additionally drives
+                // the top-of-screen "Not connected" banner (Task 19) and
+                // skips the Failed-card insert (Chrome behaviour: no
+                // transfer card at all on self-offline). We mirror that by
+                // only inserting the FAILED row on PEER_UNREACHABLE; for
+                // SELF_OFFLINE we toast and return.
+                Log.w(TAG, "Encrypted file send pre-flight failed: gate=${e.gate} name=$fileName")
+                when (e.gate) {
+                    is SendGate.SelfOffline -> {
+                        _toastEvents.tryEmit("Not connected — reconnect to send")
+                    }
+                    is SendGate.PeerUnreachable -> {
+                        runCatching {
+                            transferHistoryDao.insert(
+                                TransferHistoryEntity(
+                                    transferId    = "",
+                                    deviceId      = targetDeviceId,
+                                    direction     = "SENT",
+                                    fileName      = fileName,
+                                    fileSizeBytes = 0L,
+                                    mimeType      = mimeType,
+                                    status        = "FAILED",
+                                    sha256Hash    = null,
+                                    localUri      = uri.toString(),
+                                    startedAt     = startedAt,
+                                    completedAt   = System.currentTimeMillis(),
+                                )
+                            )
+                        }.onFailure {
+                            Log.e(TAG, "Failed-row insert failed: ${it.message}", it)
+                        }
+                        _toastEvents.tryEmit("Peer unreachable — $fileName failed")
+                    }
+                    is SendGate.Ok -> {
+                        // Unreachable; satisfies the exhaustive `when`.
+                    }
+                }
             } catch (e: com.zaptransfer.android.crypto.BeamV2Exception) {
                 Log.e(TAG, "Encrypted file send failed: ${e.code}", e)
                 _toastEvents.tryEmit("File send failed — ${e.code}")
@@ -491,6 +566,12 @@ class DeviceHubViewModel @Inject constructor(
      * Send a file via Beam v2 transport: meta frame + chunk frames, all
      * stateless AEAD under K_AB. Receiver assembles via the transport's
      * inbox and emits via [BeamV2Wiring.Delivery.onFileReceived].
+     *
+     * Task 18: gates the transport call behind
+     * [ConnectionAuthority.ensureSendable]. On a non-Ok gate, throws
+     * [PreFlightFailedException] which the caller's try/catch translates
+     * into a Failed transfer-history row + toast. Zero frames are encoded
+     * on a non-Ok gate — see [sendClipboardEncrypted] for the rationale.
      */
     private suspend fun sendFileEncrypted(
         targetDeviceId: String,
@@ -498,6 +579,8 @@ class DeviceHubViewModel @Inject constructor(
         mimeType: String,
         fileBytes: ByteArray,
     ) {
+        val gate = connectionAuthority.ensureSendable(targetDeviceId)
+        if (gate !is SendGate.Ok) throw PreFlightFailedException(gate)
         beamV2Wiring.transport.sendFile(
             targetDeviceId = targetDeviceId,
             fileName       = fileName,
@@ -505,6 +588,10 @@ class DeviceHubViewModel @Inject constructor(
             mimeType       = mimeType.ifBlank { "application/octet-stream" },
             bytes          = fileBytes,
         )
+        // End-to-end success is strong proof of life — promote the peer
+        // to HEALTHY. Mirrors background-relay.js's `notifySendCompleted`
+        // call in `sendFileEncrypted` (Chrome Task 9).
+        connectionAuthority.notifySendCompleted(targetDeviceId)
     }
 
     private fun handleReceivedFileComplete(ft: FileTransferState) {

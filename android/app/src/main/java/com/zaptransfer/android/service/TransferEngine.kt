@@ -7,6 +7,8 @@ import android.os.Build
 import android.provider.MediaStore
 import android.util.Log
 import com.zaptransfer.android.connection.ConnectionAuthority
+import com.zaptransfer.android.connection.PreFlightFailedException
+import com.zaptransfer.android.connection.SendGate
 import com.zaptransfer.android.crypto.BeamV2Transport
 import com.zaptransfer.android.crypto.BeamV2Wiring
 import com.zaptransfer.android.crypto.KeyManager
@@ -121,7 +123,18 @@ class TransferEngine @Inject constructor(
         fileSize: Long,
     ) {
         val job = scope.launch {
+            val startedAt = System.currentTimeMillis()
             try {
+                // Task 18: send-time pre-flight gate. Runs BEFORE we read
+                // the file bytes — both because reading a multi-MB file
+                // off disk only to throw it away on a self-offline gate
+                // is wasteful, and because the spec's "zero frames are
+                // transmitted on a non-Ok gate" guarantee requires we
+                // never reach `beamV2Wiring.transport.sendFile(...)` on
+                // failure.
+                val gate = connectionAuthority.ensureSendable(targetDeviceId)
+                if (gate !is SendGate.Ok) throw PreFlightFailedException(gate)
+
                 val bytes = context.contentResolver.openInputStream(fileUri)?.use { it.readBytes() }
                     ?: error("Cannot open URI: $fileUri")
                 require(bytes.size.toLong() == fileSize) {
@@ -146,7 +159,7 @@ class TransferEngine @Inject constructor(
                         status        = "COMPLETED",
                         sha256Hash    = null,
                         localUri      = fileUri.toString(),
-                        startedAt     = System.currentTimeMillis(),
+                        startedAt     = startedAt,
                         completedAt   = System.currentTimeMillis(),
                     )
                 )
@@ -156,6 +169,34 @@ class TransferEngine @Inject constructor(
                 // while the history row is missing.
                 connectionAuthority.notifySendCompleted(targetDeviceId)
                 Log.i(TAG, "Beam v2 file sent: id=$transferIdHex name=$fileName size=$fileSize")
+            } catch (e: PreFlightFailedException) {
+                // Task 18: pre-flight failed. Spec §"Send-time pre-flight"
+                // failure-semantics table (lines 311-315):
+                //   SELF_OFFLINE      → no transfer card (top-banner only)
+                //   PEER_UNREACHABLE  → Failed transfer card with retry
+                // Branch on the gate so SELF_OFFLINE doesn't produce a
+                // phantom Failed card. The DeviceHubViewModel call site
+                // applies the same distinction for parity.
+                Log.w(TAG, "sendFile pre-flight failed: gate=${e.gate} name=$fileName")
+                if (e.gate is SendGate.PeerUnreachable) {
+                    runCatching {
+                        transferHistoryDao.insert(
+                            TransferHistoryEntity(
+                                transferId    = "",
+                                deviceId      = targetDeviceId,
+                                direction     = "SENT",
+                                fileName      = fileName,
+                                fileSizeBytes = fileSize,
+                                mimeType      = mimeType.ifBlank { null },
+                                status        = "FAILED",
+                                sha256Hash    = null,
+                                localUri      = fileUri.toString(),
+                                startedAt     = startedAt,
+                                completedAt   = System.currentTimeMillis(),
+                            )
+                        )
+                    }.onFailure { Log.e(TAG, "Failed-row insert failed: ${it.message}", it) }
+                }
             } catch (e: Exception) {
                 Log.e(TAG, "sendFile failed: ${e.message}", e)
             }
@@ -172,12 +213,24 @@ class TransferEngine @Inject constructor(
     fun sendClipboard(targetDeviceId: String, text: String) {
         scope.launch {
             try {
+                // Task 18: pre-flight gate (clipboard variant). No DAO row
+                // is written for clipboards on either success OR failure;
+                // we just log + return on a failure so callers awaiting
+                // toast / UI feedback see the no-op rather than a phantom
+                // success animation. (The DeviceHubViewModel path that
+                // actually drives clipboards in production has its own
+                // pre-flight wiring + toast surface — see that file.)
+                val gate = connectionAuthority.ensureSendable(targetDeviceId)
+                if (gate !is SendGate.Ok) throw PreFlightFailedException(gate)
+
                 val transferIdHex = beamV2Wiring.transport.sendClipboard(targetDeviceId, text)
                 Log.i(TAG, "Beam v2 clipboard sent: id=$transferIdHex target=$targetDeviceId (${text.length} chars)")
                 // Successful sendClipboard is strong proof of life — promote
                 // the peer to HEALTHY. Clipboard has no DAO write, so ordering
                 // is purely "after the side-effects this method owns."
                 connectionAuthority.notifySendCompleted(targetDeviceId)
+            } catch (e: PreFlightFailedException) {
+                Log.w(TAG, "sendClipboard pre-flight failed: gate=${e.gate}")
             } catch (e: Exception) {
                 Log.e(TAG, "sendClipboard failed: ${e.message}", e)
             }
