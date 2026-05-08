@@ -12,7 +12,9 @@ import android.widget.Toast
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.zaptransfer.android.connection.ConnectionAuthority
+import com.zaptransfer.android.connection.PeerHealth
 import com.zaptransfer.android.connection.PreFlightFailedException
+import com.zaptransfer.android.connection.SelfState
 import com.zaptransfer.android.connection.SendGate
 import com.zaptransfer.android.crypto.BeamV2Transport
 import com.zaptransfer.android.crypto.BeamV2Wiring
@@ -342,7 +344,23 @@ class DeviceHubViewModel @Inject constructor(
     }
 
     /**
-     * Primary UI state: the list of paired devices enriched with live online status.
+     * Primary UI state: the list of paired devices enriched with live health
+     * + the authority's `selfState` for the top banner.
+     *
+     * Folds four reactive sources:
+     *  1. Persistent paired-device list ([DeviceRepository.observePairedDevices]).
+     *  2. Ephemeral relay-presence set ([DeviceRepository.onlineDevices]) —
+     *     used as an UNKNOWN-vs-truly-unseen tiebreaker in [computeEffectiveHealth].
+     *  3. [ConnectionAuthority.peerHealth] — the four-state per-peer health map.
+     *  4. [ConnectionAuthority.selfState] — drives the top banner AND the
+     *     "self-overrides-peer" rule (spec line 185): when self != ONLINE
+     *     every peer is forced to the OFFLINE-equivalent rendering, even if
+     *     a stale [PeerHealth.Healthy] entry lingers in the map.
+     *
+     * The self-overrides-peer rule is applied here in the ViewModel rather
+     * than in the Composable so it stays unit-testable without Compose
+     * scaffolding (we have no Compose-test framework on the JVM source set —
+     * only `androidTest` ships `ui-test-junit4`).
      *
      * Loading defaults to true until the first Room emission. After that it is always
      * false — the list may be empty but is never in an indeterminate state.
@@ -350,14 +368,19 @@ class DeviceHubViewModel @Inject constructor(
     val uiState: StateFlow<DeviceHubUiState> = combine(
         deviceRepo.observePairedDevices(),
         deviceRepo.onlineDevices,
-    ) { devices, online ->
+        connectionAuthority.peerHealth,
+        connectionAuthority.selfState,
+    ) { devices, online, peerHealth, selfState ->
         DeviceHubUiState(
             devices = devices.map { entity ->
+                val rawHealth = peerHealth[entity.deviceId] ?: PeerHealth.Unknown
                 PairedDeviceUi(
                     entity = entity,
-                    isOnline = online.contains(entity.deviceId),
+                    health = computeEffectiveHealth(rawHealth, selfState),
+                    presenceOnline = online.contains(entity.deviceId),
                 )
             },
+            selfState = selfState,
             isLoading = false,
         )
     }.stateIn(
@@ -365,6 +388,19 @@ class DeviceHubViewModel @Inject constructor(
         started = SharingStarted.WhileSubscribed(5_000),
         initialValue = DeviceHubUiState(),
     )
+
+    /**
+     * Manual reconnect entry point — wired from the top banner's "Reconnect"
+     * button. Delegates to [ConnectionAuthority.requestReconnect].
+     *
+     * In skeleton-mode (Task 19 lands before Task 20's Rung 3 work) the
+     * authority's [ConnectionAuthority.requestReconnect] is a no-op stub.
+     * Calling it is still safe — once Task 20 lands, this entry point
+     * automatically gains real recovery-ladder behaviour with no UI change.
+     */
+    fun requestReconnect() {
+        connectionAuthority.requestReconnect()
+    }
 
     /**
      * Reads the Android system clipboard and sends its text content to the
@@ -717,28 +753,78 @@ class DeviceHubViewModel @Inject constructor(
 /**
  * Top-level UI state for the Device Hub screen.
  *
- * @param devices   List of paired devices, each annotated with live online status.
+ * @param devices   List of paired devices, each annotated with live health.
+ * @param selfState Current relay-connection state from [ConnectionAuthority] —
+ *                  drives the top reconnect banner.
  * @param isLoading True only during the very first Room emission; false thereafter.
  */
 data class DeviceHubUiState(
     val devices: List<PairedDeviceUi> = emptyList(),
+    val selfState: SelfState = SelfState.Offline,
     val isLoading: Boolean = true,
 )
 
 /**
- * A [PairedDeviceEntity] enriched with the current online presence status.
+ * A [PairedDeviceEntity] enriched with its current `effective` health — the
+ * rendering-ready four-state value the per-row dot reads from.
  *
- * Presence is ephemeral — it resets to false on process restart and is
- * re-populated by relay presence events. The UI should treat [isOnline] as
- * best-effort and never gate critical operations on it.
+ * `effective` here means "after the self-overrides-peer rule has been
+ * applied" (spec line 185): when [DeviceHubUiState.selfState] is anything
+ * other than [SelfState.Online], every peer's [health] is folded down to
+ * [PeerHealth.Offline] even if the underlying `peerHealth` map still
+ * contains a (now-stale) [PeerHealth.Healthy] entry. This keeps the
+ * "single source of truth" property the spec calls out: peers can't show
+ * green while the device itself isn't actually connected to the relay.
  *
- * @param entity   The persistent device record from Room.
- * @param isOnline True if the device has reported online presence since last app start.
+ * @param entity         The persistent device record from Room.
+ * @param health         Effective four-state health for this peer (post-self-override).
+ * @param presenceOnline Raw bit from [DeviceRepository.onlineDevices] — kept
+ *                       on the data class as the "did the relay see this
+ *                       peer at all" signal. NOT used for rendering today;
+ *                       Task 21 (`SignalingClient` ↔ `ConnectionAuthority`
+ *                       bridge) is expected to use it as a tiebreaker for
+ *                       the UNKNOWN-vs-truly-unseen distinction. Read
+ *                       [health] for rendering.
  */
 data class PairedDeviceUi(
     val entity: PairedDeviceEntity,
-    val isOnline: Boolean,
-)
+    val health: PeerHealth = PeerHealth.Unknown,
+    val presenceOnline: Boolean = false,
+) {
+    /**
+     * Whether this peer is currently reachable for sending. True when health
+     * is [PeerHealth.Healthy] or [PeerHealth.Stale] — the two states the
+     * spec marks as "send-eligible" (HEALTHY is fully proven; STALE is
+     * background-rechecking but the path was healthy moments ago).
+     *
+     * UNKNOWN, FAILED, and OFFLINE all return false. UNKNOWN is the
+     * conservative case: a freshly-paired device shows offline-equivalent
+     * until the first ping proves it healthy, rather than letting a send
+     * vanish into a dropped void (Chrome reference comment).
+     */
+    val isSendable: Boolean
+        get() = health is PeerHealth.Healthy || health is PeerHealth.Stale
+}
+
+/**
+ * Apply the spec line 185 "self-overrides-peer" rule.
+ *
+ * When the device itself is not in [SelfState.Online] (i.e. we are
+ * disconnected from the relay, mid-connect, or in recovery) every peer's
+ * effective health is forced to [PeerHealth.Offline] regardless of what
+ * the cached `peerHealth` map says. The map's value can legitimately lag
+ * the relay's view across a wifi drop — without this fold the UI would
+ * show green dots for peers we cannot actually reach.
+ *
+ * When self IS Online, the raw [PeerHealth] flows through unchanged.
+ *
+ * Pure function — visible for tests and called from the [uiState] combine.
+ */
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+internal fun computeEffectiveHealth(
+    raw: PeerHealth,
+    selfState: SelfState,
+): PeerHealth = if (selfState is SelfState.Online) raw else PeerHealth.Offline
 
 /**
  * Mutable accumulator for an in-progress incoming file transfer.

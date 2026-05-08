@@ -52,13 +52,18 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.annotation.VisibleForTesting
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
+import com.zaptransfer.android.connection.PeerHealth
+import com.zaptransfer.android.connection.SelfState
 import com.zaptransfer.android.data.db.entity.ClipboardEntryEntity
 import com.zaptransfer.android.data.db.entity.PairedDeviceEntity
 import com.zaptransfer.android.data.db.entity.TransferHistoryEntity
@@ -135,9 +140,11 @@ fun DeviceHubScreen(
         uiState.devices.associate { it.entity.deviceId to it.entity.name }
     }
 
-    // Sort devices: online first, then by name. The hero is the first entry.
+    // Sort devices: send-eligible first, then by name. The hero is the first entry.
+    // "Send-eligible" matches the row's enabled-state logic (HEALTHY or STALE)
+    // so the user's most-actionable target floats to the top.
     val sortedDevices = remember(uiState.devices) {
-        uiState.devices.sortedWith(compareByDescending<PairedDeviceUi> { it.isOnline }.thenBy { it.entity.name })
+        uiState.devices.sortedWith(compareByDescending<PairedDeviceUi> { it.isSendable }.thenBy { it.entity.name })
     }
 
     val heroDevice = sortedDevices.firstOrNull()
@@ -152,12 +159,10 @@ fun DeviceHubScreen(
     // does not expose userPreferences directly and we must not modify it.
     val ownDeviceAlias = remember { Build.MODEL }
 
-    // Relay connection status is not directly exposed by the ViewModel either.
-    // We approximate "relay connected" by checking whether any device is online,
-    // which is accurate in practice since presence comes from the relay.
-    val isRelayConnected = remember(uiState.devices) {
-        uiState.devices.any { it.isOnline }
-    }
+    // The header status dot now binds to the authority's selfState directly:
+    // ONLINE = green, anything else = grey. Replaces the prior "any device
+    // online" heuristic, which conflated peer presence with relay liveness.
+    val isRelayConnected = uiState.selfState is SelfState.Online
 
     Scaffold(
         topBar = {
@@ -205,97 +210,105 @@ fun DeviceHubScreen(
 
             // Populated main screen.
             else -> {
-                LazyColumn(
+                Column(
                     modifier = Modifier
                         .fillMaxSize()
                         .padding(innerPadding),
-                    contentPadding = PaddingValues(bottom = BeamSpace.s4),
                 ) {
-                    // ── Zone 2: Hero Card ──────────────────────────────────────
-                    if (heroDevice != null) {
-                        item(key = "hero") {
-                            AnimatedVisibility(
-                                visible = true,
-                                enter = fadeIn(
-                                    animationSpec = tween(
-                                        BeamMotion.durBaseMs,
-                                        easing = BeamMotion.easeOut,
+                    ConnectionBanner(
+                        selfState = uiState.selfState,
+                        onReconnect = { viewModel.requestReconnect() },
+                    )
+                    LazyColumn(
+                        modifier = Modifier.fillMaxSize(),
+                        contentPadding = PaddingValues(bottom = BeamSpace.s4),
+                    ) {
+                        // ── Zone 2: Hero Card ──────────────────────────────────
+                        if (heroDevice != null) {
+                            item(key = "hero") {
+                                AnimatedVisibility(
+                                    visible = true,
+                                    enter = fadeIn(
+                                        animationSpec = tween(
+                                            BeamMotion.durBaseMs,
+                                            easing = BeamMotion.easeOut,
+                                        ),
+                                    ) + slideInVertically(
+                                        initialOffsetY = { 8 },
+                                        animationSpec = tween(
+                                            BeamMotion.durBaseMs,
+                                            easing = BeamMotion.easeOut,
+                                        ),
                                     ),
-                                ) + slideInVertically(
-                                    initialOffsetY = { 8 },
-                                    animationSpec = tween(
-                                        BeamMotion.durBaseMs,
-                                        easing = BeamMotion.easeOut,
-                                    ),
-                                ),
-                            ) {
-                                HeroCard(
-                                    device = heroDevice,
-                                    onPickFile = { onSendFile(heroDevice.entity.deviceId) },
-                                    onSendClipboard = { onSendText(heroDevice.entity.deviceId) },
-                                    modifier = Modifier.padding(
-                                        horizontal = BeamSpace.s4,
-                                        vertical = BeamSpace.s3,
-                                    ),
+                                ) {
+                                    HeroCard(
+                                        device = heroDevice,
+                                        onPickFile = { onSendFile(heroDevice.entity.deviceId) },
+                                        onSendClipboard = { onSendText(heroDevice.entity.deviceId) },
+                                        modifier = Modifier.padding(
+                                            horizontal = BeamSpace.s4,
+                                            vertical = BeamSpace.s3,
+                                        ),
+                                    )
+                                }
+                            }
+                        }
+
+                        // ── Pending file-save prompt ───────────────────────────
+                        pendingFile?.let { pf ->
+                            item(key = "pending-file") {
+                                PendingFileCard(
+                                    fileName = pf.fileName,
+                                    sizeBytes = pf.data.size.toLong(),
+                                    onSave = { viewModel.savePendingFile() },
+                                    onDismiss = { viewModel.dismissPendingFile() },
+                                    modifier = Modifier.padding(horizontal = BeamSpace.s4, vertical = BeamSpace.s1),
                                 )
                             }
                         }
-                    }
 
-                    // ── Pending file-save prompt ───────────────────────────────
-                    pendingFile?.let { pf ->
-                        item(key = "pending-file") {
-                            PendingFileCard(
-                                fileName = pf.fileName,
-                                sizeBytes = pf.data.size.toLong(),
-                                onSave = { viewModel.savePendingFile() },
-                                onDismiss = { viewModel.dismissPendingFile() },
-                                modifier = Modifier.padding(horizontal = BeamSpace.s4, vertical = BeamSpace.s1),
-                            )
+                        // ── Zone 3: Other Devices ──────────────────────────────
+                        if (otherDevices.isNotEmpty()) {
+                            item(key = "header-other") {
+                                SectionHeader(title = "OTHER DEVICES")
+                            }
+
+                            items(
+                                items = otherDevices,
+                                key = { it.entity.deviceId },
+                            ) { device ->
+                                DeviceRow(
+                                    device = device,
+                                    onClick = {
+                                        if (device.isSendable) {
+                                            onSendFile(device.entity.deviceId)
+                                        }
+                                    },
+                                    onLongClick = { /* retarget hero — future feature */ },
+                                    modifier = Modifier.animateItemPlacement(),
+                                )
+                            }
                         }
-                    }
 
-                    // ── Zone 3: Other Devices ──────────────────────────────────
-                    if (otherDevices.isNotEmpty()) {
-                        item(key = "header-other") {
-                            SectionHeader(title = "OTHER DEVICES")
+                        // ── Zone 4: Activity ───────────────────────────────────
+                        item(key = "header-activity") {
+                            SectionHeader(title = "ACTIVITY")
                         }
 
-                        items(
-                            items = otherDevices,
-                            key = { it.entity.deviceId },
-                        ) { device ->
-                            DeviceRow(
-                                device = device,
-                                onClick = {
-                                    if (device.isOnline) {
-                                        onSendFile(device.entity.deviceId)
-                                    }
-                                },
-                                onLongClick = { /* retarget hero — future feature */ },
-                                modifier = Modifier.animateItemPlacement(),
-                            )
-                        }
-                    }
-
-                    // ── Zone 4: Activity ───────────────────────────────────────
-                    item(key = "header-activity") {
-                        SectionHeader(title = "ACTIVITY")
-                    }
-
-                    if (activityItems.isEmpty()) {
-                        item(key = "empty-activity") {
-                            EmptyActivityMessage()
-                        }
-                    } else {
-                        items(
-                            items = activityItems,
-                            key = { it.id },
-                        ) { item ->
-                            ActivityRow(
-                                item = item,
-                                modifier = Modifier.animateItemPlacement(),
-                            )
+                        if (activityItems.isEmpty()) {
+                            item(key = "empty-activity") {
+                                EmptyActivityMessage()
+                            }
+                        } else {
+                            items(
+                                items = activityItems,
+                                key = { it.id },
+                            ) { item ->
+                                ActivityRow(
+                                    item = item,
+                                    modifier = Modifier.animateItemPlacement(),
+                                )
+                            }
                         }
                     }
                 }
@@ -370,6 +383,86 @@ private fun BeamTopBar(
     )
 }
 
+// ── Zone 1.5: Connection banner (selfState != Online) ───────────────────────
+
+/**
+ * Top-of-screen banner that surfaces the authority's [SelfState] when the
+ * device is not currently in [SelfState.Online]. Mirrors the Chrome popup
+ * banner from commit `01e33ba` per spec table line 185.
+ *
+ * Visibility + content matrix:
+ *  - [SelfState.Online]                                       -> hidden.
+ *  - [SelfState.Offline]                                      -> "Not connected" + Reconnect button.
+ *  - [SelfState.Connecting]                                   -> "Connecting\u2026" (no button — already trying).
+ *  - [SelfState.Reconnecting] `(surrenderedToUser=false)`     -> "Reconnecting\u2026" (auto-recovery in flight, no button).
+ *  - [SelfState.Reconnecting] `(surrenderedToUser=true)`      -> "Not connected" + Reconnect button (ladder gave up).
+ *
+ * The button is wired to [ConnectionAuthority.requestReconnect] via
+ * [DeviceHubViewModel.requestReconnect]. In skeleton-mode (Task 19 lands
+ * before Task 20's Rung 3 work) the authority's `requestReconnect` is a
+ * no-op stub — clicking the button is harmless until Task 20 lands.
+ *
+ * @param selfState   Current [SelfState] from the [ConnectionAuthority].
+ * @param onReconnect Click handler for the Reconnect button (when shown).
+ * @param modifier    Layout modifier.
+ */
+@Composable
+private fun ConnectionBanner(
+    selfState: SelfState,
+    onReconnect: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    // Banner copy + button visibility per spec UI-mapping table and Chrome
+    // popup parity (commit 01e33ba). Reconnect button is shown under BOTH
+    // Reconnecting variants — auto-recovery in flight may stall on a
+    // stuck rung, and the user must always have an escape hatch during
+    // the 30s+ ladder + backoff cycle. Only `Connecting` (already
+    // actively trying to reach the relay) suppresses the button.
+    val (message, showButton) = when (selfState) {
+        is SelfState.Online -> return
+        is SelfState.Connecting -> "Connecting\u2026" to false
+        is SelfState.Reconnecting ->
+            if (selfState.surrenderedToUser) "Not connected" to true
+            else "Reconnecting\u2026" to true
+        is SelfState.Offline -> "Not connected" to true
+    }
+
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .background(BeamPalette.bg2)
+            .padding(horizontal = BeamSpace.s4, vertical = BeamSpace.s2)
+            .semantics(mergeDescendants = true) {
+                contentDescription = "$message banner"
+                if (showButton) role = Role.Button
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(8.dp)
+                .clip(CircleShape)
+                .background(BeamPalette.warning),
+        )
+        Spacer(modifier = Modifier.width(BeamSpace.s2))
+        Text(
+            text = message,
+            style = BeamTextStyle.smMedium,
+            color = BeamPalette.textHi,
+            modifier = Modifier.weight(1f),
+        )
+        if (showButton) {
+            TextButton(onClick = onReconnect) {
+                Text(
+                    text = "Reconnect",
+                    style = BeamTextStyle.smMedium,
+                    color = BeamPalette.accent,
+                )
+            }
+        }
+    }
+}
+
 // ── Zone 2: Hero Card ────────────────────────────────────────────────────────
 
 /**
@@ -391,7 +484,7 @@ private fun HeroCard(
     onSendClipboard: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val isOnline = device.isOnline
+    val sendable = device.isSendable
 
     Column(
         modifier = modifier
@@ -418,17 +511,18 @@ private fun HeroCard(
 
         Spacer(modifier = Modifier.height(BeamSpace.s1))
 
-        // Status line: dot + "online" / "offline".
+        // Status line: 4-state dot + label. FAILED appends "Reconnecting…"
+        // per the spec table line 183 so the user sees recovery is in flight.
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box(
                 modifier = Modifier
                     .size(8.dp)
                     .clip(CircleShape)
-                    .background(if (isOnline) BeamPalette.online else BeamPalette.offline),
+                    .background(peerHealthDotColor(device.health)),
             )
             Spacer(modifier = Modifier.width(BeamSpace.s1))
             Text(
-                text = if (isOnline) "online" else "offline",
+                text = peerHealthStatusLabel(device.health),
                 style = BeamTextStyle.smRegular,
                 color = BeamPalette.textMid,
             )
@@ -443,7 +537,7 @@ private fun HeroCard(
         HeroVerbRow(
             label = "Tap to pick file",
             accessibilityLabel = "Send file to ${device.entity.name}",
-            enabled = isOnline,
+            enabled = sendable,
             onClick = onPickFile,
         )
 
@@ -454,7 +548,7 @@ private fun HeroCard(
         HeroVerbRow(
             label = "Send clipboard",
             accessibilityLabel = "Send clipboard to ${device.entity.name}",
-            enabled = isOnline,
+            enabled = sendable,
             onClick = onSendClipboard,
         )
     }
@@ -580,7 +674,7 @@ private fun DeviceRow(
     onLongClick: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
-    val rowAlpha = if (device.isOnline) 1f else 0.55f
+    val rowAlpha = if (device.isSendable) 1f else 0.55f
 
     Row(
         modifier = modifier
@@ -594,12 +688,14 @@ private fun DeviceRow(
             .padding(horizontal = BeamRow.paddingHorizontal, vertical = BeamRow.paddingVertical),
         verticalAlignment = Alignment.CenterVertically,
     ) {
-        // Status dot (8dp).
+        // 4-state status dot (8dp). HEALTHY/STALE = green, FAILED = warning
+        // yellow, OFFLINE/UNKNOWN = grey. STALE pulse animation is deferred —
+        // see PeerHealth.Stale branch in [peerHealthDotColor].
         Box(
             modifier = Modifier
                 .size(BeamRow.dotSize)
                 .clip(CircleShape)
-                .background(if (device.isOnline) BeamPalette.online else BeamPalette.offline),
+                .background(peerHealthDotColor(device.health)),
         )
 
         Spacer(modifier = Modifier.width(BeamSpace.s2))
@@ -614,25 +710,83 @@ private fun DeviceRow(
 
         Spacer(modifier = Modifier.width(BeamSpace.s2))
 
-        // Device name.
-        Text(
-            text = device.entity.name,
-            style = BeamTextStyle.baseMedium,
-            color = BeamPalette.textHi,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
+        // Device name + optional FAILED subtext. Wrapped in a Column so the
+        // "Reconnecting…" hint sits directly under the device name only when
+        // the peer is FAILED (mirrors Chrome popup.js's per-row subtext div).
+        Column(
             modifier = Modifier.weight(1f),
-        )
+        ) {
+            Text(
+                text = device.entity.name,
+                style = BeamTextStyle.baseMedium,
+                color = BeamPalette.textHi,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (device.health is PeerHealth.Failed) {
+                Text(
+                    text = "Reconnecting\u2026",
+                    style = BeamTextStyle.xsRegular,
+                    color = BeamPalette.warning,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+            }
+        }
 
         Spacer(modifier = Modifier.width(BeamSpace.s2))
 
-        // Trailing label: "send" or "offline".
+        // Trailing label: "send" when sendable, "offline" otherwise.
         Text(
-            text = if (device.isOnline) "send" else "offline",
+            text = if (device.isSendable) "send" else "offline",
             style = BeamTextStyle.xsMono,
             color = BeamPalette.textLo,
         )
     }
+}
+
+/**
+ * Map a [PeerHealth] value to the dot colour rendered in [HeroCard] and
+ * [DeviceRow] per the spec table at lines 181-184:
+ *
+ *  - [PeerHealth.Healthy] -> green
+ *  - [PeerHealth.Stale]   -> green (pulse animation deferred — see KDoc note)
+ *  - [PeerHealth.Failed]  -> warning yellow (paired with "Reconnecting…" subtext)
+ *  - [PeerHealth.Offline] -> grey
+ *  - [PeerHealth.Unknown] -> grey (conservative — matches Chrome popup.js)
+ *
+ * **STALE pulse note:** Chrome's `dot-stale` CSS class adds a subtle pulse
+ * animation. The Compose equivalent (`rememberInfiniteTransition` driving
+ * an alpha float) is intentionally NOT added in this initial port — STALE
+ * is invisible-to-user signal (background re-pinging in flight, recovery
+ * not yet warranted) and an extra Compose recomposition source per row is
+ * an avoidable hot-path cost for a UX subtlety that no real-device feedback
+ * has yet asked for. Visual parity with Chrome can land as a follow-up if
+ * the team decides STALE needs to be visually distinct.
+ */
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+internal fun peerHealthDotColor(health: PeerHealth): Color = when (health) {
+    is PeerHealth.Healthy -> BeamPalette.online
+    is PeerHealth.Stale -> BeamPalette.online
+    is PeerHealth.Failed -> BeamPalette.warning
+    is PeerHealth.Offline -> BeamPalette.offline
+    is PeerHealth.Unknown -> BeamPalette.offline
+}
+
+/**
+ * Map a [PeerHealth] value to the short status label shown next to the
+ * 8dp dot inside [HeroCard]. STALE collapses to "online" because the user-
+ * facing distinction between HEALTHY and STALE is not meaningful (both are
+ * sendable; STALE is purely "background re-pinging").
+ *
+ * FAILED reads "reconnecting" rather than "offline" so the label matches
+ * the dot colour cue (warning yellow) and the row-level subtext.
+ */
+@VisibleForTesting(otherwise = VisibleForTesting.PRIVATE)
+internal fun peerHealthStatusLabel(health: PeerHealth): String = when (health) {
+    is PeerHealth.Healthy, is PeerHealth.Stale -> "online"
+    is PeerHealth.Failed -> "reconnecting"
+    is PeerHealth.Offline, is PeerHealth.Unknown -> "offline"
 }
 
 // ── Zone 4: Activity ─────────────────────────────────────────────────────────
