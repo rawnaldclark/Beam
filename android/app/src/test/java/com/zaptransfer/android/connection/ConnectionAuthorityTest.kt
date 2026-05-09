@@ -142,32 +142,50 @@ class ConnectionAuthorityTest {
 
     @Test
     fun notifyWsClosed_fromOnline_movesToReconnectingFalse() = runTest {
+        // Pre-Step-E this used `advanceUntilIdle()` and asserted
+        // surrenderedToUser=false. Task 20 / Step E adds Rung 4 surrender
+        // promotion, which means a fully-drained ladder ends in
+        // Reconnecting(true) — not the immediate state this test was
+        // pinning. Switch to `runCurrent()` to capture the post-WsClosed
+        // tick BEFORE the ladder runs to surrender; shutdown afterward
+        // cancels the in-flight ladder cleanly so runTest's teardown
+        // doesn't drive virtual time through the backoff loop.
         val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
+        runCurrent()
         auth.notifyWsOpening()
         auth.notifyAuthComplete()
         auth.notifyWsClosed()
-        advanceUntilIdle()
+        runCurrent()
         val s = auth.selfState.value
         assertTrue(s is SelfState.Reconnecting)
         assertEquals(false, (s as SelfState.Reconnecting).surrenderedToUser)
+        auth.shutdown()
     }
 
     @Test
     fun notifyAuthComplete_fromReconnecting_endsAtOnline_deadlockFix() = runTest {
         // Chrome commit bd56305: Reconnecting -> Online via auth-complete is
         // the only signal a ladder rung can act on. Load-bearing.
+        // Step-E note: the WsClosed kicks the ladder. The ladder's Rung 1
+        // self-trigger requires (selfState=Online AND any peer Healthy);
+        // with no peers seeded the predicate never fires and the ladder
+        // would advance through Rungs 2+3 and surrender (Reconnecting(true))
+        // even though we drove selfState to Online via notifyAuthComplete.
+        // To pin the IMMEDIATE Reconnecting->Online deadlock-fix transition
+        // without coupling to the ladder's success criterion, use
+        // runCurrent + explicit shutdown.
         val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
+        runCurrent()
         auth.notifyWsOpening()
         auth.notifyAuthComplete()
         auth.notifyWsClosed()
-        advanceUntilIdle()
+        runCurrent()
         assertTrue(auth.selfState.value is SelfState.Reconnecting)
 
         auth.notifyAuthComplete()
-        advanceUntilIdle()
+        runCurrent()
         assertSame(SelfState.Online, auth.selfState.value)
+        auth.shutdown()
     }
 
     @Test
@@ -294,34 +312,79 @@ class ConnectionAuthorityTest {
     // ── requestReconnect ────────────────────────────────────────────────────
 
     @Test
-    fun requestReconnect_skeletonIsNoOp_doesNotChangeState() = runTest {
-        // Matches the Chrome JS skeleton at commit 68e3c9f: requestReconnect
-        // is a no-op stub until Task 17 wires the recovery ladder. The earlier
-        // draft dispatched RecoveryBegan, which prematurely flipped Online
-        // -> Reconnecting and would have collided with Task 17's actual
-        // ladder kickoff.
+    fun requestReconnect_fromOnline_kicksRung3Ladder_movesToReconnecting() = runTest {
+        // Task 20 / Step F: requestReconnect is no longer a no-op. It
+        // cancels any in-flight ladder, drops the surrender flag, resets
+        // the thrash log + backoff attempt, and kicks a fresh Rung-3-only
+        // ladder. The IMMEDIATE observable effect is the RecoveryBegan
+        // dispatch — selfState moves Online -> Reconnecting(false). Use
+        // runCurrent to capture the immediate state then shutdown to halt
+        // the ladder before runTest's teardown drives it through Rung 3
+        // surrender (which has its own runCurrent-friendly synchronous
+        // false-return in skeleton mode).
         val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
+        runCurrent()
         auth.notifyWsOpening()
         auth.notifyAuthComplete()
-        advanceUntilIdle()
+        runCurrent()
         assertSame(SelfState.Online, auth.selfState.value)
 
         auth.requestReconnect()
-        advanceUntilIdle()
-        assertSame(
-            "skeleton requestReconnect must not transition selfState",
-            SelfState.Online,
-            auth.selfState.value,
+        runCurrent()
+        assertTrue(
+            "requestReconnect dispatches RecoveryBegan -> Reconnecting",
+            auth.selfState.value is SelfState.Reconnecting,
         )
+        auth.shutdown()
     }
 
     @Test
-    fun requestReconnect_doesNotThrow_inSkeletonForm() = runTest {
+    fun requestReconnect_kicksRung3OnlyLadder_skipsRungs1and2() = runTest {
+        // Task 20 / Step F: requestReconnect kicks a Rung-3-only ladder
+        // (mirrors Chrome's `_buildRung3OnlyLadder`). Rung 1 dispatches
+        // register-rendezvous via `signalingClient.send`; Rung 2 calls
+        // disconnect/connect. A Rung-3-only ladder skips both — observable
+        // as zero `send`/`disconnect`/`connect` calls during the
+        // post-requestReconnect tick. Rung 3 in skeleton mode (no
+        // forceFullReset) returns false synchronously, so the ladder
+        // exhausts inside the same runCurrent.
+        //
+        // After the synchronous Rung 3 surrender, `handleLadderSettled`
+        // runs Exhausted -> non-surrender ladder -> recordRung3Failure +
+        // promoteToRung4 -> surrenderedToUser=true again. So we can't
+        // assert on the surrender flag's intermediate cleared state from
+        // the test without a more invasive instrumentation. Instead, we
+        // pin the structural invariant: the Rung-3-only ladder did not
+        // call send/disconnect/connect.
+        val (auth, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        // Snapshot signaling counts BEFORE requestReconnect — should be 0
+        // for all three because we haven't kicked any auto-recovery ladder.
+
+        auth.requestReconnect()
+        runCurrent()
+
+        auth.shutdown()
+
+        // No Rung-1 register-rendezvous send, no Rung-2 disconnect/connect.
+        verify(exactly = 0) { signaling.client.send(any()) }
+        verify(exactly = 0) { signaling.client.disconnect() }
+        verify(exactly = 0) { signaling.client.connect(any()) }
+    }
+
+    @Test
+    fun requestReconnect_doesNotThrow() = runTest {
+        // Smoke test — even from cold-boot Offline state, requestReconnect
+        // must not throw. The ladder kicks anyway (Rung 3 from any state),
+        // but with no forceFullReset it surrenders synchronously.
         val (auth, _) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
-        auth.requestReconnect() // skeleton stub — must not throw
-        advanceUntilIdle()
+        runCurrent()
+        auth.requestReconnect()
+        runCurrent()
+        auth.shutdown()
     }
 
     // ── threading: confined dispatcher serialises concurrent producers ─────
@@ -463,32 +526,45 @@ class ConnectionAuthorityTest {
 
     @Test
     fun connectionStateDisconnectedFromConnected_dispatchesWsClosed() = runTest {
+        // Pre-Step-E this used `advanceUntilIdle()` after the Disconnected
+        // transition. Task 20 / Step E adds Rung 4 surrender promotion,
+        // so a fully-drained ladder would surrender the state machine to
+        // Reconnecting(true) and the assertion `surrenderedToUser=false`
+        // would fail. The intent here is the IMMEDIATE post-Disconnected
+        // transition — switch to runCurrent + explicit shutdown to keep
+        // the assertion focused.
         val (auth, signaling) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
+        runCurrent()
         signaling.connectionState.value = ConnectionState.Connecting(0)
-        advanceUntilIdle()
+        runCurrent()
         signaling.connectionState.value = ConnectionState.Connected
-        advanceUntilIdle()
+        runCurrent()
         assertSame(SelfState.Online, auth.selfState.value)
 
         signaling.connectionState.value = ConnectionState.Disconnected
-        advanceUntilIdle()
+        runCurrent()
         val s = auth.selfState.value
         assertTrue(s is SelfState.Reconnecting)
         assertEquals(false, (s as SelfState.Reconnecting).surrenderedToUser)
+        auth.shutdown()
     }
 
     @Test
     fun connectionStateError_dispatchesWsClosed() = runTest {
+        // See [connectionStateDisconnectedFromConnected_dispatchesWsClosed] —
+        // same Step-E adjustment: assert IMMEDIATE post-Error state via
+        // runCurrent, shutdown explicitly to halt the ladder before
+        // runTest's teardown drives it to surrender.
         val (auth, signaling) = buildAuthority(StandardTestDispatcher(testScheduler))
-        advanceUntilIdle()
+        runCurrent()
         signaling.connectionState.value = ConnectionState.Connecting(0)
-        advanceUntilIdle()
+        runCurrent()
         signaling.connectionState.value = ConnectionState.Connected
-        advanceUntilIdle()
+        runCurrent()
         signaling.connectionState.value = ConnectionState.Error("boom")
-        advanceUntilIdle()
+        runCurrent()
         assertTrue(auth.selfState.value is SelfState.Reconnecting)
+        auth.shutdown()
     }
 
     // ── relay listener: peer-online / peer-offline routing ─────────────────
@@ -1437,10 +1513,15 @@ class ConnectionAuthorityTest {
     }
 
     @Test
-    fun ladder_exhaustion_keepsSelfStateInReconnecting_noSurrender() = runTest {
-        // Task 17 does NOT yet dispatch RecoveryGivenUp on exhaustion —
-        // Rung 4 surrender lands in the follow-up task. Verify selfState
-        // stays Reconnecting(false) after the ladder gives up.
+    fun ladder_exhaustion_promotesToRung4_setsSurrenderFlag() = runTest {
+        // Task 20 update: was previously the "no surrender on exhaustion"
+        // test (Task 17 deferred Rung 4). Now that Rung 4 is wired, an
+        // exhausted ladder dispatches `RecoveryGivenUp`, which the
+        // selfState reducer translates into Reconnecting(surrenderedToUser=true),
+        // and the authority's [surrenderedToUser] flag flips to true.
+        // The Rung-4 backoff timer is also armed but is cancelled by the
+        // shutdown() at the end of the test BEFORE the test scheduler can
+        // advance to its 30s deadline.
         val (auth, _, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
         runCurrent()
         auth.notifyWsOpening()
@@ -1449,7 +1530,8 @@ class ConnectionAuthorityTest {
         auth.notifyWsClosed() // Online -> Reconnecting kicks ladder.
         runCurrent()
 
-        // Drive past both budgets so the ladder exhausts.
+        // Drive past both budgets so the ladder exhausts. Rung 3 surrenders
+        // synchronously in skeleton mode (no forceFullReset hook).
         testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
         runCurrent()
 
@@ -1457,12 +1539,159 @@ class ConnectionAuthorityTest {
         val s = auth.selfState.value
         assertTrue("selfState stays Reconnecting on exhaustion", s is SelfState.Reconnecting)
         assertEquals(
-            "surrender flag must NOT be set on Task 17 exhaustion",
-            false,
+            "surrender flag IS set after Task 20 Rung 4 promotion",
+            true,
             (s as SelfState.Reconnecting).surrenderedToUser,
         )
+        assertEquals(
+            "authority surrenderedToUser tracks the dispatched state",
+            true,
+            auth.surrenderedToUser,
+        )
+
+        // shutdown() cancels the still-armed Rung-4 backoff timer cleanly.
+        auth.shutdown()
+    }
+
+    @Test
+    fun ladder_thrashGuard_secondRung3FailureWithinWindow_thirdKickUsesSurrenderLadder() = runTest {
+        // Task 20 / Step E: two full Rung-3 failures within
+        // RUNG_3_THRASH_WINDOW_MS (5 min) trigger the thrash guard. The
+        // third kick builds a one-rung surrender ladder which returns
+        // false synchronously — observable as the third ladder having
+        // currentLadderIsSurrender semantics, but since that field is
+        // private we observe the structural invariant: the third kick's
+        // ladder exhausts WITHOUT making any signaling.client calls
+        // (Rung 1 register-rendezvous + Rung 2 disconnect/connect are
+        // skipped entirely by the surrender ladder).
+        //
+        // Sequence:
+        //   1. Drive ladder #1 to exhaustion (Rungs 1+2+3 surrender) →
+        //      records 1 Rung-3 failure, promotes to Rung 4 (surrender flag,
+        //      backoff timer armed).
+        //   2. requestReconnect would reset the thrash log; we don't call
+        //      it. Instead, manually re-kick by driving a fresh failure.
+        //      But the existing ladder is null after the previous exhaustion
+        //      so we simply notify another peer-failed.
+        //   3. Drive ladder #2 to exhaustion → records 2nd Rung-3 failure.
+        //   4. Third kick should use the surrender ladder → exhausts
+        //      synchronously without further signaling calls.
+        val (auth, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyPeerOnline("X")
+        runCurrent()
+
+        // Ladder #1.
+        auth.notifyPingMissed("X")
+        auth.notifyPingMissed("X")
+        runCurrent()
+        assertNotNull("ladder #1 kicked", auth.currentLadder)
+
+        // Drain ladder #1 to exhaustion. RUNG_1+RUNG_2 budgets cover Rungs
+        // 1+2; Rung 3 surrenders synchronously in skeleton mode. After this
+        // the ladder is null and the thrash log has 1 entry.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        assertNull("ladder #1 cleared after exhaustion", auth.currentLadder)
+        assertEquals("first Rung-3 failure recorded", true, auth.surrenderedToUser)
+
+        // Ladder #2 — drive a fresh peer to FAILED. The peer reducer's
+        // RecoveryGivenUp dispatch from ladder #1 didn't reset peer X's
+        // FAILED state (peer reducer only reacts on RecoverySucceeded /
+        // PreFlightFailed / etc.). So we need a fresh peer or to simulate
+        // X coming back online and failing again. Simpler: notifyPeerOnline
+        // is idempotent; we drive notifyPongReceived to lift X back, then
+        // PingMissed twice to fail it again.
+        //
+        // BUT: peer X is already FAILED, so a new ladder kick from peer
+        // failure won't fire (no transition). Use a self-trigger instead:
+        // if selfState is Reconnecting(true), notifyAuthComplete moves us
+        // to Online; then notifyWsClosed moves Online -> Reconnecting(false)
+        // which kicks ladder #2.
+        auth.notifyAuthComplete()  // Reconnecting -> Online
+        runCurrent()
+        auth.notifyWsClosed()      // Online -> Reconnecting kicks ladder #2
+        runCurrent()
+        assertNotNull("ladder #2 kicked", auth.currentLadder)
+
+        // Drain ladder #2 to exhaustion → 2 Rung-3 failures recorded.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        assertNull("ladder #2 cleared after exhaustion", auth.currentLadder)
+
+        // Snapshot signaling call counts after 2 full ladders.
+        // Each non-surrender ladder did 1 send (rung1 register-rendezvous)
+        // + 1 disconnect + 1 connect (rung2). So 2 of each so far.
+
+        // Ladder #3 — manual third kick via self-trigger. Auth back to
+        // Online then close again. The thrash guard fires inside
+        // [kickLadder], so ladder #3 is the synthetic surrender ladder
+        // (one rung returning false synchronously). It exhausts inside
+        // the same runCurrent() that runs the kick — no additional
+        // virtual-time advance needed.
+        auth.notifyAuthComplete()  // Reconnecting -> Online
+        runCurrent()
+        auth.notifyWsClosed()      // kicks ladder #3 (surrender variant)
+        runCurrent()
+        // ladder #3 is synthetic surrender — by the time runCurrent
+        // returns, the synchronous false-return + handleLadderSettled has
+        // already run and currentLadder is back to null.
+        assertNull(
+            "ladder #3 surrender ladder exhausts synchronously inside one runCurrent",
+            auth.currentLadder,
+        )
+
+        // Shutdown cancels the still-armed Rung-4 backoff timer.
+        auth.shutdown()
+
+        // The thrash-guard surrender ladder must NOT have invoked Rungs
+        // 1 or 2 — total signaling counts stay at 2 (one per non-thrash
+        // ladder).
+        verify(exactly = 2) { signaling.client.send(any()) }
+        verify(exactly = 2) { signaling.client.disconnect() }
+        verify(exactly = 2) { signaling.client.connect(any()) }
+    }
+
+    @Test
+    fun ladder_backoff_armedOnRung4_cancelledByShutdown() = runTest {
+        // Task 20 / Step E: after exhaustion + Rung 4 promotion, a backoff
+        // timer is armed for BACKOFF_SCHEDULE_MS[0] (30s). [shutdown] MUST
+        // cancel the backoff Job before scope.cancel — without that
+        // ordering, runTest's teardown advanceUntilIdle hits the still-
+        // armed delay and the test JVM hangs.
+        //
+        // The structural assertion: shutdown() returns cleanly (no test
+        // hang) and post-shutdown advanceTimeBy past the 30s backoff
+        // produces NO new ladder kick (no fireBackoffRetry).
+        val (auth, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        auth.notifyWsClosed() // kicks ladder
+        runCurrent()
+        // Drain to exhaustion → promotes to Rung 4 → arms backoff timer.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        assertEquals("Rung 4 surrender flag set", true, auth.surrenderedToUser)
+        assertNull("ladder cleared post-Rung-4 promotion", auth.currentLadder)
+
+        // Snapshot signaling call counts before shutdown.
+        // The first ladder did 1 send + 1 disconnect + 1 connect.
 
         auth.shutdown()
+        runCurrent()
+
+        // Past the 30s backoff (BACKOFF_SCHEDULE_MS[0]). If shutdown didn't
+        // properly cancel the backoff Job, fireBackoffRetry would call
+        // kickLadder → another rung1 send. The shuttingDown latch in
+        // kickLadder is the second line of defence; this test pins both.
+        testScheduler.advanceTimeBy(60_000L)
+        runCurrent()
+        assertNull("no backoff-driven ladder post-shutdown", auth.currentLadder)
+        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.disconnect() }
+        verify(exactly = 1) { signaling.client.connect(any()) }
     }
 
     @Test
@@ -1590,6 +1819,108 @@ class ConnectionAuthorityTest {
         // cadence engine's delay(120000) for X is still armed and would
         // otherwise drive an unbounded reschedule loop. Same gotcha as
         // the Task 16 cadence tests.
+        auth.shutdown()
+    }
+
+    @Test
+    fun ladder_rung3_successPath_resetHookDrivesServiceRunning_andSelfOnline() = runTest {
+        // Task 20 / Step D: Rung 3 with a non-null `forceFullReset` hook
+        // exercises the cancellation-discipline code (pre/post `isActive`
+        // checks, the inner `coroutineScope { ... }` wrapper, the
+        // `combine(_selfState, serviceLifecycle.state).first { ... }`
+        // predicate). The skeleton-mode test above only covers the early-
+        // return at line ~1255 — without this success-path test, the
+        // exact code that hung the FIRST attempt at Task 20 ships
+        // untested.
+        //
+        // The test injects a reset lambda that simulates the
+        // foreground-service stop→clear→start dance:
+        //   1. Dispatch ServiceState.Stopping → Stopped
+        //   2. Dispatch ServiceState.Starting
+        //   3. Drive selfState to Online (notifyAuthComplete)
+        //   4. Dispatch ServiceState.Running — the combine() predicate
+        //      now fires (`selfState===Online && serviceState===Running`)
+        // and Rung 3 returns `true` → ladder Success.
+        val signaling = newFakeSignaling()
+        val sl = com.zaptransfer.android.service.ServiceLifecycle()
+        var authHolder: ConnectionAuthority? = null
+        val auth = ConnectionAuthority(
+            signalingClient = signaling.client,
+            dispatcher = StandardTestDispatcher(testScheduler),
+            pingTracker = null,
+            now = { 0L },
+            serviceLifecycle = sl,
+            forceFullReset = {
+                sl.dispatch(com.zaptransfer.android.service.ServiceState.Stopping)
+                sl.dispatch(com.zaptransfer.android.service.ServiceState.Stopped)
+                sl.dispatch(com.zaptransfer.android.service.ServiceState.Starting)
+                authHolder!!.notifyAuthComplete()
+                sl.dispatch(com.zaptransfer.android.service.ServiceState.Running)
+            },
+        )
+        authHolder = auth
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        auth.notifyWsClosed() // Online -> Reconnecting kicks ladder.
+        runCurrent()
+        assertNotNull("ladder kicked", auth.currentLadder)
+
+        // Drive past Rungs 1+2 (no peer Healthy → Rung 1 timeouts at 5s;
+        // no service Running → Rung 2 timeouts at 20s). Then Rung 3
+        // fires the reset lambda which drives the success criterion.
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+        // Allow the settle handler to run.
+        runCurrent()
+
+        assertNull(
+            "ladder released after Rung 3 success (forceFullReset drove " +
+                "selfState=Online + serviceState=Running)",
+            auth.currentLadder,
+        )
+        assertSame(
+            "selfState lifted back to Online after Rung 3 success",
+            SelfState.Online,
+            auth.selfState.value,
+        )
+
+        auth.shutdown()
+    }
+
+    @Test
+    fun ladder_rung3_skeletonMode_noResetHook_advancesPastRung3() = runTest {
+        // Task 20 / Step D: Rung 3 with `forceFullReset == null` surrenders
+        // synchronously, so the ladder advances cleanly to Exhausted (Rung
+        // 4 surrender lands in Step E). The existing
+        // [ladder_exhaustion_keepsSelfStateInReconnecting_noSurrender] test
+        // already drains through Rungs 1+2; this test pins the additional
+        // contract that Rung 3 in skeleton mode adds zero time-budget to
+        // the drain (return false synchronously) — so the same
+        // RUNG_1_BUDGET + RUNG_2_BUDGET advance suffices to exhaust.
+        //
+        // Wire-shape verification: forceFullReset is NOT in the
+        // buildCadenceAuthority signature — skeleton-mode is the default.
+        val (auth, _, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        runCurrent()
+        auth.notifyWsOpening()
+        auth.notifyAuthComplete()
+        runCurrent()
+        auth.notifyWsClosed() // Online -> Reconnecting kicks ladder.
+        runCurrent()
+        assertNotNull(auth.currentLadder)
+
+        // Drive past Rungs 1 and 2 budgets only — Rung 3 surrenders
+        // synchronously in skeleton mode (no extra advance needed).
+        testScheduler.advanceTimeBy(RUNG_1_BUDGET_MS + RUNG_2_BUDGET_MS + 1_000L)
+        runCurrent()
+
+        assertNull(
+            "ladder cleared after Rung 3 skeleton-mode synchronous surrender",
+            auth.currentLadder,
+        )
+
         auth.shutdown()
     }
 

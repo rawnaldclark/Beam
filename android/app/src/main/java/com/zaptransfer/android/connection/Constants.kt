@@ -103,3 +103,79 @@ const val RUNG_1_BUDGET_MS: Long = 5_000L
  * Mirrors `RUNG_2_BUDGET_MS` in `extension/connection/constants.js`.
  */
 const val RUNG_2_BUDGET_MS: Long = 15_000L
+
+/**
+ * Recovery ladder Rung 3 budget, in milliseconds.
+ *
+ * Rung 3 ("full session reset") invokes the wired `forceFullReset` hook —
+ * which on Android stops the foreground service via Intent, awaits its
+ * `onDestroy`, clears v2 transport singleton in-memory state, then
+ * restarts the service via Intent — and waits up to this budget for
+ * `selfState = ONLINE` AND `serviceLifecycle = Running`. 30s is the spec
+ * budget: long enough to absorb the OS-level service restart latency
+ * (~200ms typical, multi-second worst case under battery saver) plus the
+ * relay's full auth round-trip, short enough that a permanently-dead
+ * relay surrenders to Rung 4 within the user's "is this still trying"
+ * patience window.
+ *
+ * Mirrors `RUNG_3_BUDGET_MS` in `extension/connection/constants.js`.
+ */
+const val RUNG_3_BUDGET_MS: Long = 30_000L
+
+/**
+ * Per-step deadline for the Rung 3 service-stop phase, in milliseconds.
+ *
+ * Rung 3 dispatches a stop Intent and awaits `serviceLifecycle = Stopped`
+ * before issuing the start Intent. If the service never reports stopped
+ * within this window (e.g. the OS chose to deliver onDestroy on a delayed
+ * tick due to GC pressure), the rung surrenders without trying to start
+ * a fresh service on top of a half-torn-down one. The remaining
+ * [RUNG_3_BUDGET_MS] - [RUNG_3_STOP_TIMEOUT_MS] = 20s is then available
+ * for the start phase + selfState=Online wait. No Chrome counterpart —
+ * Chrome's `forceFullReset` is synchronous (no service Intent latency).
+ */
+const val RUNG_3_STOP_TIMEOUT_MS: Long = 10_000L
+
+/**
+ * Window over which Rung-3 attempts are counted toward the thrash guard,
+ * in milliseconds.
+ *
+ * Per spec §"Discipline rules": "Two full Rung-3 failures within 5 min →
+ * promote to Rung 4 immediately. Don't thrash." A "full Rung-3 failure"
+ * means the ladder reached Rung 3, ran its 30s budget, and `selfState`
+ * did not become ONLINE.
+ *
+ * Mirrors `RUNG_3_THRASH_WINDOW_MS` in
+ * `extension/connection/connection-authority.js`.
+ */
+const val RUNG_3_THRASH_WINDOW_MS: Long = 5L * 60_000L
+
+/**
+ * Failure-count threshold within [RUNG_3_THRASH_WINDOW_MS] that promotes
+ * the next ladder kick to a surrender-only ladder, bypassing Rungs 1+2+3
+ * and going straight to Rung 4.
+ *
+ * Mirrors `RUNG_3_THRASH_THRESHOLD` in
+ * `extension/connection/connection-authority.js`.
+ */
+const val RUNG_3_THRASH_THRESHOLD: Int = 2
+
+/**
+ * Exponential backoff schedule for Rung 4 auto-retry attempts, in
+ * milliseconds.
+ *
+ * After Rung 4 surrender lands, the authority arms a timer of
+ * `BACKOFF_SCHEDULE_MS[min(attempt, last)]` ms. The attempt index advances
+ * after each scheduling so the next retry uses a longer delay; the cap is
+ * the final entry (30 min). The user can always manually tap "Reconnect"
+ * which bypasses the schedule entirely (Task 20 §"Discipline rules":
+ * "Manual tap always bypasses backoff").
+ *
+ * Mirrors `BACKOFF_SCHEDULE_MS` in `extension/connection/constants.js`.
+ */
+val BACKOFF_SCHEDULE_MS: List<Long> = listOf(
+    30_000L,        // 30s
+    120_000L,       // 2 min
+    600_000L,       // 10 min
+    1_800_000L,     // 30 min (cap)
+)

@@ -61,6 +61,15 @@ class TransferForegroundService : LifecycleService() {
     @Inject
     lateinit var transferEngine: TransferEngine
 
+    /**
+     * Process-scoped service-lifecycle observable consumed by
+     * [com.zaptransfer.android.connection.ConnectionAuthority]'s recovery
+     * ladder Rung 3 (full session reset). Updated from [onCreate] /
+     * [onStartCommand] / [onDestroy].
+     */
+    @Inject
+    lateinit var serviceLifecycle: ServiceLifecycle
+
     /** Holds CPU wake lock + Wi-Fi high-perf lock for the transfer duration. */
     private lateinit var wakeLockManager: WakeLockManager
 
@@ -72,6 +81,11 @@ class TransferForegroundService : LifecycleService() {
         super.onCreate()
         wakeLockManager = WakeLockManager(applicationContext)
         notificationManager = getSystemService(NotificationManager::class.java)
+
+        // Mark as Starting until onStartCommand publishes Running. The
+        // recovery ladder's Rung 3 watches for Running specifically, so an
+        // intermediate Starting beat keeps observers honest.
+        serviceLifecycle.dispatch(ServiceState.Starting)
 
         Log.d(TAG, "Service created")
     }
@@ -120,13 +134,25 @@ class TransferForegroundService : LifecycleService() {
         // Subscribe to engine progress and update the notification on every change.
         observeProgress()
 
+        // Service is alive and processing transfers — the recovery ladder's
+        // Rung 3 awaits this transition after dispatching a fresh start
+        // Intent.
+        serviceLifecycle.dispatch(ServiceState.Running)
+
         return START_STICKY
     }
 
     override fun onDestroy() {
+        // Publish Stopping BEFORE wakeLockManager.release / super.onDestroy
+        // so any observer that needs to react to the impending shutdown sees
+        // Stopping while the service is still alive enough to be useful.
+        serviceLifecycle.dispatch(ServiceState.Stopping)
         wakeLockManager.release()
         Log.d(TAG, "Service destroyed — wake locks released")
         super.onDestroy()
+        // Final transition only after super.onDestroy returns — that's the
+        // tick at which the OS has truly torn the service singleton down.
+        serviceLifecycle.dispatch(ServiceState.Stopped)
     }
 
     override fun onBind(intent: Intent): IBinder? = null

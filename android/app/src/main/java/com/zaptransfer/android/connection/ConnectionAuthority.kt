@@ -3,6 +3,8 @@ package com.zaptransfer.android.connection
 import android.util.Log
 import androidx.annotation.VisibleForTesting
 import com.zaptransfer.android.crypto.KeyManager
+import com.zaptransfer.android.service.ServiceLifecycle
+import com.zaptransfer.android.service.ServiceState
 import com.zaptransfer.android.webrtc.ConnectionState
 import com.zaptransfer.android.webrtc.RelayMessage
 import com.zaptransfer.android.webrtc.SignalingClient
@@ -18,12 +20,14 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
@@ -133,7 +137,53 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * issue zero pings). The lambda decouples the two cleanly.
      */
     private val now: () -> Long = System::currentTimeMillis,
+    /**
+     * Process-scoped service-lifecycle observable consumed by Rung 3
+     * (Task 20). Defaults to a fresh disconnected instance for tests
+     * that don't drive Rung 3; production wires the Hilt @Singleton.
+     */
+    private val serviceLifecycle: ServiceLifecycle = ServiceLifecycle(),
+    /**
+     * Full session-reset hook for Rung 3 (Task 20). Production wires
+     * this post-construction via [setForceFullReset] from a Hilt module
+     * (avoiding a `BeamV2Wiring ↔ ConnectionAuthority` DI cycle); tests
+     * inject directly.
+     *
+     * Hook contract:
+     *   1. Stop the foreground service (await `serviceLifecycle = Stopped`).
+     *   2. Clear v2 transport in-memory state (outbox / inbox / inflight).
+     *   3. Restart the foreground service (await `serviceLifecycle = Running`).
+     *
+     * Throws → swallowed by Rung 3; the budget-timer race observes
+     * success-by-other-path before surrendering. `null` → Rung 3
+     * surrenders synchronously (skeleton mode).
+     */
+    forceFullReset: (suspend () -> Unit)? = null,
 ) {
+
+    /**
+     * Mutable so production wiring can install the hook AFTER construction
+     * (resolves the BeamV2Wiring ↔ ConnectionAuthority DI cycle that
+     * caching the hook eagerly would force). Read-only from the rung
+     * action's perspective — once set, the reference is stable for the
+     * life of the authority.
+     */
+    private var forceFullReset: (suspend () -> Unit)? = forceFullReset
+
+    /**
+     * Production-side wiring hook: install the `forceFullReset` callback
+     * after construction. The Hilt module that builds [ConnectionAuthority]
+     * cannot inject a callback that closes over [BeamV2Wiring] in the
+     * primary constructor without a DI cycle — so the wiring layer calls
+     * this from its own `init` once both singletons are live.
+     *
+     * Idempotent: re-installing the hook overwrites the previous reference.
+     * The replacement takes effect on the NEXT Rung 3 invocation; an
+     * in-flight Rung 3 continues to use the reference it captured.
+     */
+    fun setForceFullReset(reset: suspend () -> Unit) {
+        forceFullReset = reset
+    }
 
     /**
      * Production constructor. Hilt sees this and provides the
@@ -253,6 +303,18 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         private set
 
     /**
+     * Companion flag to [currentLadder] tracking whether the in-flight
+     * ladder is the thrash-surrender variant (one synthetic rung that
+     * returns false synchronously, sending us straight to Rung 4 without
+     * incrementing the thrash log). Mirrors Chrome's
+     * `RecoveryLadder._isSurrenderLadder` tag.
+     *
+     * `false` whenever [currentLadder] is null. Reads/writes on [scope]'s
+     * single-thread confinement.
+     */
+    private var currentLadderIsSurrender: Boolean = false
+
+    /**
      * Track of whether the authority is in "shutting down" state. Set in
      * [shutdown] before scope cancellation so any post-cancel observable
      * collector that races the teardown can short-circuit cleanly. Without
@@ -263,6 +325,64 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      */
     @Volatile
     private var shuttingDown: Boolean = false
+
+    // ── Task 20 — Rung 4 surrender / backoff / thrash guard ───────────────
+
+    /**
+     * Surrender flag (Task 20 — Rung 4). `true` after the ladder has given
+     * up and we are waiting on backoff or manual user tap; `false` otherwise.
+     * Mirrors Chrome's `_surrenderedToUser.value` Observable.
+     *
+     * Lives on [scope]'s single-thread confinement; reads from `selfState`
+     * subscribers (e.g. UI banner) get a consistent value via the
+     * [selfStateWithSurrender] StateFlow exposure (deferred — Task 21 wires
+     * the UI). For Task 20 we track it as a private flag and surface only
+     * via tests.
+     */
+    @VisibleForTesting
+    internal var surrenderedToUser: Boolean = false
+        private set
+
+    /**
+     * Timestamps (in [now] coordinates) of recent full Rung-3 failures.
+     * A "full Rung-3 failure" is recorded by [recordRung3Failure] exactly
+     * when the ladder reached Rung 3, ran its full budget, and `selfState`
+     * did not become ONLINE. Entries older than [RUNG_3_THRASH_WINDOW_MS]
+     * are pruned at the next read via [thrashGuardActive].
+     *
+     * Mirrors Chrome's `_rung3FailureLog`. Lives on [scope]'s single-
+     * thread confinement.
+     */
+    private val rung3FailureLog = mutableListOf<Long>()
+
+    /**
+     * Auto-retry attempt counter for Rung 4 backoff. Indexes into
+     * [BACKOFF_SCHEDULE_MS]. Reset to 0 every time recovery succeeds (or
+     * [requestReconnect] fires). Capped at the last index (the spec's
+     * 30-min cap rule). Mirrors Chrome's `_backoffAttempt`.
+     */
+    private var backoffAttempt: Int = 0
+
+    /**
+     * Pending Rung-4 auto-retry [Job]. Non-null while a `delay(...)` is
+     * armed; cleared when the timer fires, on [requestReconnect] (manual
+     * tap bypasses backoff), and on [shutdown].
+     *
+     * **CRITICAL cancellation order.** [shutdown] MUST cancel this Job
+     * BEFORE `scope.cancel()` AND null the field. Otherwise `runTest`'s
+     * teardown `advanceUntilIdle` advances virtual time to the still-armed
+     * `delay`, [fireBackoffRetry] runs on a (just-cancelled) scope, and
+     * the test JVM hangs on never-draining work. Mirrors the prior-attempt
+     * gotcha called out in Task 20's CRITICAL notes.
+     *
+     * `@Volatile` because writes happen on the worker thread (inside
+     * [scheduleBackoffRetry]) but reads/cancels from [shutdown] run on the
+     * caller's thread. Without the visibility guarantee the field-cancel
+     * could miss an armed Job, leaving the explicit pre-cancel ordering
+     * above ineffective.
+     */
+    @Volatile
+    private var backoffJob: Job? = null
 
     /**
      * Per-peer cadence record. `pingJob` is the scheduled "next ping fires"
@@ -724,14 +844,109 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * Manual reconnect entry point (e.g. UI "Reconnect" tap, lifecycle
      * resume).
      *
-     * **Skeleton form is a no-op stub** — matches the Chrome JS skeleton at
-     * commit `68e3c9f`. The actual ladder kickoff (cancel in-flight ladder,
-     * dispatch a fresh one starting at Rung 3, drive
-     * [signalingClient.connect] to cycle the WebSocket) lands in Task 17.
+     * Per spec §"Discipline rules": "Manual tap always bypasses backoff.
+     * `requestReconnect` mid-ladder cancels and restarts at Rung 3."
+     *
+     * Sequence (mirrors Chrome's `requestReconnect` in
+     * `extension/connection/connection-authority.js#requestReconnect`):
+     *   1. Cancel any in-flight ladder. The cancellation propagates into
+     *      the rung action via [RecoveryLadder.cancel] → [rungScope]'s
+     *      cancellation; the launched-from-kickLadder collector observes
+     *      [LadderResult.Cancelled] and `handleLadderSettled` returns
+     *      without running [recordRung3Failure] / [promoteToRung4].
+     *   2. Cancel the Rung-4 backoff timer (manual tap bypasses backoff).
+     *   3. Drop the surrender flag.
+     *   4. Reset the thrash log (the user has intervened, so the
+     *      "two recent Rung-3 failures" signal is no longer relevant).
+     *   5. Reset the backoff attempt counter.
+     *   6. Build a fresh ladder starting at Rung 3 (skipping Rungs 1+2 —
+     *      manual reconnect implies the user has decided the lighter
+     *      rungs aren't worth trying).
+     *   7. Latch [currentLadder] BEFORE dispatching `RecoveryBegan` so
+     *      the post-hook re-entry hits the "ladder owns the floor" guard.
+     *   8. Launch the new ladder via [scope.launch].
+     *
+     * **Cancel-then-launch ordering.** The cancellation of the prior
+     * ladder is synchronous from the caller's perspective ([RecoveryLadder.cancel]
+     * is non-suspending). The actual settlement of the prior ladder's
+     * `run()` happens asynchronously on its own [scope.launch] — but the
+     * `currentLadder === ladder` guard in [kickLadder] prevents the
+     * settle handler from clobbering our newly-installed ladder slot.
+     *
+     * Safe to call from any thread — marshals onto [scope] via launch.
+     * No-op if shutting down.
      */
     fun requestReconnect() {
-        // Intentionally empty until Task 17. See KDoc.
+        if (shuttingDown) return
+        scope.launch {
+            // 1. Cancel any in-flight ladder. The launched-from-kickLadder
+            // settle handler will see LadderResult.Cancelled and skip the
+            // promoteToRung4 path. We snapshot the prior ladder reference
+            // BEFORE clearing currentLadder so kickLadder's
+            // `if (currentLadder === ladder)` guard correctly distinguishes
+            // "the prior ladder cancelled" from "the new ladder is in flight".
+            currentLadder?.cancel()
+            currentLadder = null
+            currentLadderIsSurrender = false
+
+            // 2. Cancel any pending Rung-4 backoff retry. Manual tap is
+            // the user saying "don't wait, try now."
+            cancelBackoffJob()
+
+            // 3. Drop the surrender flag so the popup banner shows
+            // "Reconnecting…" again (yellow), not "Connection failed" (red).
+            if (surrenderedToUser) surrenderedToUser = false
+
+            // 4. Reset the thrash log — the user has intervened.
+            rung3FailureLog.clear()
+
+            // 5. Reset the backoff attempt counter so the next surrender
+            // (if any) starts at the 30s schedule[0] again.
+            backoffAttempt = 0
+
+            // 6. Build a fresh ladder starting at Rung 3.
+            val ladder = buildRung3OnlyLadder()
+            // 7. Latch BEFORE dispatching RecoveryBegan (same ordering
+            // rationale as kickLadder).
+            currentLadder = ladder
+            currentLadderIsSurrender = false
+            dispatchSelf(SelfStateEvent.RecoveryBegan)
+
+            Log.i(TAG, "[CA] ladder: kicked reason=manual-reconnect")
+
+            // 8. Launch the new ladder. The settle handler runs through
+            // the same handleLadderSettled path as auto-kicked ladders;
+            // success lifts to Online, exhaustion goes through Rung 4.
+            scope.launch {
+                val result = ladder.run()
+                val wasSurrender = currentLadderIsSurrender
+                if (currentLadder === ladder) {
+                    currentLadder = null
+                    currentLadderIsSurrender = false
+                }
+                handleLadderSettled(result, triggerPeerId = null, wasSurrenderLadder = wasSurrender)
+            }
+        }
     }
+
+    /**
+     * Build a single-rung ladder that runs ONLY Rung 3. Used by
+     * [requestReconnect] — manual tap always goes straight to a full
+     * session reset (Rungs 1 + 2 are useful for "keep the existing
+     * transport, just nudge it" scenarios; manual reconnect implies the
+     * user has decided the lighter rungs aren't worth trying).
+     *
+     * Mirrors Chrome's `_buildRung3OnlyLadder`.
+     */
+    private fun buildRung3OnlyLadder(): RecoveryLadder = RecoveryLadder(
+        rungs = listOf(
+            RecoveryRung(
+                name = "rung3",
+                budgetMs = RUNG_3_BUDGET_MS,
+                action = { rungScope -> rung3Action(rungScope) },
+            ),
+        ),
+    )
 
     /**
      * Tear-down hook. Cancels every per-peer cadence job, clears the
@@ -752,12 +967,20 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         // re-enter dispatchSelf on a half-torn-down state machine.
         shuttingDown = true
         signalingClient.removeListener(relayListener)
+        // CRITICAL ordering (Task 20): cancel the Rung-4 backoff Job
+        // BEFORE [scope.cancel] — without this, runTest's teardown
+        // advanceUntilIdle advances virtual time to the still-armed
+        // `delay`, [fireBackoffRetry] runs on a (just-cancelled) scope,
+        // and the test JVM hangs on never-draining work. Field is nulled
+        // explicitly so a post-cancel advanceUntilIdle sees no armed delay.
+        cancelBackoffJob()
         // Cancel any in-flight ladder so its budget timers / Flow.first
         // subscriptions release. The ladder's run() resolves with a
         // Cancelled outcome which the settle handler ignores once shutting-
         // Down is true.
         currentLadder?.cancel()
         currentLadder = null
+        currentLadderIsSurrender = false
         // Cancel cadence jobs explicitly before tearing down the scope.
         // scope.cancel() would cancel them too, but doing it here keeps the
         // bookkeeping consistent for the tests that introspect peerCadence
@@ -816,13 +1039,22 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         if (shuttingDown) return
         if (currentLadder != null) return // ladder owns the floor
 
-        val ladder = buildLadder(triggerPeerId)
+        // Task 20 — thrash guard: if the last RUNG_3_THRASH_THRESHOLD Rung-3
+        // failures all landed within RUNG_3_THRASH_WINDOW_MS, skip Rungs
+        // 1+2+3 and go straight to Rung 4. The synthetic surrender ladder
+        // returns false synchronously, dropping into [handleLadderSettled]
+        // → [promoteToRung4]. Tagged via [currentLadderIsSurrender] so the
+        // settle handler doesn't double-count this kick toward the thrash
+        // log (the failures that triggered it are already counted).
+        val thrash = thrashGuardActive()
+        val ladder = if (thrash) buildSurrenderLadder() else buildLadder(triggerPeerId)
         // CRITICAL ordering (mirrors Chrome): latch `currentLadder` BEFORE
         // dispatching `RecoveryBegan`. The selfState reducer's RECONNECTING
         // post-hook in [dispatchSelf] re-enters [kickLadder]; latching first
         // makes the re-entry hit the "ladder owns the floor" guard cleanly
         // so we never run two concurrent ladders.
         currentLadder = ladder
+        currentLadderIsSurrender = thrash
 
         // Dispatch RecoveryBegan so the popup banner shows "Reconnecting"
         // immediately on a peer-FAILED kick, not just on a self-RECONNECTING
@@ -831,16 +1063,24 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
 
         Log.i(
             TAG,
-            "[CA] ladder: kicked reason=$reason triggerPeer=${triggerPeerId ?: "none"}",
+            "[CA] ladder: kicked reason=$reason triggerPeer=${triggerPeerId ?: "none"}" +
+                if (thrash) " thrash=YES" else "",
         )
 
         scope.launch {
             val result = ladder.run()
+            // Snapshot whether this ladder was a surrender ladder BEFORE
+            // clearing the slot — handleLadderSettled needs the flag to
+            // decide whether to count toward the thrash log.
+            val wasSurrender = currentLadderIsSurrender
             // After the ladder settles, if shutdown raced us, the assignment
             // here is harmless (currentLadder is already null) — the guard
             // in handleLadderSettled prevents post-shutdown dispatches.
-            if (currentLadder === ladder) currentLadder = null
-            handleLadderSettled(result, triggerPeerId)
+            if (currentLadder === ladder) {
+                currentLadder = null
+                currentLadderIsSurrender = false
+            }
+            handleLadderSettled(result, triggerPeerId, wasSurrender)
         }
     }
 
@@ -866,6 +1106,11 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
                 name = "rung2",
                 budgetMs = RUNG_2_BUDGET_MS,
                 action = { rungScope -> rung2Action(rungScope) },
+            ),
+            RecoveryRung(
+                name = "rung3",
+                budgetMs = RUNG_3_BUDGET_MS,
+                action = { rungScope -> rung3Action(rungScope) },
             ),
         ),
     )
@@ -970,6 +1215,103 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
     }
 
     /**
+     * Rung 3 — full session reset.
+     *
+     * Action: invoke the wired [forceFullReset] hook (which on Android stops
+     * the foreground service via Intent, awaits its `onDestroy`, clears v2
+     * transport in-memory state, and restarts the service via Intent).
+     * Success indicator: [selfState] is [SelfState.Online] AND
+     * [serviceLifecycle] reports [ServiceState.Running] within
+     * [RUNG_3_BUDGET_MS].
+     *
+     * **Skeleton-mode** (`forceFullReset == null`): the rung surrenders
+     * synchronously. There is nothing to reset and the ladder advances to
+     * Rung 4. Mirrors Chrome's "no `forceFullReset` => return false" path.
+     *
+     * **Cancellation discipline.** The success-criterion await wraps the
+     * Flow.first in an explicit [coroutineScope] so external cancellation
+     * (via [RecoveryLadder.cancel] propagating into [rungScope], or via
+     * [shutdown] cancelling [scope]) tears down the inner Flow collector
+     * cleanly — the alternative pattern (raw `withTimeoutOrNull { ...first { it } }`
+     * without the inner [coroutineScope]) was the source of the prior
+     * attempt's `runTest` teardown hang, where a cancelled-but-not-drained
+     * collector kept an armed virtual-time `delay` alive.
+     *
+     * The pre-suspend `rungScope.isActive` short-circuit avoids invoking
+     * the reset hook at all if cancellation has already landed (e.g.
+     * `requestReconnect` fired between the rung-2-timeout and rung-3-start
+     * tick).
+     *
+     * @param rungScope The rung's cancellation scope (cooperatively
+     *        observed via the inner [coroutineScope] + `isActive` check).
+     */
+    private suspend fun rung3Action(
+        rungScope: kotlinx.coroutines.CoroutineScope,
+    ): Boolean {
+        // Pre-suspend cancellation check: if the rung's scope is already
+        // cancelled (cancel raced our schedule), surrender without
+        // tearing down the FG service. Mirrors Chrome's
+        // `if (signal.aborted) return false`.
+        if (!rungScope.isActive) return false
+
+        val reset = forceFullReset
+        if (reset == null) {
+            // Skeleton-mode: no reset hook wired. Surrender synchronously
+            // so the ladder advances to Rung 4 (or exhausts in Task-20-
+            // step-D-isolation, where Rung 4 isn't wired yet).
+            //
+            // Logged at WARN so a beta APK shipped without the Step-G Hilt
+            // wiring (`setForceFullReset` never called) surfaces a
+            // detectable signal — without this log a "Reconnect" tap that
+            // surrenders within seconds with no actual reset attempt
+            // looks identical at the UI level to a stuck relay.
+            Log.w(
+                TAG,
+                "rung3Action: forceFullReset hook not wired — surrendering. " +
+                    "This is expected in unit tests but indicates a missing " +
+                    "production wiring step in real builds.",
+            )
+            return false
+        }
+
+        // Invoke the reset hook. A throw is swallowed (Chrome parity:
+        // `forceFullReset` swallows restart errors internally, and we do
+        // belt-and-braces here in case a test injects a throwing reset).
+        // The success-criterion wait still gets the budget to observe
+        // success-by-other-path before surrendering.
+        try {
+            reset()
+        } catch (ce: CancellationException) {
+            // Structured-concurrency cancel must propagate so the caller's
+            // scope tears down cleanly. Catching CE as a domain outcome
+            // would mask parent-cancellation as Rung-3-failure.
+            throw ce
+        } catch (e: Exception) {
+            Log.d(TAG, "rung3Action: forceFullReset() threw", e)
+        }
+
+        // Post-resume cancellation check: a cancel could have landed while
+        // the reset hook was suspending. Surrender immediately rather than
+        // arming a doomed Flow collector.
+        if (!rungScope.isActive) return false
+
+        // Wait for (selfState=Online AND serviceLifecycle=Running) within
+        // budget. Wrap the Flow.first in an inner `coroutineScope` so that
+        // when the outer `withTimeoutOrNull` cancels (timeout or external),
+        // the inner scope cancels structurally and tears down the combine
+        // collector — not relying on the timeout's implicit cancellation,
+        // which the prior attempt found could leak under runTest teardown.
+        return withTimeoutOrNull(RUNG_3_BUDGET_MS) {
+            coroutineScope {
+                combine(_selfState, serviceLifecycle.state) { self, svc ->
+                    self === SelfState.Online && svc === ServiceState.Running
+                }.first { it }
+                true
+            }
+        } ?: false
+    }
+
+    /**
      * Common settlement handler. Called from [kickLadder]'s `scope.launch`
      * once the ladder resolves.
      *
@@ -985,10 +1327,21 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
      * @param triggerPeerId The peer that triggered the kick (for lifting
      *        FAILED → UNKNOWN on success), or `null` if self-triggered.
      */
-    private fun handleLadderSettled(result: LadderResult, triggerPeerId: String?) {
+    private fun handleLadderSettled(
+        result: LadderResult,
+        triggerPeerId: String?,
+        wasSurrenderLadder: Boolean,
+    ) {
         if (shuttingDown) return
         when (result) {
             is LadderResult.Success -> {
+                // Spec §"Discipline rules": "A rung that succeeds resets the
+                // ladder to idle." Reset the thrash counter, the backoff
+                // attempt counter, and the surrender flag.
+                rung3FailureLog.clear()
+                backoffAttempt = 0
+                if (surrenderedToUser) surrenderedToUser = false
+                cancelBackoffJob()
                 // Lift selfState (RECONNECTING -> ONLINE) and the trigger
                 // peer (FAILED -> UNKNOWN). The reducers are no-ops if we
                 // are already there. dispatchSelf re-enters via the post-
@@ -1000,16 +1353,194 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
                 }
             }
             is LadderResult.Cancelled -> {
-                // Cancelled by `requestReconnect` mid-ladder (Task 11) or by
+                // Cancelled by `requestReconnect` mid-ladder or by
                 // [shutdown]. The canceller already owns the recovery state
-                // machine from here — do nothing.
+                // machine from here — do NOT promote to Rung 4 on cancel.
             }
             is LadderResult.Exhausted -> {
-                // Task 17 stops here; Rung 4 surrender (RecoveryGivenUp)
-                // lands in the follow-up task. selfState stays Reconnecting
-                // (the ladder didn't lift it).
+                if (wasSurrenderLadder) {
+                    // The surrender ladder fired because the thrash guard
+                    // was already active. The surrender flag is already
+                    // set (was set when the previous ladder exhausted),
+                    // and the backoff timer is already armed. Re-running
+                    // promoteToRung4 here would re-arm the timer in an
+                    // infinite loop (the thrash log doesn't drain in
+                    // virtual time because it uses wall-clock `now()`),
+                    // so simply stay surrendered until manual reconnect
+                    // OR the wall-clock thrash window prunes the log.
+                    Log.i(TAG, "[CA] ladder: surrender ladder exhausted, no further retry until requestReconnect")
+                    if (!surrenderedToUser) surrenderedToUser = true
+                    return
+                }
+                // Non-surrender ladder reached Rung 3 and Rung 3 did not
+                // lift selfState within budget. Record toward the thrash
+                // counter and promote to Rung 4.
+                recordRung3Failure()
+                promoteToRung4()
             }
         }
+    }
+
+    // ── Task 20 — Rung 4 surrender / backoff / thrash guard helpers ───────
+
+    /**
+     * Build a one-rung "surrender" ladder used when the thrash guard fires.
+     * The single rung returns false synchronously, sending us straight
+     * through [handleLadderSettled]'s Exhausted path -> [promoteToRung4].
+     *
+     * Mirrors Chrome's `_buildSurrenderLadder`. Tagged via
+     * [currentLadderIsSurrender] (set in [kickLadder]) so the settle
+     * handler doesn't double-count it toward [rung3FailureLog].
+     */
+    private fun buildSurrenderLadder(): RecoveryLadder = RecoveryLadder(
+        rungs = listOf(
+            RecoveryRung(
+                name = "thrash-surrender",
+                budgetMs = 0L,
+                action = { false },
+            ),
+        ),
+    )
+
+    /**
+     * Returns `true` iff the next ladder kick should pre-empt the 3-rung
+     * sequence and go straight to surrender. Prunes entries older than
+     * [RUNG_3_THRASH_WINDOW_MS] as a side effect.
+     *
+     * MUST be called on [scope]. Mirrors Chrome's `_thrashGuardActive`.
+     */
+    private fun thrashGuardActive(): Boolean {
+        if (rung3FailureLog.isEmpty()) return false
+        val cutoff = now() - RUNG_3_THRASH_WINDOW_MS
+        rung3FailureLog.removeAll { it < cutoff }
+        return rung3FailureLog.size >= RUNG_3_THRASH_THRESHOLD
+    }
+
+    /**
+     * Append the current timestamp to [rung3FailureLog]. Called from
+     * [handleLadderSettled]'s Exhausted branch when the ladder reached
+     * Rung 3 and Rung 3 did not lift selfState to ONLINE within budget.
+     *
+     * MUST be called on [scope]. Mirrors Chrome's `_recordRung3Failure`.
+     */
+    private fun recordRung3Failure() {
+        rung3FailureLog.add(now())
+        Log.i(TAG, "[CA] ladder: rung3 failure recorded (count=${rung3FailureLog.size})")
+    }
+
+    /**
+     * Rung 4: surrender to the user and schedule the next auto-retry.
+     *
+     * Per spec §"Rung 4 — Surface to user":
+     *   - `selfState` stays in RECONNECTING (the reducer's
+     *     [SelfStateEvent.RecoveryGivenUp] handler is a no-op outside
+     *     RECONNECTING, so we make sure we're at least in RECONNECTING
+     *     first via [SelfStateEvent.RecoveryBegan]).
+     *   - The [surrenderedToUser] flag flips to `true` so the popup banner
+     *     switches to the red "Connection failed — tap to reconnect" UI.
+     *   - [SelfStateEvent.RecoveryGivenUp] is dispatched into the reducer
+     *     for any state observers that want to react.
+     *   - An exponential-backoff timer is armed for the next auto-attempt.
+     *
+     * MUST be called on [scope]. Mirrors Chrome's `_promoteToRung4`.
+     */
+    private fun promoteToRung4() {
+        if (shuttingDown) return
+        // Make sure we're at least in RECONNECTING so the popup banner
+        // stays up. (We could also be in OFFLINE, e.g. if a Stop event
+        // raced — in which case the user is no longer paired and the
+        // surrender flag is moot. The reducer ignores the dispatch in
+        // that case.)
+        dispatchSelf(SelfStateEvent.RecoveryBegan)
+        dispatchSelf(SelfStateEvent.RecoveryGivenUp)
+        if (!surrenderedToUser) surrenderedToUser = true
+        Log.i(TAG, "[CA] ladder: surrendered to user (Rung 4)")
+        scheduleBackoffRetry()
+    }
+
+    /**
+     * Arm the next auto-retry timer per [BACKOFF_SCHEDULE_MS]. The
+     * [backoffAttempt] index advances after each scheduling so the next
+     * retry uses a longer delay (capped at the last entry in the schedule).
+     *
+     * If a backoff Job is already armed, this is a no-op (idempotent —
+     * a second [promoteToRung4] while we're waiting must not stack timers).
+     *
+     * MUST be called on [scope]. Mirrors Chrome's `_scheduleBackoffRetry`.
+     *
+     * **Cancellation discipline.** The launched Job participates in
+     * [scope]'s structured concurrency, so [scope.cancel] cancels it
+     * AS LONG AS [shutdown] cancels [backoffJob] explicitly first AND
+     * nulls the field. Without that explicit pre-cancel, `runTest`'s
+     * teardown advanceUntilIdle finds the still-armed `delay` and
+     * advances time to it, [fireBackoffRetry] runs on a (just-cancelled)
+     * scope, and the test JVM hangs on never-draining work.
+     */
+    private fun scheduleBackoffRetry() {
+        if (shuttingDown) return
+        if (backoffJob != null) return // already armed
+        val idx = minOf(backoffAttempt, BACKOFF_SCHEDULE_MS.size - 1)
+        val delayMs = BACKOFF_SCHEDULE_MS[idx]
+        backoffAttempt += 1
+        Log.i(
+            TAG,
+            "[CA] ladder: backoff retry scheduled in ${delayMs}ms (attempt #${idx + 1})",
+        )
+        backoffJob = scope.launch {
+            try {
+                delay(delayMs)
+            } catch (ce: CancellationException) {
+                // Structured cancel — no work to do; let the cancel
+                // propagate naturally (don't even try to clear the field
+                // here, [shutdown] / [requestReconnect] / [cancelBackoffJob]
+                // handle that ordering).
+                throw ce
+            }
+            // Clear the field BEFORE firing so an immediate re-arm inside
+            // fireBackoffRetry (e.g. another exhausted ladder) sees a
+            // null slot to use.
+            backoffJob = null
+            fireBackoffRetry()
+        }
+    }
+
+    /**
+     * Cancel any pending Rung-4 auto-retry [Job]. Called by
+     * [requestReconnect] (manual tap bypasses backoff), the success branch
+     * of [handleLadderSettled], and [shutdown].
+     *
+     * **CRITICAL ordering.** Callers in [shutdown] MUST call this BEFORE
+     * `scope.cancel()`. The field is nulled here so a post-cancel
+     * advanceUntilIdle does not see an armed delay.
+     *
+     * MUST be called on [scope] OR from [shutdown]. The field write is
+     * a single reference assignment; the [Volatile]-equivalent
+     * single-thread confinement of [scope] makes the read-then-cancel
+     * race-free for the on-scope path. The [shutdown] path runs on the
+     * caller's thread and races with any in-flight scheduleBackoffRetry —
+     * the worst case is a benign double-cancel (idempotent on Jobs).
+     */
+    private fun cancelBackoffJob() {
+        backoffJob?.cancel()
+        backoffJob = null
+    }
+
+    /**
+     * Backoff-timer callback: the auto-retry interval has elapsed. Drop
+     * the surrender flag (we're trying again) and kick a fresh full
+     * ladder. Note we kick a FULL ladder (Rungs 1+2+3), not just Rung 3 —
+     * the thrash counter is still in scope and will short-circuit to
+     * Rung 4 again if Rungs 1+2 don't quietly recover us.
+     *
+     * MUST be called on [scope]. Mirrors Chrome's `_fireBackoffRetry`.
+     */
+    private fun fireBackoffRetry() {
+        if (shuttingDown) return
+        if (currentLadder != null) return // a manual reconnect raced us
+        // Drop the surrender flag — we're actively trying again. The
+        // popup banner switches back to the yellow "Reconnecting…" UI.
+        if (surrenderedToUser) surrenderedToUser = false
+        kickLadder(triggerPeerId = null, reason = "backoff-retry")
     }
 
     // ── Cadence engine (Task 16) ──────────────────────────────────────────
