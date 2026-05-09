@@ -30,6 +30,16 @@ const val ACTION_CANCEL_TRANSFER = "com.zaptransfer.android.ACTION_CANCEL_TRANSF
 const val ACTION_OPEN_FILE = "com.zaptransfer.android.ACTION_OPEN_FILE"
 
 /**
+ * Action used by the recovery ladder's Rung 3 ("full session reset") to tell
+ * the service to tear itself down. The hook dispatches this Intent, awaits
+ * [com.zaptransfer.android.service.ServiceState.Stopped], clears the v2
+ * transport's in-memory state, then dispatches a fresh
+ * `startForegroundService` Intent — the OS's natural service lifecycle
+ * handles the rest.
+ */
+const val ACTION_STOP_SERVICE = "com.zaptransfer.android.ACTION_STOP_SERVICE"
+
+/**
  * Foreground service that keeps active file transfers alive while the app is in the
  * background. Shows a persistent progress notification so the user is always aware
  * of ongoing transfers and can cancel them without returning to the app.
@@ -101,6 +111,16 @@ class TransferForegroundService : LifecycleService() {
                     Log.d(TAG, "Cancel requested for transferId=$transferId")
                     transferEngine.cancelTransfer(transferId)
                 }
+                return START_NOT_STICKY
+            }
+            ACTION_STOP_SERVICE -> {
+                // Recovery ladder Rung 3 ("full session reset") asked the
+                // service to tear down. The matching `startForegroundService`
+                // intent will arrive shortly after `serviceLifecycle.state`
+                // settles to `Stopped` — the new instance comes up clean.
+                Log.d(TAG, "Stop requested by recovery ladder Rung 3")
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
                 return START_NOT_STICKY
             }
         }

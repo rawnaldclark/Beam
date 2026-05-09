@@ -134,6 +134,30 @@ class BeamV2Transport(
     private val pendingRotations  = ConcurrentHashMap<String, PendingRotation>()
     private val rotationMutex     = Mutex()
 
+    /**
+     * Drop in-flight bookkeeping (outbox, inbox, pendingRotations) so any
+     * stale per-transfer state from a broken session does not survive the
+     * recovery ladder's Rung 3 ("full session reset"). Mirror of Chrome's
+     * `_resetTransportSingleton()` in
+     * `extension/crypto/beam-v2-wiring.js` — Chrome nulls the
+     * module-level `_transport`; on Kotlin the singleton lives behind the
+     * Hilt graph so clearing the per-transfer maps in place is the
+     * equivalent.
+     *
+     * Does NOT clear codec keys or pairing data — those live in
+     * [DeviceRepository] / [KeyManager] and are reloaded by the
+     * post-restart service onCreate path. Only the ephemeral
+     * per-in-flight-transfer maps are dropped.
+     *
+     * Safe to call from any thread (the underlying maps are
+     * [ConcurrentHashMap]).
+     */
+    fun clearInMemoryState() {
+        outbox.clear()
+        inbox.clear()
+        pendingRotations.clear()
+    }
+
     // -------------------------------------------------------------------------
     // Sender — clipboard
     // -------------------------------------------------------------------------

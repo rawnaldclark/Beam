@@ -1,16 +1,27 @@
 package com.zaptransfer.android.crypto
 
+import android.content.Context
+import android.content.Intent
 import android.util.Base64
 import android.util.Log
+import androidx.core.content.ContextCompat
 import com.zaptransfer.android.connection.ConnectionAuthority
+import com.zaptransfer.android.connection.RUNG_3_STOP_TIMEOUT_MS
 import com.zaptransfer.android.data.repository.DeviceRepository
+import com.zaptransfer.android.service.ACTION_STOP_SERVICE
+import com.zaptransfer.android.service.ServiceLifecycle
+import com.zaptransfer.android.service.ServiceState
+import com.zaptransfer.android.service.TransferForegroundService
 import com.zaptransfer.android.webrtc.RelayMessage
 import com.zaptransfer.android.webrtc.SignalingClient
 import com.zaptransfer.android.webrtc.SignalingListener
+import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
 import org.json.JSONObject
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -34,6 +45,8 @@ class BeamV2Wiring @Inject constructor(
     private val deviceRepo: DeviceRepository,
     private val keyManager: KeyManager,
     private val connectionAuthority: ConnectionAuthority,
+    @ApplicationContext private val appContext: Context,
+    private val serviceLifecycle: ServiceLifecycle,
 ) {
 
     interface Delivery {
@@ -54,6 +67,15 @@ class BeamV2Wiring @Inject constructor(
     val transport: BeamV2Transport by lazy { build() }
 
     init {
+        // Step G: install the production [ConnectionAuthority.forceFullReset]
+        // hook. This wiring resolves the BeamV2Wiring ↔ ConnectionAuthority
+        // Hilt cycle: the authority's @Inject constructor cannot take a
+        // BeamV2Wiring (BeamV2Wiring already injects authority), so the
+        // hook is bound post-construction here. Until this init runs, the
+        // authority is in skeleton mode (Rung 3 surrenders synchronously,
+        // logged via Log.w from `rung3Action`).
+        connectionAuthority.setForceFullReset(buildForceFullResetHook())
+
         // The wiring class is the SINGLE place that routes v2 frames into
         // the transport. Other listeners (TransferEngine, DeviceHubViewModel)
         // MUST skip BEA2-prefixed binary frames and beam-v2-* JSON to avoid
@@ -93,6 +115,104 @@ class BeamV2Wiring @Inject constructor(
      */
     fun setDelivery(d: Delivery) {
         delivery = d
+    }
+
+    /**
+     * Drop the cached transport's in-flight bookkeeping (outbox, inbox,
+     * pendingRotations) so any state a stale session accumulated does not
+     * survive the recovery ladder's Rung 3 ("full session reset"). Mirror
+     * of Chrome's `_resetTransportSingleton()` in
+     * `extension/crypto/beam-v2-wiring.js`.
+     *
+     * Called by the [forceFullReset] hook installed in [init] AFTER the
+     * service has reached [ServiceState.Stopped] and BEFORE the
+     * `startForegroundService` Intent is dispatched — clearing while the
+     * old service is still alive could race the next-incoming frame.
+     *
+     * Safe to call from any thread (delegates to [BeamV2Transport.clearInMemoryState]
+     * which uses [java.util.concurrent.ConcurrentHashMap]).
+     */
+    fun clearInMemoryState() {
+        transport.clearInMemoryState()
+    }
+
+    /**
+     * Build the production Rung-3 "full session reset" hook. Spec §"Rung 3
+     * — Full session reset" Android steps mapped onto this lambda:
+     *
+     *   1. Dispatch [ACTION_STOP_SERVICE] Intent → service.onDestroy →
+     *      [ServiceLifecycle] dispatches [ServiceState.Stopped].
+     *   2. Await [ServiceState.Stopped] within [RUNG_3_STOP_TIMEOUT_MS]
+     *      (10s). On timeout: surrender — the lambda returns without
+     *      clearing state or restarting; `rung3Action`'s outer
+     *      `RUNG_3_BUDGET_MS` (30s) timer fires, the rung returns false,
+     *      ladder advances to Rung 4.
+     *   3. Clear in-memory transport state.
+     *   6. Dispatch a fresh `startForegroundService` Intent → service
+     *      onCreate → [ServiceLifecycle] dispatches [ServiceState.Running].
+     *
+     * Steps 4-5 (reload paired devices from Room, re-init crypto from
+     * KeyManager) happen automatically as the new service instance comes
+     * up — neither is a side-effect this hook drives.
+     *
+     * The lambda's parent scope is the rung's `CoroutineScope` provided
+     * by [com.zaptransfer.android.connection.RecoveryLadder] —
+     * cancellation propagates here as a [kotlinx.coroutines.CancellationException]
+     * out of [withTimeoutOrNull] / [kotlinx.coroutines.flow.Flow.first]
+     * cooperatively.
+     */
+    private fun buildForceFullResetHook(): suspend () -> Unit = ::forceFullReset
+
+    /**
+     * Body of the [ConnectionAuthority.forceFullReset] hook. See
+     * [buildForceFullResetHook] for spec mapping.
+     */
+    private suspend fun forceFullReset() {
+        if (serviceLifecycle.state.value !== ServiceState.Stopped) {
+            // Step 1: dispatch ACTION_STOP_SERVICE Intent.
+            val stopIntent = Intent(appContext, TransferForegroundService::class.java).apply {
+                action = ACTION_STOP_SERVICE
+            }
+            try {
+                appContext.startService(stopIntent)
+            } catch (e: IllegalStateException) {
+                // Background-start exception on API 26+ when the app is
+                // backgrounded. Fall through to the await — if the
+                // service happens to be already stopping (e.g. the OS
+                // killed it for resources), the lifecycle flow will
+                // surface `Stopped` and we proceed.
+                Log.w(TAG, "forceFullReset: stopService failed; continuing to await", e)
+            }
+
+            // Step 2: await Stopped within RUNG_3_STOP_TIMEOUT_MS.
+            val stopped = withTimeoutOrNull(RUNG_3_STOP_TIMEOUT_MS) {
+                serviceLifecycle.state.first { it === ServiceState.Stopped }
+                true
+            }
+            if (stopped == null) {
+                Log.w(
+                    TAG,
+                    "forceFullReset: service did not reach STOPPED within " +
+                        "${RUNG_3_STOP_TIMEOUT_MS}ms; surrendering Rung 3",
+                )
+                return
+            }
+        }
+
+        // Step 3: clear in-memory transport state.
+        clearInMemoryState()
+
+        // Step 6: dispatch a fresh startForegroundService Intent. The new
+        // service instance's onCreate will dispatch Starting then Running;
+        // `rung3Action`'s outer combine awaits Running.
+        val startIntent = Intent(appContext, TransferForegroundService::class.java)
+        try {
+            ContextCompat.startForegroundService(appContext, startIntent)
+        } catch (e: IllegalStateException) {
+            Log.w(TAG, "forceFullReset: startForegroundService failed", e)
+            // Do not throw — let `rung3Action` surrender via its outer
+            // budget timer rather than escalate this lambda's failure.
+        }
     }
 
     private fun build(): BeamV2Transport {
