@@ -711,33 +711,39 @@ export async function deliverIncomingFile({
         saveAs:   false,
       });
       console.log('[Beam SW] Auto-saved file:', fileName);
+      chrome.notifications.create('file-' + Date.now(), {
+        type:    'basic',
+        iconUrl: 'icons/icon-128.png',
+        title:   'File Saved',
+        message: fileName + ' (' + formatSize(fileSize) + ') saved to Downloads',
+      });
+      return;
     } catch (err) {
-      console.error('[Beam SW] Auto-save download failed:', err);
+      // Download failed (missing permission, disk full, ...). Do NOT claim
+      // success, and do NOT lose the bytes — fall through to the manual-save
+      // stash below so the user can still retrieve the file from the popup.
+      console.error('[Beam SW] Auto-save download failed; falling back to manual save:', err);
     }
-    chrome.notifications.create('file-' + Date.now(), {
-      type:    'basic',
-      iconUrl: 'icons/icon-128.png',
-      title:   'File Saved',
-      message: fileName + ' (' + formatSize(fileSize) + ') saved to Downloads',
-    });
-  } else {
-    await chrome.storage.session.set({
-      receivedFile: {
-        fileName,
-        fileSize,
-        mimeType: safeMime,
-        fromDeviceId,
-        data:     base64,
-        timestamp: Date.now(),
-      },
-    });
-    chrome.notifications.create('file-' + Date.now(), {
-      type:    'basic',
-      iconUrl: 'icons/icon-128.png',
-      title:   'File Received',
-      message: fileName + ' (' + formatSize(fileSize) + ') — open Beam to save',
-    });
   }
+
+  // Manual-save path: auto-save is off, or the auto-save download failed above.
+  // Stash the bytes in session storage for the popup and prompt the user.
+  await chrome.storage.session.set({
+    receivedFile: {
+      fileName,
+      fileSize,
+      mimeType: safeMime,
+      fromDeviceId,
+      data:     base64,
+      timestamp: Date.now(),
+    },
+  });
+  chrome.notifications.create('file-' + Date.now(), {
+    type:    'basic',
+    iconUrl: 'icons/icon-128.png',
+    title:   'File Received',
+    message: fileName + ' (' + formatSize(fileSize) + ') — open Beam to save',
+  });
 }
 
 /**
