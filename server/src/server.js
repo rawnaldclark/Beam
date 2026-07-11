@@ -46,6 +46,7 @@ import { DataRelay }       from './relay.js';
 import { RateLimiter }     from './ratelimit.js';
 import { MSG }             from './protocol.js';
 import { createVerifyClient } from './origin.js';
+import { createMessageRouter } from './router.js';
 
 // ---------------------------------------------------------------------------
 // Configuration
@@ -375,79 +376,9 @@ gateway.on('disconnect', (deviceId) => {
  * @param {object} msg      - Validated protocol message.
  * @param {import('ws').WebSocket} ws - Sender's WebSocket.
  */
-gateway.onMessage((deviceId, msg, ws) => {
-  // --- Rate limit check ---
-  const connId = wsToConnId.get(ws) ?? deviceId;
-  if (!rateLimiter.allowMessage(connId)) {
-    try {
-      if (ws.readyState === ws.OPEN) {
-        ws.send(JSON.stringify({
-          type:    MSG.ERROR,
-          message: 'Rate limit exceeded: too many messages per second',
-        }));
-        ws.close();
-      }
-    } catch { /* ignore */ }
-    return;
-  }
-
-  // --- Heartbeat (presence keeps device alive) ---
-  presence.heartbeat(deviceId);
-
-  // --- Route by message type ---
-  switch (msg.type) {
-
-    // Peer discovery registration
-    case MSG.REGISTER_RENDEZVOUS:
-      presence.register(deviceId, msg.rendezvousIds);
-      break;
-
-    // WebRTC signaling + pairing — Signaling.handleMessage() returns true when handled.
-    case MSG.SDP_OFFER:
-    case MSG.SDP_ANSWER:
-    case MSG.ICE_CANDIDATE:
-    case MSG.PAIRING_REQUEST:
-    case MSG.PAIRING_ACK:
-    case MSG.CLIPBOARD_TRANSFER:
-    case MSG.FILE_OFFER:
-    case MSG.FILE_ACCEPT:
-    case MSG.FILE_COMPLETE:
-    case MSG.TRANSFER_INIT:
-    case MSG.TRANSFER_ACCEPT:
-    case MSG.TRANSFER_REJECT:
-      signaling.handleMessage(deviceId, msg, ws);
-      break;
-
-    // Relay session binding — check bandwidth quota before accepting.
-    case MSG.RELAY_BIND:
-      if (rateLimiter.isRelayDisabled()) {
-        gateway.sendTo(ws, {
-          type:    MSG.ERROR,
-          message: 'Relay unavailable: monthly bandwidth quota nearly exhausted',
-        });
-        break;
-      }
-      dataRelay.handleMessage(deviceId, msg, ws);
-      break;
-
-    // Relay session release — no quota check needed.
-    case MSG.RELAY_RELEASE:
-      dataRelay.handleMessage(deviceId, msg, ws);
-      break;
-
-    // PING is already handled inside Gateway (which sends PONG and returns
-    // before calling onMessage).  This case is a belt-and-suspenders no-op
-    // for any future path where PING might propagate here.
-    case MSG.PING:
-      // Already handled; nothing to do.
-      break;
-
-    default:
-      // Unknown types are caught by protocol.validate() before reaching here;
-      // this default is a defensive no-op.
-      break;
-  }
-});
+gateway.onMessage(createMessageRouter({
+  rateLimiter, wsToConnId, presence, signaling, dataRelay, gateway,
+}));
 
 // ---------------------------------------------------------------------------
 // Binary relay frames

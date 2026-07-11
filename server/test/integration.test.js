@@ -36,6 +36,7 @@ import { Signaling }   from '../src/signaling.js';
 import { DataRelay }   from '../src/relay.js';
 import { RateLimiter } from '../src/ratelimit.js';
 import { MSG }         from '../src/protocol.js';
+import { createMessageRouter } from '../src/router.js';
 
 // ---------------------------------------------------------------------------
 // Wire @noble/ed25519 v2 synchronous SHA-512 for sign() calls
@@ -360,57 +361,10 @@ function createTestServer() {
       dataRelay.handleDisconnect(deviceId);
     });
 
-    // --- Message dispatcher ---
-    gateway.onMessage((deviceId, msg, ws) => {
-      const connId = wsToConnId.get(ws) ?? deviceId;
-      if (!rateLimiter.allowMessage(connId)) {
-        try {
-          if (ws.readyState === ws.OPEN) {
-            ws.send(JSON.stringify({
-              type:    MSG.ERROR,
-              message: 'Rate limit exceeded: too many messages per second',
-            }));
-            ws.close();
-          }
-        } catch { /* ignore */ }
-        return;
-      }
-
-      presence.heartbeat(deviceId);
-
-      switch (msg.type) {
-        case MSG.REGISTER_RENDEZVOUS:
-          presence.register(deviceId, msg.rendezvousIds);
-          break;
-
-        case MSG.SDP_OFFER:
-        case MSG.SDP_ANSWER:
-        case MSG.ICE_CANDIDATE:
-          signaling.handleMessage(deviceId, msg, ws);
-          break;
-
-        case MSG.RELAY_BIND:
-          if (rateLimiter.isRelayDisabled()) {
-            gateway.sendTo(ws, {
-              type:    MSG.ERROR,
-              message: 'Relay unavailable: monthly bandwidth quota nearly exhausted',
-            });
-            break;
-          }
-          dataRelay.handleMessage(deviceId, msg, ws);
-          break;
-
-        case MSG.RELAY_RELEASE:
-          dataRelay.handleMessage(deviceId, msg, ws);
-          break;
-
-        case MSG.PING:
-          break; // handled inside gateway
-
-        default:
-          break;
-      }
-    });
+    // --- Message dispatcher (the REAL production router, not a copy) ---
+    gateway.onMessage(createMessageRouter({
+      rateLimiter, wsToConnId, presence, signaling, dataRelay, gateway,
+    }));
 
     // --- Binary relay (second wss 'connection' handler, like server.js) ---
     wss.on('connection', (ws) => {
