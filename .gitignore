@@ -2,3 +2,7 @@ node_modules/
 .superpowers/
 *.log
 .env
+
+# local runtime / throwaway diagnostics
+.claude/scheduled_tasks.lock
+server/observer.mjs

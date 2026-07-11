@@ -1150,15 +1150,12 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
         // — it just means Rung 1 cannot recover and we'll time out and
         // advance to Rung 2.
         try {
-            val frame = JSONObject().apply {
-                put("type", "register-rendezvous")
-                // Match the JS shape: a single rendezvousId field carrying
-                // own deviceId. The relay accepts both this and the array
-                // form used by [SignalingClient.registerRendezvous] for
-                // multi-rendezvous scenarios.
-                pingTracker?.let { put("rendezvousId", it.ownDeviceId) }
-            }
-            signalingClient.send(frame)
+            // Replay the COMPLETE rendezvous set (own + paired peers) that
+            // SignalingClient remembers. The relay's presence.register
+            // REPLACES membership, so re-sending an own-only frame here would
+            // drop every paired-peer room and break routing — the original
+            // "can't connect/send" bug. See [SignalingClient.reRegisterRendezvous].
+            signalingClient.reRegisterRendezvous()
         } catch (e: Exception) {
             // Swallow — see KDoc.
             Log.d(TAG, "rung1Action: send register-rendezvous failed", e)

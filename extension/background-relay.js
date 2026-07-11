@@ -28,6 +28,21 @@ import {
   getConnectionAuthority,
   installPopupBroadcaster,
 } from './connection/connection-authority-wiring.js';
+import { computeRendezvousIds } from './shared/rendezvous.js';
+
+/**
+ * Builds the COMPLETE rendezvous set to register: own deviceId + every paired
+ * peer's deviceId. The relay's presence.register REPLACES membership, so we
+ * MUST send the full set every time — own-only (or peers-only) drops rooms and
+ * breaks routing. See shared/rendezvous.js.
+ *
+ * @param {string} ownDeviceId
+ * @returns {Promise<string[]>}
+ */
+async function currentRendezvousIds(ownDeviceId) {
+  const { pairedDevices = [] } = await chrome.storage.local.get('pairedDevices');
+  return computeRendezvousIds(ownDeviceId, pairedDevices.map((d) => d.deviceId));
+}
 
 /**
  * Lazy accessor for the Beam v2 transport singleton. The hooks intentionally
@@ -263,6 +278,14 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
   const authority = ensureConnectionAuthority({
     sendJson: (msg) => sendPairingMessage(msg),
     ownDeviceId: deviceId,
+    // Rung 1: re-assert rendezvous membership. Must replay the COMPLETE set
+    // (own + paired peers) — the relay REPLACES membership on register, so an
+    // own-only re-register here would drop every peer room. Without this hook
+    // the ladder falls back to sendJson({rendezvousId: ownDeviceId}) (own-only).
+    register: async () => {
+      const rendezvousIds = await currentRendezvousIds(deviceId);
+      sendPairingMessage({ type: 'register-rendezvous', rendezvousIds });
+    },
     // Rung 2: bounce the WS without dropping the v2 transport. Equivalent to
     // a soft reset — the relay sees us close + open a new socket, and the
     // existing transport singleton (with cached cipher state) is reused.
@@ -359,12 +382,17 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
       else if (msg.type === 'auth-ok') {
         _lastPongAt = Date.now(); // reset zombie timer on fresh auth
         console.log('[Beam SW] Pairing relay authenticated as', deviceId);
-        // Register our deviceId as rendezvous so the relay routes Android's message.
+        // Register own deviceId AND every paired peer's deviceId. Own is
+        // required so our own-id-keyed peer-pings route; peers are required
+        // so we're a member of each peer's room. presence.register REPLACES
+        // the set, so sending own-only (the old bug) left peers unable to
+        // reach us — "can't connect/send".
+        const rendezvousIds = await currentRendezvousIds(deviceId);
         ws.send(JSON.stringify({
           type: 'register-rendezvous',
-          rendezvousIds: [deviceId],
+          rendezvousIds,
         }));
-        console.log('[Beam SW] Registered rendezvous:', deviceId);
+        console.log('[Beam SW] Registered rendezvous:', rendezvousIds);
         // Start heartbeat to keep connection alive while user switches to phone
         _startHeartbeat();
         // Authority now sees us as ONLINE (CONNECTING -> ONLINE).

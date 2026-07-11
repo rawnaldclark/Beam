@@ -32,6 +32,7 @@ import { MSG }                  from './shared/message-types.js';
 import { KEEPALIVE_INTERVAL_MS } from './shared/constants.js';
 import { startPairingListener, stopPairingListener, sendPairingMessage, sendBinary, sendClipboardEncrypted, sendFileEncrypted, setRestartHook } from './background-relay.js';
 import { beamErrorMessage } from './crypto/beam-errors.js';
+import { computeRendezvousIds } from './shared/rendezvous.js';
 import { getConnectionAuthority } from './connection/connection-authority-wiring.js';
 import { appendHistoryEntry, buildFailedEntry } from './shared/transfer-history.js';
 
@@ -311,11 +312,13 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       if (sendPairingMessage) {
         try {
           // Re-send register-rendezvous to poke the server's presence module.
-          chrome.storage.local.get('deviceId').then(({ deviceId }) => {
+          // Must carry the COMPLETE set (own + paired peers) — presence.register
+          // REPLACES membership, so an own-only re-register would drop peer rooms.
+          chrome.storage.local.get(['deviceId', 'pairedDevices']).then(({ deviceId, pairedDevices = [] }) => {
             if (deviceId) {
               sendPairingMessage({
                 type: 'register-rendezvous',
-                rendezvousIds: [deviceId],
+                rendezvousIds: computeRendezvousIds(deviceId, pairedDevices.map((d) => d.deviceId)),
               });
             }
           });

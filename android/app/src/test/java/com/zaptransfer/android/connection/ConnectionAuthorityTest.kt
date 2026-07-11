@@ -1228,7 +1228,7 @@ class ConnectionAuthorityTest {
         runCurrent()
         auth.shutdown()
 
-        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.reRegisterRendezvous() }
         verify(atLeast = 1) { signaling.client.disconnect() }
         verify(atLeast = 1) { signaling.client.connect(any()) }
     }
@@ -1304,7 +1304,7 @@ class ConnectionAuthorityTest {
         runCurrent()
         auth.shutdown()
 
-        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.reRegisterRendezvous() }
         verify(exactly = 1) { signaling.client.disconnect() }
         verify(exactly = 1) { signaling.client.connect(any()) }
     }
@@ -1351,7 +1351,7 @@ class ConnectionAuthorityTest {
         runCurrent()
         auth.shutdown()
 
-        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.reRegisterRendezvous() }
         verify(exactly = 1) { signaling.client.disconnect() }
         verify(exactly = 1) { signaling.client.connect(any()) }
     }
@@ -1647,7 +1647,7 @@ class ConnectionAuthorityTest {
         // The thrash-guard surrender ladder must NOT have invoked Rungs
         // 1 or 2 — total signaling counts stay at 2 (one per non-thrash
         // ladder).
-        verify(exactly = 2) { signaling.client.send(any()) }
+        verify(exactly = 2) { signaling.client.reRegisterRendezvous() }
         verify(exactly = 2) { signaling.client.disconnect() }
         verify(exactly = 2) { signaling.client.connect(any()) }
     }
@@ -1689,7 +1689,7 @@ class ConnectionAuthorityTest {
         testScheduler.advanceTimeBy(60_000L)
         runCurrent()
         assertNull("no backoff-driven ladder post-shutdown", auth.currentLadder)
-        verify(exactly = 1) { signaling.client.send(any()) }
+        verify(exactly = 1) { signaling.client.reRegisterRendezvous() }
         verify(exactly = 1) { signaling.client.disconnect() }
         verify(exactly = 1) { signaling.client.connect(any()) }
     }

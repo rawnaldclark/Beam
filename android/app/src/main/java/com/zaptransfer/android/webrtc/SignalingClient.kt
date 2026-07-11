@@ -61,6 +61,54 @@ private const val HEARTBEAT_INTERVAL_MS = 30_000L
 /** Relay server URL — matches spec §6.9. */
 const val RELAY_URL = "wss://zaptransfer-relay.fly.dev"
 
+/**
+ * Builds the COMPLETE rendezvous membership set this device must register.
+ *
+ * Every `register-rendezvous` frame must carry the device's OWN deviceId
+ * (so its own-id-keyed peer-pings — see [com.zaptransfer.android.connection.PeerPingTracker]
+ * — route) PLUS every paired peer's deviceId (so it is a member of each
+ * peer's room and can be a routing target there). The relay's
+ * `presence.register` REPLACES the membership set on every call, so a
+ * partial set (own-only, or peers-only) silently breaks routing. Mirrors
+ * `extension/shared/rendezvous.js`.
+ *
+ * @param ownDeviceId   This device's own deviceId (base64url SHA-256 of its Ed25519 pk).
+ * @param peerDeviceIds Paired peer deviceIds.
+ * @return Deduped list = own + peers, own first.
+ */
+internal fun buildRendezvousIds(ownDeviceId: String, peerDeviceIds: List<String>): List<String> =
+    (listOf(ownDeviceId) + peerDeviceIds).distinct()
+
+/**
+ * Decides whether a `connect()` call should start a fresh `attemptConnect`
+ * loop, or no-op because one is already handling the connection.
+ *
+ * Prevents the launch-time double-connect race: `DeviceHubViewModel.init` and
+ * `refreshPresence` both call `connect()` before the first attempt reaches
+ * Connected, which under the old "only skip if already Connected" guard
+ * spawned two sockets under one deviceId (relay zombie-evicts one → presence
+ * flapping). We must still INTERRUPT a loop that is asleep in backoff (the
+ * fast-reconnect-on-foreground path), so the asleep case returns true.
+ *
+ * @param connected      Current state is [ConnectionState.Connected].
+ * @param hasSocket      A live [okhttp3.WebSocket] handle exists.
+ * @param attemptActive  An `attemptConnect` coroutine is currently active.
+ * @param inBackoffSleep That loop is parked in a `delay(...)` between attempts.
+ */
+internal fun shouldStartConnectAttempt(
+    connected: Boolean,
+    hasSocket: Boolean,
+    attemptActive: Boolean,
+    inBackoffSleep: Boolean,
+): Boolean {
+    // Healthy live connection — nothing to do.
+    if (connected && hasSocket) return false
+    // A loop is already actively establishing (not sleeping) — let it finish
+    // instead of racing it with a second socket.
+    if (attemptActive && !inBackoffSleep) return false
+    return true
+}
+
 // ── Connection state ──────────────────────────────────────────────────────────
 
 /**
@@ -226,6 +274,16 @@ class SignalingClient @Inject constructor(
     @Volatile
     private var intentionalDisconnect = false
 
+    /**
+     * True only while the [attemptConnect] loop is parked in a `delay(...)`
+     * between attempts (backoff or transient-retry). Lets [connect] tell
+     * "actively establishing" (don't spawn a second loop) apart from "asleep
+     * in backoff" (interrupt for an immediate retry). See
+     * [shouldStartConnectAttempt].
+     */
+    @Volatile
+    private var inBackoffSleep = false
+
     /** Reconnection attempt index — indexes into [BACKOFF_MS]. */
     private val reconnectAttempt = AtomicInteger(0)
 
@@ -275,18 +333,29 @@ class SignalingClient @Inject constructor(
      *
      * @param relayUrl Override URL for testing; defaults to the production [RELAY_URL].
      */
+    @Synchronized
     fun connect(relayUrl: String = RELAY_URL) {
         intentionalDisconnect = false
 
-        // Fast path: if we are already authenticated and the WebSocket is
-        // alive, do NOTHING. Without this guard, every `refreshPresence`
-        // fired on lifecycle ON_RESUME (e.g. returning from the system file
-        // picker) tore down the live socket, causing every in-flight
-        // sendFile / sendClipboard to fail with "Socket closed". The cancel-
-        // and-reconnect path below remains intact for the cold-reopen,
-        // backoff-sleeping, and post-network-transition cases it was
-        // designed for.
-        if (_connectionState.value is ConnectionState.Connected && webSocket != null) {
+        // Skip when a healthy socket is live, OR when an attempt loop is
+        // already actively establishing one. The first guard stops
+        // `refreshPresence` (fired on ON_RESUME, e.g. returning from the file
+        // picker) from tearing down a live socket. The second guard stops the
+        // launch-time double-connect race: DeviceHubViewModel.init AND
+        // refreshPresence both call connect() before the first attempt reaches
+        // Connected — without it, two attemptConnect loops open two sockets
+        // under one deviceId and the relay zombie-evicts one, flapping
+        // presence. A loop ASLEEP in backoff is still interrupted below (the
+        // cold-reopen / post-network-transition fast-reconnect path).
+        // @Synchronized serialises the check-then-act against connect()/
+        // disconnect() called from other threads (e.g. recovery coroutines).
+        if (!shouldStartConnectAttempt(
+                connected = _connectionState.value is ConnectionState.Connected,
+                hasSocket = webSocket != null,
+                attemptActive = attemptConnectJob?.isActive == true,
+                inBackoffSleep = inBackoffSleep,
+            )
+        ) {
             return
         }
 
@@ -352,16 +421,48 @@ class SignalingClient @Inject constructor(
     }
 
     /**
+     * This device's own deviceId (base64url SHA-256 of its Ed25519 public key).
+     * Cached — the keypair is stable for the install lifetime. Always part of
+     * the rendezvous set so this device's own-id-keyed peer-pings route (see
+     * [buildRendezvousIds]).
+     */
+    private val ownDeviceId: String by lazy {
+        keyManager.deriveDeviceId(keyManager.getOrCreateKeys().ed25519Pk)
+    }
+
+    /**
      * Registers rendezvous IDs with the relay so it can route messages between
      * paired devices sharing those IDs.
      *
-     * @param rendezvousIds List of rendezvous ID strings to register.
+     * The device's OWN deviceId is always folded in via [buildRendezvousIds]
+     * regardless of what the caller passes — callers supply paired-peer
+     * deviceIds; omitting own would leave this device out of its own room and
+     * break its peer-pings (the original "can't connect/send" bug).
+     *
+     * @param rendezvousIds Paired-peer rendezvous IDs (own is added automatically).
      * @return true if the message was enqueued; false if the socket is unavailable.
      */
     fun registerRendezvous(rendezvousIds: List<String>): Boolean {
-        // Remember these for automatic replay on future reconnects.
-        pendingRendezvousIds = rendezvousIds.toList()
-        return sendRegisterRendezvousNow(rendezvousIds)
+        val full = buildRendezvousIds(ownDeviceId, rendezvousIds)
+        // Remember the COMPLETE set for automatic replay on future reconnects.
+        pendingRendezvousIds = full
+        return sendRegisterRendezvousNow(full)
+    }
+
+    /**
+     * Re-sends the most recent COMPLETE rendezvous set (own + peers). Used by
+     * the recovery ladder's Rung 1 to re-assert membership after the relay may
+     * have GC'd our session — it must replay the full set, never a partial
+     * (own-only) one, because `presence.register` REPLACES the membership set.
+     *
+     * Falls back to own-only if no registration has happened yet this session.
+     *
+     * @return true if the message was enqueued; false if the socket is unavailable.
+     */
+    fun reRegisterRendezvous(): Boolean {
+        val full = pendingRendezvousIds?.takeIf { it.isNotEmpty() }
+            ?: buildRendezvousIds(ownDeviceId, emptyList())
+        return sendRegisterRendezvousNow(full)
     }
 
     /**
@@ -406,7 +507,12 @@ class SignalingClient @Inject constructor(
 
             if (backoff > 0) {
                 Log.d(TAG, "Reconnect backoff ${backoff}ms (attempt $attempt)")
-                delay(backoff)
+                inBackoffSleep = true
+                try {
+                    delay(backoff)
+                } finally {
+                    inBackoffSleep = false
+                }
             }
 
             if (intentionalDisconnect) break
@@ -440,7 +546,12 @@ class SignalingClient @Inject constructor(
             if (lastFailureWasTransient && transientStreak < MAX_TRANSIENT_STREAK) {
                 transientStreak += 1
                 Log.d(TAG, "Transient failure — fast retry $transientStreak/$MAX_TRANSIENT_STREAK")
-                delay(TRANSIENT_RETRY_DELAY_MS)
+                inBackoffSleep = true
+                try {
+                    delay(TRANSIENT_RETRY_DELAY_MS)
+                } finally {
+                    inBackoffSleep = false
+                }
             } else {
                 if (lastFailureWasTransient) {
                     Log.w(TAG, "Transient failures exceeded $MAX_TRANSIENT_STREAK — escalating to exponential backoff")
