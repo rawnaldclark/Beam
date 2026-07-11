@@ -423,6 +423,42 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
                     val nonce = message.json.optString("nonce", "")
                     if (nonce.isNotEmpty()) notifyPongReceived(nonce)
                 }
+                "peer-ping" -> {
+                    // A peer is probing our liveness. Echo the nonce back as a
+                    // peer-pong so the pinger's tracker resolves and it sees us
+                    // HEALTHY. Without this, Chrome's pings go unanswered and it
+                    // gates every Chrome->Android send as PEER_UNREACHABLE — the
+                    // third layer of the "can't connect/send" break.
+                    //
+                    // Routing mirrors Chrome (extension/background-relay.js):
+                    //   - targetDeviceId : the pinger (msg.fromDeviceId, added by
+                    //     the relay when it forwarded the ping).
+                    //   - rendezvousId   : OUR own deviceId — both clients are
+                    //     registered to it, and the relay's membership check
+                    //     requires sender + target to share the named rendezvous.
+                    //
+                    // ownDeviceId comes from the ping tracker; a null tracker is
+                    // skeleton mode (key derivation failed), where the device is
+                    // not reachable anyway, so dropping the pong is acceptable.
+                    val nonce = message.json.optString("nonce", "")
+                    val fromDeviceId = message.json.optString("fromDeviceId", "")
+                    val ownId = pingTracker?.ownDeviceId
+                    if (nonce.isNotEmpty() && fromDeviceId.isNotEmpty() && ownId != null) {
+                        val pong = JSONObject().apply {
+                            put("type", "peer-pong")
+                            put("nonce", nonce)
+                            put("targetDeviceId", fromDeviceId)
+                            put("rendezvousId", ownId)
+                        }
+                        try {
+                            signalingClient.send(pong)
+                        } catch (e: Exception) {
+                            // Reader-thread callback: never let a send failure
+                            // (e.g. WS mid-close) escape into the OkHttp loop.
+                            Log.w(TAG, "Failed to send peer-pong for inbound peer-ping", e)
+                        }
+                    }
+                }
             }
         }
     }

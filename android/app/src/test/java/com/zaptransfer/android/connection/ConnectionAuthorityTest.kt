@@ -642,6 +642,46 @@ class ConnectionAuthorityTest {
         assertEquals(0, auth.peerHealth.value.size)
     }
 
+    // ── relay listener: inbound peer-ping -> peer-pong responder ────────────
+
+    @Test
+    fun relayPeerPing_repliesWithPeerPong() = runTest {
+        // A cadence authority carries a real PeerPingTracker, so ownDeviceId
+        // (the pong's rendezvousId) is available. Wire content is opaque in
+        // unit tests (stub org.json), so we assert the call-count invariant:
+        // an inbound peer-ping must produce exactly one outbound send (the pong).
+        val (_, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        advanceUntilIdle()
+        val listener = signaling.listenerSlot.captured
+
+        val ping = mockk<JSONObject>()
+        every { ping.optString("type") } returns "peer-ping"
+        every { ping.optString("nonce", "") } returns "n1"
+        every { ping.optString("fromDeviceId", "") } returns "chrome-1"
+
+        listener.onMessage(RelayMessage.Text(ping))
+        advanceUntilIdle()
+
+        verify(exactly = 1) { signaling.client.send(any()) }
+    }
+
+    @Test
+    fun relayPeerPing_withEmptyNonce_sendsNoPong() = runTest {
+        val (_, signaling, _) = buildCadenceAuthority(StandardTestDispatcher(testScheduler))
+        advanceUntilIdle()
+        val listener = signaling.listenerSlot.captured
+
+        val ping = mockk<JSONObject>()
+        every { ping.optString("type") } returns "peer-ping"
+        every { ping.optString("nonce", "") } returns ""
+        every { ping.optString("fromDeviceId", "") } returns "chrome-1"
+
+        listener.onMessage(RelayMessage.Text(ping))
+        advanceUntilIdle()
+
+        verify(exactly = 0) { signaling.client.send(any()) }
+    }
+
     // ── StateFlow re-emission contract: no spurious updates on reducer no-ops ─
 
     @Test
