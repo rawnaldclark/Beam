@@ -23,7 +23,7 @@ android {
 
     defaultConfig {
         applicationId = "com.zaptransfer.android"
-        minSdk = 26          // Android 8.0 — required for EncryptedSharedPreferences + modern crypto APIs
+        minSdk = 29          // Android 10 — code saves via MediaStore.Downloads (API 29, scoped storage) in 22 places; pre-Q crashed with NoClassDefFoundError
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
