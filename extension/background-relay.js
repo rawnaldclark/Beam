@@ -151,6 +151,16 @@ let _lastPongAt = Date.now();
 const ZOMBIE_DETECTION_MS = 60_000; // 2 missed ping/pong cycles (25s each) + margin
 
 /**
+ * Watchdog for the connect/auth handshake. If the relay accepts the socket
+ * but never completes challenge -> auth-ok (silent server, dropped
+ * mid-handshake), the connect promise would hang forever — and with it
+ * `_inflightConnect`, whose single-flight guard would then block every future
+ * reconnect (permanent offline). The watchdog rejects the connect so the guard
+ * clears and auto-reconnect can open a fresh socket.
+ */
+const AUTH_TIMEOUT_MS = 15_000;
+
+/**
  * Start listening for a pairing request from an Android device.
  *
  * Opens a WebSocket to the relay server, authenticates using Ed25519
@@ -215,6 +225,7 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
   _lastEd25519Sk = ed25519Sk;
   _lastEd25519Pk = ed25519Pk;
   _explicitStop = false;
+  _authFailed = false;
 
   pairingDeviceId = deviceId;
 
@@ -315,13 +326,37 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
   authority.notifyWsOpening();
 
   return new Promise((resolve, reject) => {
+    // Settle-once: the connect promise MUST settle exactly once, and settling
+    // it is what clears `_inflightConnect` (via the .finally in
+    // startPairingListener). Every terminal path — auth-ok, auth-fail, error,
+    // constructor throw, a close before auth-ok, or the watchdog — routes
+    // through here so the single-flight guard can never get stuck.
+    let settled = false;
+    let authTimer = null;
+    const done = () => {
+      if (settled) return;
+      settled = true;
+      if (authTimer) { clearTimeout(authTimer); authTimer = null; }
+      resolve();
+    };
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      if (authTimer) { clearTimeout(authTimer); authTimer = null; }
+      reject(err);
+    };
+    authTimer = setTimeout(
+      () => fail(new Error('connect/auth timeout after ' + AUTH_TIMEOUT_MS + 'ms')),
+      AUTH_TIMEOUT_MS,
+    );
+
     let ws;
     try {
       ws = new WebSocket(RELAY_URL);
       console.log('[Beam SW] _doConnect: WebSocket created, readyState=', ws.readyState);
     } catch (err) {
       console.error('[Beam SW] _doConnect: WebSocket constructor threw:', err);
-      reject(new Error('WebSocket constructor failed: ' + (err?.message || String(err))));
+      fail(new Error('WebSocket constructor failed: ' + (err?.message || String(err))));
       return;
     }
     pairingWs = ws;
@@ -370,7 +405,7 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
             timestamp,
           }));
         } catch (err) {
-          reject(new Error('Auth signing failed: ' + err.message));
+          fail(new Error('Auth signing failed: ' + err.message));
         }
       }
       else if (msg.type === 'pong') {
@@ -397,11 +432,15 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
         _startHeartbeat();
         // Authority now sees us as ONLINE (CONNECTING -> ONLINE).
         getConnectionAuthority()?.notifyAuthComplete();
-        resolve();
+        done();
       }
       else if (msg.type === 'auth-fail') {
         console.error('[Beam SW] Pairing relay auth failed:', msg.reason);
-        reject(new Error('Auth failed: ' + (msg.reason || 'unknown')));
+        // Bad/revoked key or clock skew — retrying with the same credentials
+        // just storms the relay. Suppress the onclose auto-reconnect until the
+        // next explicit connect.
+        _authFailed = true;
+        fail(new Error('Auth failed: ' + (msg.reason || 'unknown')));
       }
       else if (msg.type === 'pairing-request') {
         console.log('[Beam SW] PAIRING_REQUEST received from', msg.fromDeviceId || msg.deviceId);
@@ -491,7 +530,7 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
     ws.onerror = (e) => {
       console.error('[Beam SW] Pairing relay WebSocket error event:', e,
         'readyState=', ws?.readyState);
-      reject(new Error('WebSocket connection error (readyState=' + ws?.readyState + ')'));
+      fail(new Error('WebSocket connection error (readyState=' + ws?.readyState + ')'));
     };
 
     ws.onclose = async (e) => {
@@ -503,6 +542,12 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
         console.log('[Beam SW] Orphan WebSocket closed (code:', e.code + ') — ignored');
         return;
       }
+
+      // Settle the connect promise if it is still pending. A close BEFORE
+      // auth-ok would otherwise leave `_inflightConnect` hung forever, and the
+      // single-flight guard would then block every future reconnect. No-op if
+      // the promise already resolved (auth-ok) or rejected.
+      fail(new Error('WebSocket closed before auth-ok (code ' + e.code + ')'));
 
       console.warn('[Beam SW] Pairing relay WebSocket closed. Code:', e.code, 'Reason:', e.reason);
       if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
@@ -522,10 +567,12 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
         }).catch(() => {});
       } catch { /* ignore */ }
 
-      // Auto-reconnect if we weren't explicitly stopped
-      if (!_explicitStop && _lastDeviceId && _lastEd25519Sk && _lastEd25519Pk) {
+      // Auto-reconnect if we weren't explicitly stopped and auth didn't fail
+      // (a failed auth won't succeed on retry — see _authFailed).
+      if (!_explicitStop && !_authFailed && _lastDeviceId && _lastEd25519Sk && _lastEd25519Pk) {
         console.log('[Beam SW] Auto-reconnecting to relay in 2s...');
-        setTimeout(() => {
+        _reconnectTimer = setTimeout(() => {
+          _reconnectTimer = null;
           if (!pairingWs && !_explicitStop) {
             startPairingListener(_lastDeviceId, _lastEd25519Sk, _lastEd25519Pk)
               .then(() => console.log('[Beam SW] Reconnected successfully'))
@@ -539,12 +586,22 @@ async function _doConnect(deviceId, ed25519Sk, ed25519Pk) {
 
 // Reconnection state
 let _explicitStop = false;
+/**
+ * Set when the relay rejected our auth (bad/revoked key, clock skew). Retrying
+ * with the same credentials just storms the relay, so the onclose auto-reconnect
+ * is suppressed until the next explicit connect (which resets this). Cleared at
+ * the top of every _doConnect.
+ */
+let _authFailed = false;
 let _lastDeviceId = null;
 let _lastEd25519Sk = null;
 let _lastEd25519Pk = null;
 
 /** @type {number|null} */
 let _heartbeatTimer = null;
+
+/** Pending 2s auto-reconnect timer, tracked so stopPairingListener can cancel it. */
+let _reconnectTimer = null;
 
 /**
  * Start the heartbeat: sends JSON `ping` every 25 seconds AND checks for
@@ -585,6 +642,7 @@ export function stopPairingListener() {
   _inflightConnect = null;
   _inflightDeviceId = null;
   if (_heartbeatTimer) { clearInterval(_heartbeatTimer); _heartbeatTimer = null; }
+  if (_reconnectTimer) { clearTimeout(_reconnectTimer); _reconnectTimer = null; }
   if (pairingWs) {
     pairingWs.onmessage = null;
     pairingWs.onerror = null;
