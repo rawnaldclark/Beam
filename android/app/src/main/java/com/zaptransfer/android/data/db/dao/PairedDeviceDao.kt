@@ -59,13 +59,6 @@ interface PairedDeviceDao {
     suspend fun update(device: PairedDeviceEntity)
 
     /**
-     * Update only the [lastSeenAt] timestamp for presence tracking.
-     * More efficient than a full Update when only presence changes.
-     */
-    @Query("UPDATE paired_devices SET last_seen_at = :lastSeenAt WHERE device_id = :deviceId")
-    suspend fun updateLastSeen(deviceId: String, lastSeenAt: Long)
-
-    /**
      * Update only the Beam v2 K_AB generation ring (serialised JSON).
      * Called by the transport on key rotation to swap in a new generation.
      */

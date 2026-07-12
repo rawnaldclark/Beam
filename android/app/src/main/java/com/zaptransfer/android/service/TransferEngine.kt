@@ -304,11 +304,4 @@ class TransferEngine @Inject constructor(
             Log.e(TAG, "deliverV2File failed: ${e.message}", e)
         }
     }
-
-    /**
-     * Suspend stub kept for source-compat with old callers that injected
-     * `chunkProgressDao` and called this. The Beam v2 receiver does not yet
-     * persist chunk-level progress; this is a no-op until that work lands.
-     */
-    suspend fun clearCheckpoint(@Suppress("unused") transferId: String) { /* no-op */ }
 }
