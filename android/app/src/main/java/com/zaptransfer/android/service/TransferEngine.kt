@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -181,15 +182,11 @@ class TransferEngine @Inject constructor(
                 if (e.gate is SendGate.PeerUnreachable) {
                     runCatching {
                         transferHistoryDao.insert(
-                            TransferHistoryEntity(
-                                transferId    = "",
+                            TransferHistoryEntity.failedSent(
                                 deviceId      = targetDeviceId,
-                                direction     = "SENT",
                                 fileName      = fileName,
                                 fileSizeBytes = fileSize,
                                 mimeType      = mimeType.ifBlank { null },
-                                status        = "FAILED",
-                                sha256Hash    = null,
                                 localUri      = fileUri.toString(),
                                 startedAt     = startedAt,
                                 completedAt   = System.currentTimeMillis(),
@@ -289,7 +286,7 @@ class TransferEngine @Inject constructor(
             }
             transferHistoryDao.insert(
                 TransferHistoryEntity(
-                    transferId    = "",
+                    transferId    = UUID.randomUUID().toString(),
                     deviceId      = args.fromDeviceId,
                     direction     = "RECEIVED",
                     fileName      = args.fileName,

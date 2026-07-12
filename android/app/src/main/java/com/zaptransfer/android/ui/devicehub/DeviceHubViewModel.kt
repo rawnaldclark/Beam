@@ -565,15 +565,11 @@ class DeviceHubViewModel @Inject constructor(
                     is SendGate.PeerUnreachable -> {
                         runCatching {
                             transferHistoryDao.insert(
-                                TransferHistoryEntity(
-                                    transferId    = "",
+                                TransferHistoryEntity.failedSent(
                                     deviceId      = targetDeviceId,
-                                    direction     = "SENT",
                                     fileName      = fileName,
                                     fileSizeBytes = 0L,
                                     mimeType      = mimeType,
-                                    status        = "FAILED",
-                                    sha256Hash    = null,
                                     localUri      = uri.toString(),
                                     startedAt     = startedAt,
                                     completedAt   = System.currentTimeMillis(),

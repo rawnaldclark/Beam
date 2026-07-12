@@ -5,6 +5,7 @@ import androidx.room.Entity
 import androidx.room.ForeignKey
 import androidx.room.Index
 import androidx.room.PrimaryKey
+import java.util.UUID
 
 /**
  * Immutable audit record written once a transfer reaches a terminal state
@@ -97,4 +98,37 @@ data class TransferHistoryEntity(
     /** Unix epoch milliseconds when status reached a terminal state. Null until then. */
     @ColumnInfo(name = "completed_at")
     val completedAt: Long? = null,
-)
+) {
+    companion object {
+        /**
+         * Build a FAILED "SENT" audit row with a fresh unique primary key.
+         *
+         * A pre-flight-failed send never received a real transferId, so callers
+         * used to pass `""` — but `transfer_id` is the PK under
+         * [androidx.room.OnConflictStrategy.IGNORE], so the second `""` row
+         * collided with the first and was silently dropped, hiding every failed
+         * send after the first. Minting a UUID keeps each failed row distinct.
+         */
+        fun failedSent(
+            deviceId: String,
+            fileName: String,
+            fileSizeBytes: Long,
+            mimeType: String?,
+            localUri: String?,
+            startedAt: Long,
+            completedAt: Long,
+        ): TransferHistoryEntity = TransferHistoryEntity(
+            transferId    = UUID.randomUUID().toString(),
+            deviceId      = deviceId,
+            direction     = "SENT",
+            fileName      = fileName,
+            fileSizeBytes = fileSizeBytes,
+            mimeType      = mimeType,
+            status        = "FAILED",
+            sha256Hash    = null,
+            localUri      = localUri,
+            startedAt     = startedAt,
+            completedAt   = completedAt,
+        )
+    }
+}
