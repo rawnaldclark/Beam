@@ -187,7 +187,7 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
 
     /**
      * Production constructor. Hilt sees this and provides the
-     * [SignalingClient] and [KeyManager] singletons. The reducer-confinement
+     * [SignalingClient], [KeyManager], and [ServiceLifecycle] singletons. The reducer-confinement
      * dispatcher is a private single-threaded slice of [Dispatchers.Default];
      * tests use the [VisibleForTesting] primary constructor to inject a
      * [kotlinx.coroutines.test.StandardTestDispatcher] instead.
@@ -210,10 +210,17 @@ class ConnectionAuthority @VisibleForTesting internal constructor(
     constructor(
         signalingClient: SignalingClient,
         keyManager: KeyManager,
+        serviceLifecycle: ServiceLifecycle,
     ) : this(
         signalingClient,
         Dispatchers.Default.limitedParallelism(1),
         buildProductionTracker(signalingClient, keyManager),
+        // MUST forward the Hilt @Singleton ServiceLifecycle — the same instance
+        // TransferForegroundService dispatches to. Defaulting to a fresh
+        // ServiceLifecycle() (the primary ctor's default) left Rung 3 watching a
+        // permanently-Stopped throwaway, so its `state === Running` predicate
+        // never fired and the manual Reconnect button always surrendered.
+        serviceLifecycle = serviceLifecycle,
     )
 
     // ── Internal state ────────────────────────────────────────────────────
